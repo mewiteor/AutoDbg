@@ -1,0 +1,11 @@
+LIBRARY ucrtbase
+EXPORTS
+    _byteswap_uint64
+    _byteswap_ulong
+    _fseeki64
+    _ftelli64
+    _gmtime64
+    _localtime64
+    _difftime64
+    _time64
+    _mktime64
