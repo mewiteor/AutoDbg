@@ -1,0 +1,5 @@
+# uv 的虚拟环境（本地生成，不入库）
+.venv/
+
+# datas.json 是 datas.bin 的 JSON 中间态（内容等价；工具只读 datas.bin）
+datas.json

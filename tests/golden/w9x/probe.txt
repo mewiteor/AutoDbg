@@ -1,0 +1,4 @@
+exit=0
+flavor=lua55
+globals=inspect,jsonx,moses
+ok

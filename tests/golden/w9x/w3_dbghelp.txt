@@ -1,0 +1,6 @@
+exit=timeout
+before run
+frames=0
+has_dbghelp=no
+detached flag set
+run returned
