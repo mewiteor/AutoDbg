@@ -43,6 +43,10 @@ make.bat i <dir>         :: 指定输出目录（默认 .out）
 - `.out/AutoDbg_<arch>.exe` —— **唯一交付物**：零 CRT 启动器 + LZMA 单流载荷，内含该架构的全部模块（86 → 4 个，64 → 2 个；见 §11）。
 - `.out/lua_<arch>.exe` / `.out/luajit_<arch>.exe` —— 零 CRT 的独立解释器宿主（**不交付**：`gendata` 自举要用它们跑工具脚本）。
 - `.out/AutoDbg_<flavor>_<arch>.dll` / `.out/AutoDbgLegacy_<flavor>_<arch>.dll` —— 中间产物（模块本体），只被打包与 `--module-dir` 调试用，**不交付**。
+- `<build>/gen/autodbg_build.h` —— **构建期生成的版本宏**（`AUTODBG_VERSION` / `_SOURCE` / `_DIRTY`，见 `src/sys/version.h`）：
+  `make.bat` 的 `:genversion` 每次构建都算一遍 `git describe --tags --always --dirty`（有 tag 时是 `v0.1.0[-N-g<hash>]`，
+  没 tag 时就是 commit 短哈希，工作区脏会带 `-dirty`），**内容没变就不碰文件**（否则每次都全量重编）。
+  不做这一步的构建会降级成 `"unknown"`，不会编译失败。
 
 各架构的差异（见 `make.bat`）：
 
@@ -77,7 +81,8 @@ make.bat i <dir>         :: 指定输出目录（默认 .out）
 ```
 
 - 无脚本参数时弹文件对话框（启动器里的 `GetOpenFileNameW`，9x 降级 A 版）选脚本。
-- 选项（启动器层）：`--flavor=lua|luajit`（默认 lua 5.5）、`--variant=modern|legacy`（仅排障；正常靠平台探测 + 映射失败回退）、`--list`（列出载荷里的模块）、`--module-dir=<dir>`（调试：从磁盘取同名 DLL，仍走内存映射）、`--quiet`（关错误弹窗）、`--selftest`（跑纯函数自测）、`--server[=http]` 及其 `--server-*` 子选项（§12）。
+- 选项（启动器层）：`-h` / `--help`（打 usage 后退出 0）、`--version`（版本/ABI/架构后退出 0；版本串来自构建期的 `git describe`，见 §1）、`--flavor=lua|luajit`（默认 lua 5.5）、`--variant=modern|legacy`（仅排障；正常靠平台探测 + 映射失败回退）、`--list`（列出载荷里的模块）、`--module-dir=<dir>`（调试：从磁盘取同名 DLL，仍走内存映射）、`--quiet`（关错误弹窗）、`--selftest`（跑纯函数自测）、`--server[=http]` 及其 `--server-*` 子选项（§12）。
+  启动器的输出一律 **ASCII**（它走 `WriteFile` 写字节，中文在 CP936 控制台上会乱码；模块那边走 `WriteConsoleW` 才例外）。
 - **脚本首行标记**也能选 flavor：`--!lua` / `--!luajit`（优先级：命令行 > 首行标记 > 字节码 magic > 默认 lua）。
   其它 `--!xxx` 一律报错退出（D9）；例外：`--!autodbg` / `--!adbg` 是**编辑器侧标记**
   （远程地址 / exe / 架构），launcher 会**跳过它继续看下一行**（所以同一份脚本既能被 nvim 插件跑，
@@ -287,7 +292,11 @@ tests/golden/w9x/    Win98 guest 的黄金输出
 
 ### 10.10 目录与错误处理
 
-- 目录创建集中在 `:build` 开头（build 根、`<flavor>\include`、各模块/变体 obj 目录、`datas_<flavor>`、`pack`、`pever`、`launcher`）；子程序只在确实新增目录时 `mkdir`。
+- 目录创建集中在 `:build` 开头（build 根、`<flavor>\include`、各模块/变体 obj 目录、`datas_<flavor>`、`pack`、`pever`、`launcher`、**`gen`**）；子程序只在确实新增目录时 `mkdir`。
+- **构建期生成的文件**（都要遵守「内容不变就不写」）：
+  · `:genversion` → `<build>\gen\autodbg_build.h`（版本宏；由 `git describe` 算，与 ninja 无关，在 `ninja -C` 之前跑）；
+  · `luajit_relver.txt` → 喂给 `genver`（见 §10.7）。
+  两者都把结果作为**编译期的头/输入**，所以必须挂在包含它们的 TU 的依赖链上（前者靠 `deps = msvc` 的 `/showIncludes` 记录，后者靠 ninja 的隐式依赖）。
 - 失败一律 `|| exit /b 1` 或 `|| goto err`；`:err` 打印 `error` 并 `exit /b 1`。
 - `ninja -C %BUILDDIR%` 放在 `:build` 末尾（每个架构生成完立刻构建），不要把构建集中到 `:start`。
 

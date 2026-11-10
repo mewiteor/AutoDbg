@@ -22,6 +22,8 @@
 | B9 | LuaJIT 的 `luajit.lib` 一片 `C4819` 与 `time_t` 不匹配 | 影子头是 UTF-8、x86 影子 `time.h` 的 `time_t` 是 `long` | `LJ_CFLAGS` 带 `%CHARSET_FLAGS%` 与 `%TIME_T_FLAGS%`、`/I%SRCDIR%\sys\include`、`/Iluajit`、`/Iluajit\include`（顺序有意义） |
 | B10 | `make.bat a 32` 之类的未知架构被**静默当 x86** 构建 | 旧 `:config` 只判 `x64`，其余全落 x86 分支 | 显式白名单：只认 `64` / `86`；`98` 报「已退役」；其余报错退出 1 |
 | B11 | `.out` 里出现 `AutoDbg_*.lib` / `*.exp` 噪音 | DLL 链接默认产出导入库与导出文件，而模块只被手工映射、从不被 import | DLL 链接加 `/noimplib /noexp`（导出表本身不受影响，`resolve("autodbg_run")` 照常工作） |
+| B12 | 加了个「构建期生成的版本头」后，每次构建都全量重编 | 生成步骤无条件重写文件 → mtime 变 → 包含它的 TU 全部重编；或者反过来忘了把它放到 include 路径里（`#include` 找不到 → 默默跑“unknown”分支） | `:genversion` 先写 `*.tmp`、`fc /b` 比内容，**变了才 `move`**（同 `luajit_relver.txt` 的路子）；`<build>\gen` 必须同时进 `CFLAGS` 与 `AD_FLAGS` 的 `/I` |
+| B13 | 把中文写进启动器打印的文本（`--help` / 错误信息）在控制台上是乱码 | 启动器走 `WriteFile` 写字节，控制台按 CP936 解码；它又是 ANSI 编译 | 启动器输出一律 **ASCII**（中文只走模块内的 `WriteConsoleW`）；构建期生成的 `.h` 注释也只写 ASCII（cmd 代码页不可控，进了 `/utf-8` 编译单元会报 C4819） |
 
 ## K. 零 CRT / 编译器辅助符号 / 结构偏移
 

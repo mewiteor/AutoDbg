@@ -20,6 +20,7 @@
 
 #include "../../common/allocator.hpp"
 #include "../../common/cmdline.h"
+#include "../version.h" /* AUTODBG_VERSION（构建期生成，见 make.bat :genversion） */
 #include "boot.h"
 #include "error.hpp"
 #include "module_loader.hpp"
@@ -514,6 +515,60 @@ void build_addr(char *dst, unsigned cap, const char *addr, unsigned port)
 }
 }
 
+/* ---- `--version` / `--help` ----
+ * 输出一律 **ASCII**：launcher 是 ANSI 编译、走 `WriteFile` 写字节，
+ * 中文在 CP936 控制台上会乱码（模块那边走 `WriteConsoleW` 才不受影响）。 */
+void print_version()
+{
+    out("AutoDbg ");
+    out(AUTODBG_VERSION);
+    out(" (");
+    out(AUTODBG_VERSION_SOURCE);
+#if AUTODBG_VERSION_DIRTY
+    out(", dirty");
+#endif
+    out(", abi ");
+    out_u32((unsigned)AUTODBG_ABI_VERSION);
+    out(", ");
+    out(AUTODBG_VERSION_ARCH);
+    out(")\n");
+}
+
+void print_usage()
+{
+    out("AutoDbg ");
+    out(AUTODBG_VERSION);
+    out(" (");
+    out(AUTODBG_VERSION_ARCH);
+    out(", abi ");
+    out_u32((unsigned)AUTODBG_ABI_VERSION);
+    out(")\n\n");
+
+    out("usage: AutoDbg_<arch>.exe [options] [<script.lua>] [script args...]\n\n");
+    out("options:\n");
+    out("  -h, --help                 show this help and exit\n");
+    out("      --version              show version / abi / arch and exit\n");
+    out("      --flavor=lua|luajit    interpreter (default: lua 5.5)\n");
+    out("      --variant=modern|legacy  force variant (debugging only)\n");
+    out("      --list                 list modules embedded in the payload\n");
+    out("      --module-dir=<dir>     load module DLLs from <dir> (still memory-mapped)\n");
+    out("      --quiet                do not show error message boxes\n");
+    out("      --selftest             run built-in pure-function self test\n");
+    out("      --server[=http]        run as HTTP server (see below)\n");
+    out("      --server-addr=<ip:port>  listen address (default 127.0.0.1:8642)\n");
+    out("      --server-port=<port>     only override the port\n");
+    out("      --server-token=<hex|auto|none>\n");
+    out("      --server-max-body=<bytes>  request body limit (default 8388608)\n");
+    out("      --server-queue=<n>       queue depth (default 8)\n");
+    out("      --server-timeout=<sec>   per-request timeout (0 = none)\n");
+    out("      --server-log=<path>      diagnostic log file\n");
+    out("      --server-no-echo         do not echo executed output to console\n\n");
+    out("script head markers:\n");
+    out("  --!lua / --!luajit         select interpreter (CLI --flavor wins)\n");
+    out("  --!autodbg ...             editor-side marker (ignored, line is skipped)\n\n");
+    out("exit codes: 0 ok / -1 load or run failed / lua error code / 2 launcher error\n");
+}
+
 extern "C" int launcher_main(int argc, char **argv)
 {
     unsigned    flavor         = k_flavor_lua;   /* D6：默认 Lua 5.5 */
@@ -522,6 +577,8 @@ extern "C" int launcher_main(int argc, char **argv)
     bool        variant_forced = false;
     bool        list_only      = false;
     bool        quiet          = false;
+    bool        help_requested = false;
+    bool        version_only   = false;
     const char *module_dir     = nullptr;
     const char *script         = nullptr;
 
@@ -583,6 +640,14 @@ extern "C" int launcher_main(int argc, char **argv)
         else if (str_eq(a, "--quiet"))
         {
             quiet = true;
+        }
+        else if (str_eq(a, "--help") || str_eq(a, "-h") || str_eq(a, "-?"))
+        {
+            help_requested = true;
+        }
+        else if (str_eq(a, "--version"))
+        {
+            version_only = true;
         }
         else if (str_eq(a, "--selftest"))
         {
@@ -660,6 +725,18 @@ extern "C" int launcher_main(int argc, char **argv)
             script = a;
         }
         /* 其余位置参数属于脚本（模块侧按 boot.cmdline_a 重新拆一次，拿到全部） */
+    }
+
+    /* ---- `--help` / `--version`：不碰载荷、不弹对话框，直接打印退出 ---- */
+    if (help_requested)
+    {
+        print_usage();
+        return 0;
+    }
+    if (version_only)
+    {
+        print_version();
+        return 0;
     }
 
     /* ---- 定脚本（D7：无参时弹文件对话框） ---- */

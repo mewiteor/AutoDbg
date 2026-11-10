@@ -1,4 +1,4 @@
-﻿# =============================================================================
+# =============================================================================
 # tools/server_test/e2e.ps1 —— server 模式的端到端冒烟（S1 验收）
 #
 # 来源：新写（plan_server.md S1）。
@@ -126,6 +126,25 @@ function Hdr($resp, [string]$name)
 
 try
 {
+    # ---------------------------------------------------------------- 启动器 CLI（--help / --version）
+    # 不需要 server：直接跑 exe 看 stdout/退出码
+    $helpOut = & $Exe --help 2>&1 | Out-String
+    Check 'cli.help.exit' ($LASTEXITCODE -eq 0) "exit=$LASTEXITCODE"
+    Check 'cli.help.usage' ($helpOut -match 'usage: AutoDbg') 'has usage line'
+    Check 'cli.help.options' (($helpOut -match '--flavor') -and ($helpOut -match '--server-token')) 'lists options'
+
+    $verOut = & $Exe --version 2>&1 | Out-String
+    Check 'cli.version.exit' ($LASTEXITCODE -eq 0) "exit=$LASTEXITCODE"
+    Check 'cli.version.format' ($verOut -match '^AutoDbg \S+ \(.*abi 2, (x64|x86)\)') "out=$($verOut.Trim())"
+    # 版本串应该是 tag 或 commit 短哈希（没有 tag 时就是 7 位以上的十六进制）
+    Check 'cli.version.identity' ($verOut -match '^AutoDbg ([0-9a-f]{7,40}|v?\d[^ ]*)(-dirty)? ') "out=$($verOut.Trim())"
+
+    $shortOut = & $Exe -h 2>&1 | Out-String
+    Check 'cli.help-short' ($LASTEXITCODE -eq 0 -and $shortOut -match 'usage: AutoDbg') "exit=$LASTEXITCODE"
+
+    & $Exe --definitely-not-an-option 2>&1 | Out-Null
+    Check 'cli.unknown-option' ($LASTEXITCODE -eq 1) "exit=$LASTEXITCODE"
+
     # ---------------------------------------------------------------- 默认实例（loopback，免 token）
     if (-not (Start-Server @())) { exit 2 }
 
@@ -139,6 +158,8 @@ try
     Check 'version.arch' ($v.arch -eq $(if ($Render -eq '64') { 'x64' } else { 'x86' })) "arch=$($v.arch)"
     if ($Variant) { Check 'version.variant' ($v.variant -eq $Variant) "variant=$($v.variant)" }
     Check 'version.winsock' ($v.winsock -eq 'ws2_32.dll') "winsock=$($v.winsock)"
+    Check 'version.identity' ($v.server -match '^([0-9a-f]{7,40}|v?\d[^ ]*)(-dirty)?$') "server=$($v.server)"
+    Check 'version.source' ($v.version_source -in @('tag', 'describe', 'commit', 'unknown')) "source=$($v.version_source)"
 
     # --- /run：text 模式（脚本 print 的输出必须进响应）
     $r = Post-Run 'print("hello")' @('format=text')

@@ -68,6 +68,8 @@ AutoDbg_<arch>.exe        零 CRT 启动器 → payload (LZMA 单流) → 手工
 ```bat
 .out\AutoDbg_64.exe script.lua
 .out\AutoDbg_86.exe --flavor=luajit script.lua      :: LuaJIT instead of Lua 5.5
+.out\AutoDbg_64.exe --help                          :: all launcher options
+.out\AutoDbg_64.exe --version                       :: version (git tag/commit) + abi + arch
 ```
 
 ```lua

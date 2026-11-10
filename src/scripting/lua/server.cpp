@@ -27,6 +27,7 @@
 #include "common/rand.hpp"
 
 #include "core/util.hpp" /* PrintS / PrintF / ErrorS */
+#include "../../sys/version.h" /* AUTODBG_VERSION：构建期由 make.bat 生成（git describe） */
 
 #include <windows.h>
 
@@ -36,7 +37,8 @@ namespace autodbg::server
 {
 namespace
 {
-constexpr const char *k_server_version = "0.1.0";
+constexpr const char *k_server_version    = AUTODBG_VERSION;
+constexpr const char *k_server_ver_source = AUTODBG_VERSION_SOURCE;
 
 /* 本文件大量用到 common 的 HTTP 类型；在匿名命名空间开头统一引入，
  * 免得每个函数签名都要写全名（函数体内的 `using namespace` 管不到签名）。 */
@@ -759,6 +761,8 @@ void handle_version(long long sock, const autodbg_boot *boot, const server_confi
     w.boolean(true);
     w.key("server");
     w.string(k_server_version);
+    w.key("version_source");
+    w.string(k_server_ver_source);
     w.key("abi");
     w.number((long long)AUTODBG_ABI_VERSION);
     w.key("arch");
@@ -1610,7 +1614,7 @@ bool handle_connection(long long sock,
             send_json_status(sock, 405, "method_not_allowed", "GET /");
         else
             send_status(sock, 200,
-                        "AutoDbg server " "0.1.0"
+                        "AutoDbg server " AUTODBG_VERSION
                         "\n"
                         "GET  /health      liveness (+busy/queue)\n"
                         "GET  /version     build info\n"
