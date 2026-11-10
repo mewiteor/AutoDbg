@@ -62,6 +62,13 @@ int net_recv(long long sock, void *buf, size_t cap, int timeout_ms);
 
 /* 发（写满为止）：true = 全部写出 */
 bool net_send_all(long long sock, const void *data, size_t len, int timeout_ms);
+
+/* 本机 IPv4 地址清单（给「绑 0.0.0.0 时客户端该填哪个 IP」用）——
+ * 每条网卡占一行「地址 + 网卡描述」，写成 **UTF-8**、以 `\n` 结尾、**不含 NUL**；
+ * 返回写入字节数（0 = 取不到，调用方什么也不打）。
+ * 实现：首选 iphlpapi!GetAdaptersInfo（带网卡描述名；Win95 可能没 iphlpapi → 动态取不到
+ * 就降级），兕底用 winsock 的 gethostname/gethostbyname（只有主机名 + 地址）。 */
+size_t net_describe_local_addresses(char *dst, size_t cap);
 } /* namespace autodbg::common */
 
 #endif /* AUTODBG_COMMON_NET_HPP */

@@ -18,6 +18,8 @@
 #include <windows.h>
 #include <string.h>
 
+#include "allocator.hpp" /* net_describe_local_addresses 的两块临时缓冲 */
+
 namespace autodbg::common
 {
 namespace
@@ -41,6 +43,10 @@ struct ws_api
     int(WSAAPI *getsockname)(SOCKET, struct sockaddr *, int *)     = nullptr;
     int(WSAAPI *setsockopt)(SOCKET, int, int, const char *, int)   = nullptr;
     int(WSAAPI *ioctlsocket)(SOCKET, long, u_long *)               = nullptr;
+
+    /* 可选（net_describe_local_addresses 的兑底路径用）：取不到不影响 server 功能 */
+    int(WSAAPI *gethostname)(char *, int)                          = nullptr;
+    struct hostent *(WSAAPI *gethostbyname)(const char *)           = nullptr;
 };
 
 ws_api g_ws;
@@ -87,6 +93,10 @@ bool load_module(const char *dll, bool try_wsa2)
         FreeLibrary(m);
         return false;
     }
+
+    /* 可选项：主机名/地址枚举（兑底用，缺失不影响 server） */
+    bind_sym(m, "gethostname", &a.gethostname);
+    bind_sym(m, "gethostbyname", &a.gethostbyname);
 
     WSADATA wsa;
     memset(&wsa, 0, sizeof wsa);
@@ -384,5 +394,205 @@ bool net_send_all(long long sock, const void *data, size_t len, int timeout_ms)
         len -= (size_t)r;
     }
     return true;
+}
+
+/* ------------------- 本机 IPv4 清单（绑 0.0.0.0 时的启动提示） -------------------
+ * 两个来源，按可用性降级：
+ *   ① `iphlpapi!GetAdaptersInfo` —— 带网卡描述名（「Intel(R) Ethernet …」）
+ *   ② winsock `gethostname` + `gethostbyname` —— 只有主机名 + 地址（Win95 没有 iphlpapi）
+ * 结构体在这里**自己定义**（不 include <iphlpapi.h>：它会拉进 iptypes/winsock 的复杂依赖）。
+ * 字段类型与 SDK 逐项对应（ULONG/UINT/BYTE/指针）→ 布局与 SDK 一致；末尾几个用不到的
+ * time_t 字段直接不写（GetAdaptersInfo 只顺着 Next 链走，不需要我们给出 sizeof）。
+ */
+namespace
+{
+constexpr unsigned long k_error_buffer_overflow = 111;
+constexpr unsigned      k_if_type_loopback      = 24; /* MIB_IF_TYPE_LOOPBACK */
+
+struct ip_addr_string_lite
+{
+    struct ip_addr_string_lite *Next;
+    char                        IpAddress[16]; /* MAX_IP_ADDR_STRING_LENGTH */
+    char                        IpMask[16];
+    unsigned long               Context;
+};
+
+struct ip_adapter_info_lite
+{
+    struct ip_adapter_info_lite *Next;
+    unsigned long                ComboIndex;
+    char                         AdapterName[260]; /* MAX_ADAPTER_NAME_LENGTH + 4 */
+    char                         Description[132]; /* MAX_ADAPTER_DESCRIPTION_LENGTH + 4 */
+    unsigned                     AddressLength;    /* MAX_ADAPTER_ADDRESS_LENGTH = 8 */
+    unsigned char                Address[8];
+    unsigned long                Index;
+    unsigned                     Type;
+    unsigned                     DhcpEnabled;
+    struct ip_addr_string_lite  *CurrentIpAddress;
+    struct ip_addr_string_lite   IpAddressList;
+    struct ip_addr_string_lite   GatewayList;
+    struct ip_addr_string_lite   DhcpServer;
+    int                          HaveWins; /* 后面的 time_t 字段本文件不读 */
+};
+
+/* ❗必须是 **WINAPI**（x86 = stdcall）且**参数个数与真实 API 完全一致**：
+ * iphlpapi 的导出是 stdcall，x86 上 cdecl × stdcall 会让栈不平衡（实测：
+ * x86 一进枚举就 0xC0000005，x64 看不出来——x64 只有一种调用约定）。 */
+using get_adapters_info_fn = unsigned long(WINAPI *)(ip_adapter_info_lite *, unsigned long *);
+
+/* 累积式文本缓冲（自动留 NUL，超长就截断） */
+struct text_buf
+{
+    char  *dst;
+    size_t cap;
+    size_t at;
+
+    void put(const char *s)
+    {
+        while (s != nullptr && *s != '\0' && at + 1 < cap)
+            dst[at++] = *s++;
+        dst[at] = '\0';
+    }
+
+    void putn(const char *s, size_t n)
+    {
+        for (size_t i = 0; i < n && at + 1 < cap; i++)
+            dst[at++] = s[i];
+        dst[at] = '\0';
+    }
+};
+
+/* CP_ACP（iphlpapi 给的是 ANSI）→ UTF-8：让整块提示与模块其它输出同一编码 */
+void put_ansi_as_utf8(text_buf *tb, const char *s)
+{
+    if (s == nullptr || *s == '\0')
+        return;
+    int wn = MultiByteToWideChar(CP_ACP, 0, s, -1, nullptr, 0);
+    if (wn <= 1)
+    {
+        tb->put(s); /* 转不了就原样输出（至少不丢信息） */
+        return;
+    }
+
+    WCHAR  stack_w[160];
+    WCHAR *w = (wn <= (int)(sizeof stack_w / sizeof stack_w[0])) ? stack_w : (WCHAR *)alloc(sizeof(WCHAR) * (size_t)wn);
+    if (w == nullptr)
+    {
+        tb->put(s);
+        return;
+    }
+    MultiByteToWideChar(CP_ACP, 0, s, -1, w, wn);
+
+    char  stack_u[512];
+    int   un = WideCharToMultiByte(CP_UTF8, 0, w, wn - 1, nullptr, 0, nullptr, nullptr);
+    char *u  = (un < (int)sizeof stack_u) ? stack_u : (char *)alloc((size_t)un + 1);
+    if (u != nullptr && un > 0)
+    {
+        WideCharToMultiByte(CP_UTF8, 0, w, wn - 1, u, un, nullptr, nullptr);
+        tb->putn(u, (size_t)un);
+    }
+    if (u != nullptr && u != stack_u)
+        release(u);
+    if (w != stack_w)
+        release(w);
+}
+
+/* 一条地址行：「        192.168.1.10     Intel(R) Ethernet …」
+ * 地址列按 15 字符（IPv4 最长）对齐 + 2 空格间隔 —— 用**字段长度**补空格，
+ * 不依赖绝对列号（之前用绝对列号时短地址的行会错位）。 */
+void put_address_line(text_buf *tb, const char *ip, const char *desc)
+{
+    size_t len = 0;
+    while (ip[len] != '\0')
+        len++;
+    tb->put("        "); /* 8 空格缩进 */
+    tb->put(ip);
+    for (size_t i = len; i < 15; i++)
+        tb->put(" ");
+    tb->put("  ");
+    put_ansi_as_utf8(tb, desc);
+    tb->put("\n");
+}
+} /* namespace */
+
+size_t net_describe_local_addresses(char *dst, size_t cap)
+{
+    if (dst == nullptr || cap < 32)
+        return 0;
+    dst[0] = '\0';
+    text_buf tb{dst, cap, 0};
+
+    /* ① iphlpapi!GetAdaptersInfo（有网卡描述名） */
+    HMODULE iphlp = LoadLibraryA("iphlpapi.dll");
+    if (iphlp != nullptr)
+    {
+        get_adapters_info_fn gai = (get_adapters_info_fn)(void *)GetProcAddress(iphlp, "GetAdaptersInfo");
+        if (gai != nullptr)
+        {
+            unsigned long need = 0;
+            if (gai(nullptr, &need) == k_error_buffer_overflow && need > 0)
+            {
+                void *raw = alloc((size_t)need);
+                if (raw != nullptr)
+                {
+                    unsigned long sz = need;
+                    if (gai((ip_adapter_info_lite *)raw, &sz) == 0)
+                    {
+                        for (ip_adapter_info_lite *a = (ip_adapter_info_lite *)raw; a != nullptr; a = a->Next)
+                        {
+                            if (a->Type == k_if_type_loopback)
+                                continue; /* 127.0.0.1 的伪适配器，不列 */
+                            for (ip_addr_string_lite *ip = &a->IpAddressList; ip != nullptr; ip = ip->Next)
+                            {
+                                if (ip->IpAddress[0] == '\0')
+                                    continue;
+                                if (ip->IpAddress[0] == '0' && ip->IpAddress[1] == '.' &&
+                                    ip->IpAddress[2] == '0' && ip->IpAddress[3] == '.')
+                                    continue; /* 0.0.0.0（未配置） */
+                                put_address_line(&tb, ip->IpAddress, a->Description);
+                            }
+                        }
+                    }
+                    release(raw);
+                }
+            }
+        }
+        FreeLibrary(iphlp);
+        if (tb.at > 0)
+            return tb.at;
+    }
+
+    /* ② 兑底：gethostname + gethostbyname（Win95 没有 iphlpapi 时走这里） */
+    if (g_ws.mod == nullptr || g_ws.gethostname == nullptr || g_ws.gethostbyname == nullptr)
+        return 0;
+
+    char host[256];
+    host[0] = '\0';
+    if (g_ws.gethostname(host, (int)sizeof host) != 0)
+        return 0;
+    struct hostent *he = g_ws.gethostbyname(host);
+    if (he == nullptr || he->h_addrtype != AF_INET || he->h_addr_list == nullptr)
+        return 0;
+
+    for (int i = 0; he->h_addr_list[i] != nullptr; i++)
+    {
+        const unsigned char *b = (const unsigned char *)he->h_addr_list[i];
+        char                 ip[16];
+        int                  k = 0;
+        for (int part = 0; part < 4; part++)
+        {
+            unsigned v = b[part];
+            if (v >= 100)
+                ip[k++] = (char)('0' + v / 100);
+            if (v >= 10)
+                ip[k++] = (char)('0' + (v / 10) % 10);
+            ip[k++] = (char)('0' + v % 10);
+            if (part != 3)
+                ip[k++] = '.';
+        }
+        ip[k] = '\0';
+        put_address_line(&tb, ip, host);
+    }
+    return tb.at;
 }
 } /* namespace autodbg::common */

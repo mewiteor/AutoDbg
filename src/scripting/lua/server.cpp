@@ -1804,6 +1804,23 @@ int server_main(const autodbg_boot *boot)
            cfg.max_body, cfg.queue_depth, cfg.timeout_sec, cfg.echo ? "on" : "off",
            (net_module_name() != nullptr) ? net_module_name() : "(none)");
 
+    /* 绑到 0.0.0.0 时把本机网卡地址列出来：client 直接用其中一条就能连（不用猜 IP）。
+     * 走 PrintS（core 的输出分流：控制台 / 重定向都能看）；取不到就安静地不列。 */
+    {
+        unsigned any = 1;
+        if (autodbg::common::net_parse_ipv4(cfg.host, &any) && any == 0)
+        {
+            char   addrs[1024];
+            size_t n = autodbg::common::net_describe_local_addresses(addrs, sizeof addrs);
+            if (n > 0)
+            {
+                PrintS("autodbg server: 本机网卡地址（client 填其中任一条）:\n");
+                PrintS(addrs);
+            }
+            PrintS("autodbg server: 提示: 非 loopback 监听需要 token，且防火墙可能要放行该端口\n");
+        }
+    }
+
     /* ---- S2：队列 + 工作线程 ---- */
     if (cfg.queue_depth > (unsigned)k_job_queue_max)
         cfg.queue_depth = (unsigned)k_job_queue_max;

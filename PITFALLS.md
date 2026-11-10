@@ -39,6 +39,7 @@
 | K8 | 影子头下 C 编译报 `C2143`（`wchar_t` 不认） | 影子头里 `wchar_t` 由 `string.h` 提供，`stddef.h` 没有 | 需要 `wchar_t` 的头 include `<string.h>`（`cmdline.h` 就是这么修的） |
 | K9 | `1.0/0.0` 编译报 `C2124` | MSVC 把它当编译期错误 | 测试里用 `volatile double zero` 挡住常量折叠 |
 | K10 | `GetVersionExA` 报 `C4996` | 该 API 被标记废弃 | 用 `#pragma warning(push/disable/pop)` 局部包住（本项目确实需要它区分 9x） |
+| K11 | `GetProcAddress` 取到的 Win32 API 一调就 `0xC0000005`（**只在 x86**，x64 正常） | 函数指针 typedef 没写 `WINAPI`（x86 上 Win32 导出是 **stdcall**）或**参数个数与真实 API 不一致** → 栈不平衡 | typedef 一律写成 `unsigned long (WINAPI *)(真实参数表)`，参数个数与 SDK 原型**逐个一致**（不能“多传一个没用到的”）；x64 只有一种调用约定，测不出来 |
 
 ## L. Lua / LuaJIT / lualib 烘焙
 
@@ -135,3 +136,4 @@
 | X2 | x86 产物导入表里冒出 XP+ 的符号（`K32*`、`dbghelp.dll`…） | 静态 `#include <Psapi.h>` 默认 `PSAPI_VERSION=2` 会映射成 Vista+ 的 `K32*` | ScyllaHide 侧按架构加 `/DPSAPI_VERSION=1`（仅 x86）；其余新 API 一律走 `common::dynapi`；改完跑 `scan_dir.py` |
 | X3 | 逐字节比对 golden 时永远不相等 | 产物重定向输出 CRLF（msvcrt 文本模式），而 golden 是 LF | golden 统一 LF，比较走「CRLF→LF + 去末尾空行」归一化（D15） |
 | X4 | x86 产物在 Win9x 上「需要更新版本的 Windows」 | `link /subsystem:console,4.0` 被忽略（`LNK4010`，产物仍是 6.0/5.1） | 只能链接后改 PE 头：`tools/pever`（`pever` rule，仅 x86，x64 保持 6.0） |
+| X5 | 想列出网卡地址，顺手 `#include <iphlpapi.h>` / 链 `iphlpapi.lib` | Win95 没有 `iphlpapi.dll` → 静态导入 = legacy 模块映射硬失败；头文件还会拉进 `iptypes`/`winsock2` 的顺序坑 | `LoadLibraryA("iphlpapi.dll")` + `GetProcAddress("GetAdaptersInfo")`，结构体在 `net.cpp` 里**自定**（字段类型与 SDK 逐项对应，布局即一致；用不到的尾部 `time_t` 字段不写）；取不到就降级成 `gethostname`/`gethostbyname` |

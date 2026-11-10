@@ -372,6 +372,10 @@ payload              // 单条 LZMA 流：各模块原始字节按 entry 顺序�
 - 归属：server 跑在**模块（DLL）里**（需要 `lua_State` 与引擎会话），启动器只解析选项；`--server` 时允许不给脚本。
 - 选项（全部 `--server-*` 前缀）：`--server[=http]`、`--server-addr=<ip:port>`（默认 `127.0.0.1:8642`）、`--server-port=`、`--server-token=<hex|auto|none>`、`--server-max-body=`、`--server-queue=`、`--server-timeout=`、`--server-log=<path>`、`--server-no-echo`。
 - 端点：`GET /health` / `/version` / `/`（说明）、`POST /run`（body = Lua 源码，**不落盘**）、`POST /cancel`、`POST /shutdown`、`POST /effects?token=`（client 文件 I/O 的恢复）、`POST /mcp`。
+- 绑 `0.0.0.0` 时启动横幅会**列出本机网卡地址**（地址 + 网卡描述，UTF-8），方便 client 直接拄一条去配
+  `--!autodbg url=…`：地址来自 `iphlpapi!GetAdaptersInfo`（**必须动态载入**，Win95 没有；取不到就退
+  `gethostname`/`gethostbyname`，再取不到就安静不列）。结构体在 `net.cpp` 里自定（不 include `iphlpapi.h`），
+  字段类型与 SDK 逐项对应。
 - 认证（D21）：loopback 且未指定 token → **不校验**；非 loopback → **强制** token（`auto` 生成或显式给），`--server-token=none` 在非 loopback 上拒绝启动。
 - 并发：accept 线程 + **单个** worker 线程（脚本串行）；`/health`、`/cancel`、`/version` 在 accept 线程直答，不被长脚本饿死。
 - 取消/超时：`exec_guard` 的两条注入路径（`on_wait_timeout` 100 ms / `lua_sethook` 每 100 万条指令），server 模式下**不得**回落到 `CheckConsoleInput`（`PITFALLS.md` S2）。

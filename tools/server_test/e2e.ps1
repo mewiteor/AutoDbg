@@ -55,6 +55,20 @@ function Check([string]$name, [bool]$cond, [string]$detail = '')
     if ($cond) { Ok $name $detail } else { Bad $name $detail }
 }
 
+# 读 server 还在写的日志/输出文件（默认 File.ReadAllBytes 会因占用失败）
+function Read-Shared([string]$path)
+{
+    if (-not (Test-Path $path)) { return '' }
+    try
+    {
+        $fs = [System.IO.File]::Open($path, 'Open', 'Read', 'ReadWrite')
+        $sr = New-Object System.IO.StreamReader($fs, [System.Text.Encoding]::UTF8)
+        $t = $sr.ReadToEnd(); $sr.Close(); $fs.Close()
+        return $t
+    }
+    catch { return '' }
+}
+
 function Start-Server([string[]]$Extra)
 {
     $script:serverSeq = 1 + [int]$script:serverSeq
@@ -241,6 +255,25 @@ try
     Check 'auth.401-wrong-token' ($r.StatusCode -eq 401) "status=$($r.StatusCode)"
 
     Stop-Server
+
+    # ---------------------------------------------------------------- 绑 0.0.0.0：启动横幅列本机网卡地址
+    # 目的：client 不用去猜 IP（把这里列出的地址拄进 nvim 的 `--!autodbg url=…` 即可）。
+    # 万一环境不允许监听 0.0.0.0（防火墙/权限），当 SKIP 处理而不是 FAIL。
+    if (Start-Server @('--server-addr=0.0.0.0', '--server-token=abcdefgh'))
+    {
+        Start-Sleep -Milliseconds 200
+        $banner = Read-Shared $script:outFile
+        Check 'bindall.listen-line' ($banner -match "listen=0\.0\.0\.0:$Port") ((($banner -split "`n") | Where-Object { $_ -match 'listen=' }) -join '')
+        Check 'bindall.adapter-list' ($banner -match '(?m)^\s+\d{1,3}(\.\d{1,3}){3}\s+\S') 'expect at least one "<ip> <adapter>" line'
+        Check 'bindall.hint-token' ($banner -match 'auth: bearer') 'non-loopback must force a token'
+        Stop-Server
+    }
+    else
+    {
+        Ok 'bindall.listen-line' 'skip（本机不允许监听 0.0.0.0）'
+        Ok 'bindall.adapter-list' 'skip'
+        Ok 'bindall.hint-token' 'skip'
+    }
 
     # ---------------------------------------------------------------- 体上限实例（413）
     if (-not (Start-Server @('--server-max-body=256'))) { exit 2 }
