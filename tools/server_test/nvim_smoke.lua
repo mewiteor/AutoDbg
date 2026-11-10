@@ -8,7 +8,8 @@
 --   环境变量：AUTODBG_URL（默认 http://127.0.0.1:8642）
 -- 退出码：全部通过 → 0；有失败 → 1（用 `:cquit 1`）。
 -- 覆盖：同步执行、结果 buffer 内容、quickfix 跳转、取消（纯 Lua 忙循环）、
---       text 格式、token 缺失时的 401 诊断路径。
+--       text 格式、token 缺失时的 401 诊断路径、client 文件 I/O，
+--       脚本头标记（modeline）、LuaLS 注解库与 LuaSnip 片段（后三项不需要 server）。
 -- =============================================================================
 
 local url = os.getenv("AUTODBG_URL") or "http://127.0.0.1:8642"
@@ -107,8 +108,139 @@ check("io.ok", ioRes.ok == true, "status=" .. tostring(ioRes.status) .. " err=" 
 check("io.write", (ioRes.stdout or ""):find("w\t7", 1, true) ~= nil, "stdout=[" .. tostring(ioRes.stdout) .. "]")
 check("io.read-binary", (ioRes.stdout or ""):find("r\t7\ttrue", 1, true) ~= nil, "stdout=[" .. tostring(ioRes.stdout) .. "]")
 pcall(os.remove, ioPath)
+
+-- ---------------------------------------------------------------- 脚本头标记（不需要 server）
+-- 远程地址：setup 的 url 是默认值，脚本头部的 `--!autodbg ...` 覆盖它（换机器只改那一行）
+local modeline = require("autodbg.modeline")
+local ml = modeline.from_text("--!autodbg url=http://192.168.1.10:8642 token=abc\nprint(1)\n")
+check("modeline.marker", ml.found == true)
+check("modeline.url", ml.url == "http://192.168.1.10:8642", tostring(ml.url))
+check("modeline.token", ml.token == "abc", tostring(ml.token))
+local ml2 = modeline.from_text("-- header\n-- autodbg: host=10.0.0.5 port=9000\n")
+check("modeline.host-port", ml2.found == true and ml2.host == "10.0.0.5" and ml2.port == "9000",
+  tostring(ml2.host) .. ":" .. tostring(ml2.port))
+check("modeline.merge-url", modeline.merge_url("http://127.0.0.1:8642", ml) == "http://192.168.1.10:8642")
+check("modeline.merge-host-port", modeline.merge_url("http://127.0.0.1:8642", ml2) == "http://10.0.0.5:9000")
+check("modeline.none", modeline.from_text("-- just a comment\nprint(1)\n").found == false)
+check("modeline.not-comment", modeline.from_text("local s = 'autodbg: url=x'\n").found == false)
+
+-- 无名 buffer 也要能判定（插件不依赖文件名）
+local ubuf = vim.api.nvim_create_buf(false, true)
+vim.api.nvim_buf_set_lines(ubuf, 0, -1, false, { "--!autodbg port=4321", "Run({})" })
+local ub = modeline.from_buf(ubuf)
+check("modeline.unnamed-buffer", ub.found == true and ub.port == "4321", tostring(ub.port))
+
+-- 标记放文件末尾也算（与 vim 的 modeline 同口径：前 5 行 / 后 5 行）
+local tbuf = vim.api.nvim_create_buf(false, true)
+local tlines = {}
+for _ = 1, 30 do
+  tlines[#tlines + 1] = "print(1)"
+end
+tlines[#tlines + 1] = "--!autodbg port=4444"
+vim.api.nvim_buf_set_lines(tbuf, 0, -1, false, tlines)
+check("modeline.tail", modeline.from_buf(tbuf).port == "4444")
+
+-- `:AutoDbgHeader` 的实现（没装 LuaSnip 时的替代品）
+local hbuf = vim.api.nvim_create_buf(false, true)
+adbg.insert_header({ bufnr = hbuf })
+local hline = vim.api.nvim_buf_get_lines(hbuf, 0, 1, false)[1] or ""
+check("header.insert", hline == "--!autodbg url=" .. url, hline)
+check("header.idempotent", adbg.insert_header({ bufnr = hbuf }) == false)
+
+-- run() 会用标记里的地址（指向一个必然连不上的端口 → 只验证优先级与 res.url）
+set_buffer({ "--!autodbg url=http://127.0.0.1:9", 'print("never")' }, "marker-url.lua")
+local mres = adbg.run({ sync = true, open = "none" })
+check("modeline.run-url", mres.url == "http://127.0.0.1:9" and mres.mode == "modeline",
+  tostring(mres.url) .. " mode=" .. tostring(mres.mode))
+check("modeline.run-unreachable", mres.status == 0 and mres.ok == false, "status=" .. tostring(mres.status))
+
+-- ---------------------------------------------------------------- LuaLS 注解库（不需要 server）
+-- 取代模块侧的 generate_templete：插件自带 addons/autodbg/{config.json,library/*.lua}
+local lsp = require("autodbg.lsp")
+local addon = lsp.addon_dir()
+check("lsp.addon-dir", vim.fn.isdirectory(addon) == 1, addon)
+check("lsp.addon-config", vim.fn.filereadable(addon .. "/config.json") == 1)
+for _, f in ipairs({ "lualib", "variant", "callbacks", "debugger", "gui", "file_io" }) do
+  local p = addon .. "/library/" .. f .. ".lua"
+  local head = vim.fn.filereadable(p) == 1 and (vim.fn.readfile(p, "", 1)[1] or "") or ""
+  check("lsp.meta." .. f, head == "---@meta", head)
+end
+
+-- ---------------------------------------------------------------- LuaSnip 片段（不需要 server）
+local snippets = require("autodbg.snippets")
+package.loaded["luasnip"] = nil
+package.loaded["autodbg.snippets"] = nil
+snippets = require("autodbg.snippets")
+check("snippets.no-luasnip", snippets.get() == nil and snippets.add("lua") == false)
+
+-- 假 LuaSnip：只实现片段构造函数，用来证明片段能构造、触发词齐全、展开文本是合法 Lua
+local built, added = {}, {}
+package.loaded["luasnip"] = {
+  snippet = function(o, nodes)
+    built[#built + 1] = { trig = o.trig, nodes = nodes }
+    return { trig = o.trig }
+  end,
+  text_node = function(t)
+    return { t = t }
+  end,
+  insert_node = function(pos, v)
+    return { i = pos, v = v }
+  end,
+  choice_node = function(pos, choices)
+    return { c = pos, choices = choices }
+  end,
+  add_snippets = function(ft, list, opts)
+    added.ft, added.count, added.key = ft, #list, opts and opts.key
+    return true
+  end,
+}
+package.loaded["autodbg.snippets"] = nil
+snippets = require("autodbg.snippets")
+local slist = snippets.get()
+check("snippets.count", type(slist) == "table" and #slist >= 10, tostring(slist and #slist))
+check("snippets.add", snippets.add("lua") == true and added.ft == "lua" and added.key == "autodbg",
+  tostring(added.ft) .. "/" .. tostring(added.key))
+
+local seen, uniq = {}, {}
+for _, s in ipairs(built) do
+  if not seen[s.trig] then
+    seen[s.trig] = true
+    uniq[#uniq + 1] = s
+  end
+end
+for _, want in ipairs({ "adbg", "adrun", "adbp", "adrunbp", "adhw", "adctx", "admem", "adstack",
+  "adexcept", "adgui", "adclick", "adfile" }) do
+  check("snippets.trig." .. want, seen[want] == true)
+end
+
+-- 渲染成文本再 load()：片段里的引号/括号写错会在这里变红（曾把 "png" 写坏过一次）
+local function render(nodes)
+  local out = {}
+  for _, n in ipairs(nodes or {}) do
+    if n.t ~= nil then
+      -- LuaSnip 的 t{"a","b"} 是**两行**（元素之间自动换行，末尾不再加）
+      out[#out + 1] = type(n.t) == "table" and table.concat(n.t, "\n") or n.t
+    elseif n.i ~= nil then
+      out[#out + 1] = tostring(n.v or "")
+    elseif n.c ~= nil then
+      local first = n.choices and n.choices[1]
+      out[#out + 1] = first and tostring(first.t or "") or ""
+    end
+  end
+  return table.concat(out)
+end
+for _, s in ipairs(uniq) do
+  local chunk, err = load(render(s.nodes), "snippet:" .. s.trig)
+  check("snippets.valid-lua." .. s.trig, chunk ~= nil, err and tostring(err) or "")
+end
+package.loaded["luasnip"] = nil
+package.loaded["autodbg.snippets"] = nil
 -- ---------------------------------------------------------------- /health
+-- 注意：health/cancel 也尊重**当前 buffer** 的标记，所以先换回一个没有标记的 buffer
+-- （上一个用例留了一个指向 127.0.0.1:9 的标记）。
+set_buffer({ "print(1)" }, "health.lua")
 local h = adbg.health({ sync = true })
+check("health.mode", h.mode == "setup", tostring(h.mode))
 check("health.status", h.status == 200, "status=" .. tostring(h.status))
 check("health.body", (h.body or ""):find('"ok":true', 1, true) ~= nil or (h.body or ""):find('"ok": true', 1, true) ~= nil,
   tostring(h.body))

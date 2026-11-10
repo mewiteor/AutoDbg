@@ -21,7 +21,7 @@
 
 #include "core/core.hpp" /* DebuggerSession + set_current_session */
 #include "core/util.hpp" /* E / ErrorS / Error / ErrorN / macro helpers */
-#include "state.hpp"     /* run_script_file / generate_templete / g_wfilepath */
+#include "state.hpp"     /* run_script_file / g_wfilepath */
 #include "server.hpp"    /* S0：server 模式入口（plan_server.md §3.1 / D27） */
 #include "common/dynapi.hpp" /* get_proc_as：Win95 缺失的 kernel32 API 动态解析 */
 #include "common/selftest.hpp" /* S0：--selftest 纯函数自测（§11 验收） */
@@ -83,7 +83,6 @@ int _tmain(int argc, LPTSTR argv[])
         }
         g_wfilepath = buf;
     }
-    generate_templete();
     if (!PathFileExists(g_wfilepath))
     {
         ErrorS(TEXT("文件不存在: "));

@@ -37,7 +37,7 @@ extern "C"
 #include "scripting/lua/console_input.hpp" /* 宿主层控制台判定（纯函数，可单测；Q27） */
 #include "scripting/lua/exec_guard.hpp"    /* S2：远程执行的取消/超时守卫（plan_server.md §5.4） */
 #include "registry.hpp"                    /* P4.2：注册表（`register_lua_api`） */
-#include "state.hpp"                       /* P4.1：脚本状态（`run_script_file` / `g_wfilepath` / `generate_templete`） */
+#include "state.hpp"                       /* P4.1：脚本状态（`run_script_file` / `g_wfilepath`） */
 #include "bindings.hpp"                    /* P4.2：本 TU 的 `lua_*` 入口声明（registry.cpp 也用它） */
 
 /* 迁移期便利：让旧调用点（`PrintF`/`ErrorS`/`log_msg`/`LjGetConsoleWindow`/

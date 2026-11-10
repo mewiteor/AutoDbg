@@ -75,6 +75,9 @@
 | N2 | 无头测试一旦脚本抛错就永久挂住 | `--headless` 不会自己退出 | `nvim_smoke.ps1` 用「`luafile` + `qa!`」两条 `-c` |
 | N3 | 测试中断并报 `E95` | 多个用例复用了同一个 buffer 名（`nvim_buf_set_name` 不允许重名） | 每个用例用不同文件名（`ok.lua` / `syntax.lua` …），顺便验证 chunkname 传递 |
 | N4 | 插件把脚本写到临时文件 | 早期实现走文件 | 脚本正文走 `curl --data-binary @-`（stdin），响应只用 `-D -` 解析，**全程不落盘** |
+| N5 | 想让注解只对「当前这个 AutoDbg 脚本」生效，但 lua_ls 没有按 buffer 挂库的接口 | `Lua.workspace.library` 是 **client 级全局**的设置（不支持按文件/按 buffer） | 只能**懒启用**：检测到脚本头部的 `--!autodbg` 标记才把它加进 library（避免污染其它纯 Lua 项目）；代价是一旦启用，本会话内其它 Lua 文件也会看到这些注解。`setup{ lsp = { enable = false } }` / `:AutoDbgLsp off` 可关掉 |
+| N6 | 片段展开后字符串被拆成两行（`imagepath = "` 与路径分家） | LuaSnip 的 `t{"a","b"}` 是**多行节点**：元素之间自动换行，`t` 结束后不会再加换行 | 想与后面的 insert 拼在同一行时，把续行写在**同一个** `t` 元素里（或用单字符串 + `\n`）；验证法是「把所有节点渲染成文本再 `load()`」（已进 `nvim_smoke`） |
+| N7 | LuaLS 注解库挂上了，但 `Run` / `gui` / `jsonx` 仍报 undefined global | `---@meta` 文件的首行必须正好是 `---@meta`（带 BOM 或先写注释都会让 LuaLS 不当它是 meta 文件）；另外 addon 目录要含 `config.json` | 注解文件一律**无 BOM、首行 `---@meta`**；`nvim_smoke` 逐文件断言首行（`lsp.meta.*`） |
 
 ## O. 输出、日志与排障手法
 

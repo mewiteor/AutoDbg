@@ -79,7 +79,7 @@ make.bat i <dir>         :: 指定输出目录（默认 .out）
 - 无脚本参数时弹文件对话框（启动器里的 `GetOpenFileNameW`，9x 降级 A 版）选脚本。
 - 选项（启动器层）：`--flavor=lua|luajit`（默认 lua 5.5）、`--variant=modern|legacy`（仅排障；正常靠平台探测 + 映射失败回退）、`--list`（列出载荷里的模块）、`--module-dir=<dir>`（调试：从磁盘取同名 DLL，仍走内存映射）、`--quiet`（关错误弹窗）、`--selftest`（跑纯函数自测）、`--server[=http]` 及其 `--server-*` 子选项（§12）。
 - **脚本首行标记**也能选 flavor：`--!lua` / `--!luajit`（优先级：命令行 > 首行标记 > 字节码 magic > 默认 lua）。
-- `state.cpp` 会在脚本目录旁生成 `cdebugger.d.lua` + `.luarc.json`（编辑器提示用；server 模式跳过）。
+- `state.cpp` **不再**往脚本目录写任何文件（`cdebugger.d.lua` / `.luarc.json` 已移除）：编辑器补全改由 neovim 插件的 LuaLS 注解库提供（§12.5）。
 - 脚本参数从 `argv[2..]` 压入 Lua；退出码 0 = 成功，-1 = 加载/运行失败，Lua 运行时错误为 LuaJIT/Lua 的错误码（2 等），启动器自己的错误为 2（另有 `--list` / `--selftest` / `/shutdown` 等正常返回 0）。
 
 ## 4. 测试与门禁
@@ -387,10 +387,25 @@ payload              // 单条 LZMA 流：各模块原始字节按 entry 顺序�
 
 ### 12.5 neovim 插件（`nvim/`，子模块）
 
-- 命令：`:AutoDbgRun`（当前 buffer / 选区 / 文件）、`:AutoDbgCancel`、`:AutoDbgHealth`。
+- 命令：`:AutoDbgRun`（当前 buffer / 选区 / 文件）、`:AutoDbgCancel`、`:AutoDbgHealth`（会打印实际用的地址）、`:AutoDbgHeader`（插入脚本头标记）、`:AutoDbgLsp [on|off]`（挂/摘注解库）。
 - 传输：`vim.system` + `curl`，脚本走 stdin（**不落盘**）；结果落 scratch buffer，`<file>:<line>:` 进 quickfix。
 - 默认响应格式 **JSON**（D33，插件要渲染 `exit`/`canceled`/`timed_out`/`truncated`）。
 - 客户端效果循环在 `nvim/lua/autodbg/effects.lua`（base64 + `exec_effect`，≤16 轮，把每轮 `stdout_so_far` 拼回最终结果）。
+- **脚本头标记（modeline）**：`nvim/lua/autodbg/modeline.lua` 解析前/后 5 行里的
+  `--!autodbg url=http://host:port token=…`（也认 `-- autodbg: ...` / `-- adbg:`）。
+  键只有 `url` / `host` / `port` / `token`，**覆盖 `setup{}` 的默认值**；裸 `--!autodbg` 只做标记。
+- **LuaLS 注解库（取代模块的 `generate_templete`）**：插件自带 LLS-Addons 结构的
+  `nvim/addons/autodbg/{config.json, library/*.lua}`（`lualib` / `variant` / `callbacks` /
+  `debugger` / `gui` / `file_io`，首行都是 `---@meta`）。`nvim/lua/autodbg/lsp.lua` 在
+  「当前 buffer 头部有标记」时把它加进 lua_ls 的 `Lua.workspace.library` 并 notify 刷新。
+  ❗`workspace.library` 是 **client 级全局**（lua_ls 不支持按 buffer 挂库）→ 只能**懒启用**，
+  一旦启用本会话内其它 Lua 文件也会看到这些注解；`setup{ lsp = { enable = false } }` 或
+  `:AutoDbgLsp off` 可关掉（`PITFALLS.md` N5）。
+- **LuaSnip 片段**：`nvim/lua/autodbg/snippets.lua`（**不硬依赖** LuaSnip，没有就安静跳过），
+  `setup{ snippets = { enable = true } }` 时在 `FileType lua` 注册；触发词 `adbg` / `adrun` /
+  `adbp` / `adrunbp` / `adhw` / `adctx` / `admem` / `adstack` / `adexcept` / `adgui` / `adclick` / `adfile`。
+  ❗LuaSnip 的 `t{"a","b"}` 是**多行**文本节点（元素之间自动换行）——写片段时把「续行」
+  拆成独立元素会把一行拆成两行（`PITFALLS.md` N6）。
 
 ## 13. 已定决策（不要再讨论/推翻；改之前先在 `PITFALLS.md` 查有没有相关坑）
 
@@ -421,7 +436,7 @@ payload              // 单条 LZMA 流：各模块原始字节按 entry 顺序�
 | D23 | GUI API 形态 | 单一全局表 **`gui`**（不平铺 25+ 个全局名） |
 | D24 | 截图格式 | **PNG（stored deflate，自写编码器）** 为默认；`raw`(BGRA)/`bmp` 可选 |
 | D25 | 请求选项载体 | 查询串 + 少量头部；C 侧**不写 JSON 解析器**（JSON 请求体直通 Lua 的 `jsonx`） |
-| D26 | 脚本传输 | 请求体 = Lua 源码，`luaL_loadbuffer(..., "@<文件名>")`；**不落盘**，跳过 `generate_templete()` |
+| D26 | 脚本传输 | 请求体 = Lua 源码，`luaL_loadbuffer(..., "@<文件名>")`；**全程不落盘**（模块也不再生成 `cdebugger.d.lua` / `.luarc.json`，改由 nvim 插件的 LuaLS 注解库提供） |
 | D27 | server 归属 | server 跑在**模块里**；启动器只解析选项；`boot` 末尾追加字段 + `AUTODBG_ABI_VERSION` 1→2 |
 | D28 | MCP 长路 | 传输/流式在 C，**JSON-RPC 分发在 Lua**（`jsonx` 已内置 encode+decode） |
 | D29 | 命令行 client | **不做专用 `adbgcli`**：`curl` / `Invoke-WebRequest` / nvim 插件就是 client |

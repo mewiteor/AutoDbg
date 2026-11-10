@@ -71,7 +71,7 @@ harness 入口：`pwsh tools/w9x_test/w9x.ps1 -Action check|run|record|revert|ga
 | 20 | GBK 脚本（CP936 执行字符集） | guest 里抓不到 stdout → **人工确认** | 人工 |
 | 21 | UTF-8 BOM 脚本 | ✅ 已自动化（golden `bom.txt`）：98 上 Lua 5.5 直接 `exit=3` | 完成 |
 | 22 | 中文路径 + 长路径 | 能打开、能跑；`GetModuleFileName(NULL)` 仍是主 exe（`AGENTS.md` §11.5） | 待做 |
-| 23 | 只读 / 不可写目录 | `cdebugger.d.lua` + `.luarc.json` 生成失败时静默返回（不崩） | 待做 |
+| 23 | 只读 / 不可写目录 | 模块**不再写脚本目录**（编辑器提示已移到 nvim 插件），只读目录下应能正常跑完 | 待做 |
 
 ### 2.4 调试 API 在 9x 上的行为差异（记录型，允许 xfail）
 

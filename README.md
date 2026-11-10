@@ -128,7 +128,7 @@ curl -sS -X POST http://127.0.0.1:8642/mcp -H 'Content-Type: application/json' \
 - [x] Lua 5.5 **and** LuaJIT support from one deliverable; 29 stable global names + `Var` metatable.
 - [x] Single-file packaging: 2 exes instead of 6, embedded modules, in-memory mapping, variant fallback.
 - [x] Win9x static import gate green (`tools/api_check`); x86 subsystem version patched to 4.0.
-- [x] Server mode (HTTP subset), cancel/timeout, nvim client, GUI automation, MCP, client file I/O.
+- [x] Server mode (HTTP subset), cancel/timeout, nvim client (script-head markers for the remote address, LuaLS completions, LuaSnip snippets), GUI automation, MCP, client file I/O.
 
 ### Open
 

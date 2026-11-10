@@ -8,8 +8,11 @@
  *     （`all_bytecodes`）→ `my_loadfile()` 加载脚本 → 传脚本参数 → `lua_pcall`
  *     → 出错时按旧格式打印 → `lua_close`；返回旧 `_tmain` 的退出码。
  *   · `my_loadfile()`：脚本文件（源码或字节码）→ Lua 函数（原样搬入）。
- *   · `generate_templete()`：在脚本目录旁生成 `cdebugger.d.lua` + `.luarc.json`（原样搬入）。
  *   · `g_wfilepath`：脚本路径（**Q7 归 Lua 层**，不进 `DebuggerSession`）。
+ *
+ * 注：原先的 `generate_templete()`（往脚本目录旁写 `cdebugger.d.lua` + `.luarc.json`）
+ *   已移除 —— 编辑器提示改由 neovim 插件的 LuaLS 注解库提供（插件仓库
+ *   `addons/autodbg/` + `lua/autodbg/lsp.lua`），模块不再往脚本目录写文件。
  * ========================================================================== */
 #include <windows.h>
 #include <lua.hpp>
@@ -26,9 +29,6 @@ int my_loadfile(lua_State *L, LPCTSTR path);
 /* 脚本目录工具（Q7）：清空目录内容后重建；Lua 侧 `ResetDir` 的实现
  * （P4.6 从 bindings.cpp 搬来：它只操作脚本目录，与调试无关） */
 int lua_reset_dir(lua_State *L);
-
-/* 生成脚本目录旁的 `cdebugger.d.lua` + `.luarc.json`（编辑器提示用；失败静默） */
-void generate_templete();
 
 /* 建状态 → 注册 → 烘焙库（与 run_script_file 前半段逐字一致；S0 的 server/exec 用）
  * 返回 nullptr = `luaL_newstate()` 失败。 */
