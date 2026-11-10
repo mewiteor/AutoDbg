@@ -128,7 +128,7 @@ curl -sS -X POST http://127.0.0.1:8642/mcp -H 'Content-Type: application/json' \
 - [x] 同一份交付物同时支持 Lua 5.5 与 LuaJIT；29 个稳定全局名 + `Var` 元表。
 - [x] 单文件打包：2 个 exe 取代 6 个旧产物，模块内嵌 + 内存映射 + 变体回退。
 - [x] Win9x 静态导入门禁全绿（`tools/api_check`）；x86 子系统版本改写为 4.0。
-- [x] server 模式（HTTP 子集）、取消/超时、nvim 客户端（脚本头标记指定远程地址、LuaLS 补全、LuaSnip 片段）、GUI 自动化、MCP、客户端文件 I/O。
+- [x] server 模式（HTTP 子集）、取消/超时、nvim 客户端（本地/远程自动选、脚本头标记、按架构的 LuaLS 补全、LuaSnip 片段）、GUI 自动化、MCP、客户端文件 I/O。
 
 ### 待完成
 

@@ -79,6 +79,9 @@ make.bat i <dir>         :: 指定输出目录（默认 .out）
 - 无脚本参数时弹文件对话框（启动器里的 `GetOpenFileNameW`，9x 降级 A 版）选脚本。
 - 选项（启动器层）：`--flavor=lua|luajit`（默认 lua 5.5）、`--variant=modern|legacy`（仅排障；正常靠平台探测 + 映射失败回退）、`--list`（列出载荷里的模块）、`--module-dir=<dir>`（调试：从磁盘取同名 DLL，仍走内存映射）、`--quiet`（关错误弹窗）、`--selftest`（跑纯函数自测）、`--server[=http]` 及其 `--server-*` 子选项（§12）。
 - **脚本首行标记**也能选 flavor：`--!lua` / `--!luajit`（优先级：命令行 > 首行标记 > 字节码 magic > 默认 lua）。
+  其它 `--!xxx` 一律报错退出（D9）；例外：`--!autodbg` / `--!adbg` 是**编辑器侧标记**
+  （远程地址 / exe / 架构），launcher 会**跳过它继续看下一行**（所以同一份脚本既能被 nvim 插件跑，
+  也能直接命令行跑；`PITFALLS.md` N9）。
 - `state.cpp` **不再**往脚本目录写任何文件（`cdebugger.d.lua` / `.luarc.json` 已移除）：编辑器补全改由 neovim 插件的 LuaLS 注解库提供（§12.5）。
 - 脚本参数从 `argv[2..]` 压入 Lua；退出码 0 = 成功，-1 = 加载/运行失败，Lua 运行时错误为 LuaJIT/Lua 的错误码（2 等），启动器自己的错误为 2（另有 `--list` / `--selftest` / `/shutdown` 等正常返回 0）。
 
@@ -387,22 +390,24 @@ payload              // 单条 LZMA 流：各模块原始字节按 entry 顺序�
 
 ### 12.5 neovim 插件（`nvim/`，子模块）
 
-- 命令：`:AutoDbgRun`（当前 buffer / 选区 / 文件）、`:AutoDbgCancel`、`:AutoDbgHealth`（会打印实际用的地址）、`:AutoDbgHeader`（插入脚本头标记）、`:AutoDbgLsp [on|off]`（挂/摘注解库）。
-- 传输：`vim.system` + `curl`，脚本走 stdin（**不落盘**）；结果落 scratch buffer，`<file>:<line>:` 进 quickfix。
-- 默认响应格式 **JSON**（D33，插件要渲染 `exit`/`canceled`/`timed_out`/`truncated`）。
+- 命令：`:AutoDbgRun`（当前 buffer / 选区 / 文件）、`:AutoDbgCancel`、`:AutoDbgHealth`（报本次的模式与地址）、`:AutoDbgHeader [remote|local]`（插入脚本头标记）、`:AutoDbgLsp [on|off]`（挂/摘注解库）。
+- **两种运行模式（D39）**：能拿到 exe（标记 `exe=` > `setup.exe` > PATH 里的 `AutoDbg_{64,86}.exe`）→ **本地模式**直接跑 exe；否则 → **远程模式**（HTTP `/run`）。标记的 exe 不存在时**回落远程**并提示一次；`setup{ mode = "remote" }` 强制远程，`mode = "local"` 则必须本地（找不到就报错）。
+- 本地模式：buffer 写到临时文件跑完即删（AutoDbg 只接受脚本路径），临时路径在输出里被换回 buffer 名（quickfix 仍可用）；默认带 `--quiet`（免 headless 被 MessageBox 挂住）；flavor 由脚本自己的 `--!lua`/`--!luajit` 决定。
+- 远程模式：`vim.system` + `curl`，脚本走 stdin（**不落盘**）；结果落 scratch buffer，`<file>:<line>:` 进 quickfix；默认响应格式 **JSON**（D33）。
 - 客户端效果循环在 `nvim/lua/autodbg/effects.lua`（base64 + `exec_effect`，≤16 轮，把每轮 `stdout_so_far` 拼回最终结果）。
 - **脚本头标记（modeline）**：`nvim/lua/autodbg/modeline.lua` 解析前/后 5 行里的
-  `--!autodbg url=http://host:port token=…`（也认 `-- autodbg: ...` / `-- adbg:`）。
-  键只有 `url` / `host` / `port` / `token`，**覆盖 `setup{}` 的默认值**；裸 `--!autodbg` 只做标记。
-- **LuaLS 注解库（取代模块的 `generate_templete`）**：插件自带 LLS-Addons 结构的
-  `nvim/addons/autodbg/{config.json, library/*.lua}`（`lualib` / `variant` / `callbacks` /
-  `debugger` / `gui` / `file_io`，首行都是 `---@meta`）。`nvim/lua/autodbg/lsp.lua` 在
-  「当前 buffer 头部有标记」时把它加进 lua_ls 的 `Lua.workspace.library` 并 notify 刷新。
+  `--!autodbg url=… token=… / host=… port=… / exe=… / arch=x86|x64`（也认 `-- autodbg:` / `-- adbg:`），
+  **覆盖 `setup{}` 的默认值**；裸 `--!autodbg` 只做标记。
+- **LuaLS 注解库（取代模块的 `generate_templete`）**：插件自带
+  `nvim/addons/autodbg/library/*.lua`（与架构无关）+ `nvim/addons/autodbg/arch/{x86,x64}/context.lua`
+  （**按架构**的 `Context`：x86 = 23 项，x64 = 60 项含 `Xmm0-15`/`R8-R15`，D40）。
+  `nvim/lua/autodbg/lsp.lua` 在「当前 buffer 头部有标记」时把 `library/` + `arch/<arch>/`
+  加进 lua_ls 的 `Lua.workspace.library` 并 notify 刷新；换架构时先摘另一个。
   ❗`workspace.library` 是 **client 级全局**（lua_ls 不支持按 buffer 挂库）→ 只能**懒启用**，
   一旦启用本会话内其它 Lua 文件也会看到这些注解；`setup{ lsp = { enable = false } }` 或
   `:AutoDbgLsp off` 可关掉（`PITFALLS.md` N5）。
 - **LuaSnip 片段**：`nvim/lua/autodbg/snippets.lua`（**不硬依赖** LuaSnip，没有就安静跳过），
-  `setup{ snippets = { enable = true } }` 时在 `FileType lua` 注册；触发词 `adbg` / `adrun` /
+  `setup{ snippets = { enable = true } }` 时在 `FileType lua` 注册；触发词 `adbg`（远程）/ `adbgl`（本地）/ `adrun` /
   `adbp` / `adrunbp` / `adhw` / `adctx` / `admem` / `adstack` / `adexcept` / `adgui` / `adclick` / `adfile`。
   ❗LuaSnip 的 `t{"a","b"}` 是**多行**文本节点（元素之间自动换行）——写片段时把「续行」
   拆成独立元素会把一行拆成两行（`PITFALLS.md` N6）。
@@ -449,3 +454,5 @@ payload              // 单条 LZMA 流：各模块原始字节按 entry 顺序�
 | D36 | SSE/流式形态 | `Accept: text/event-stream` → `chunked` + **单事件**；增量推帧留待后续（见 `plan_server.md`） |
 | D37 | client 文件 I/O 机制 | **协程挂起 + 效果协议**（`read_file`/`write_file` → `yield` 效果表 → 客户端本地执行 → `POST /effects` 恢复）；不重放脚本、不碰客户端磁盘 |
 | D38 | 挂起/恢复的落地细节 | ①`/run` 也跑在协程里，完成即关、挂起则留；②MCP 用 `call_yielding` 让 yield 穿透 pcall；③`lualib/effects.lua` 顶层不能取 `jsonx`（按文件名烘焙，effects 先于 jsonx） |
+| D39 | nvim 插件的运行模式 | **本地优先**：标记 `exe=` > `setup.exe` > PATH 里的 `AutoDbg_{64,86}.exe`，拿到就跑本地；拿不到（或标记的 exe 不存在）→ **回落远程**（用 `url`/`host`/`port`）。`mode = "remote"` 强制远程，`mode = "local"` 则必须本地（找不到报错，不静默回落） |
+| D40 | 架构决定 LSP 注解 | `Context` 按架构拆成两份：x86 = 23 项、x64 = 60 项（含 `Xmm0-15` / `R8-R15` / `P1Home…`）；`lsp.lua` 只挂当前架构那一份（标记 `arch=` > `exe` 文件名 > `setup.lsp.arch` > 缺省 `x64`），切换时先摘另一个 |

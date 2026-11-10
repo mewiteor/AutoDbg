@@ -329,7 +329,9 @@ bool ask_script()
 }
 
 /* ---- flavor 选择（§2.5 / D9 / D10）----
- * 只看**第一个非空行**；UTF-8 BOM 跳过；UTF-16 BOM 视为「无标记」。
+ * 只看**最开始若干行**（跳过空行）：UTF-8 BOM 跳过；UTF-16 BOM 视为「无标记」。
+ * `--!autodbg` / `--!adbg` 是**编辑器侧标记**（远程地址 / exe / arch），不是 flavor
+ *   → 跳过整行继续看下一行（这样同一份脚本既能被 nvim 插件跑，也能直接命令行跑）。
  * 返回：0/1 = 选定；2 = 无标记；3 = 未知标记（调用方报错退出）。 */
 unsigned flavor_from_script(const char *path, char *bad_name, unsigned bad_cap)
 {
@@ -363,12 +365,15 @@ unsigned flavor_from_script(const char *path, char *bad_name, unsigned bad_cap)
         return 2;
     }
 
-    /* 跳空白 */
-    while (i < read && (buf[i] == ' ' || buf[i] == '\t' || buf[i] == '\r' || buf[i] == '\n'))
-        i++;
-
-    if (i + 3 <= read && buf[i] == '-' && buf[i + 1] == '-' && buf[i + 2] == '!')
+    for (;;)
     {
+        /* 跳空白 */
+        while (i < read && (buf[i] == ' ' || buf[i] == '\t' || buf[i] == '\r' || buf[i] == '\n'))
+            i++;
+
+        if (i + 3 > read || buf[i] != '-' || buf[i + 1] != '-' || buf[i + 2] != '!')
+            return 2;   /* 第一个非空行不是标记 → 无标记 */
+
         i += 3;
         char     name[16];
         unsigned n = 0;
@@ -387,6 +392,14 @@ unsigned flavor_from_script(const char *path, char *bad_name, unsigned bad_cap)
         if (str_ieq(name, "luajit") || str_ieq(name, "jit"))
             return k_flavor_luajit;
 
+        /* `--!autodbg ...`（nvim 插件的脚本头标记）不是 flavor → 跳过整行继续扫 */
+        if (str_ieq(name, "autodbg") || str_ieq(name, "adbg"))
+        {
+            while (i < read && buf[i] != '\n')
+                i++;
+            continue;
+        }
+
         /* 未知标记：报错退出（D9，让 typo 可见） */
         unsigned k = 0;
         for (; name[k] != '\0' && k + 1 < bad_cap; k++)
@@ -394,8 +407,6 @@ unsigned flavor_from_script(const char *path, char *bad_name, unsigned bad_cap)
         bad_name[k] = '\0';
         return 3;
     }
-
-    return 2;   /* 无标记 */
 }
 
 /* 从磁盘读一个模块（D5 的 `--module-dir`，仍走内存映射，不 LoadLibrary） */

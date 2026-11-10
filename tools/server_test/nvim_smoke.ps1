@@ -1,4 +1,4 @@
-﻿# =============================================================================
+# =============================================================================
 # tools/server_test/nvim_smoke.ps1 —— neovim 客户端的无头验收（S3）
 #
 # 来源：新写（plan_server.md S3）。
@@ -62,6 +62,8 @@ try
     }
 
     $env:AUTODBG_URL = "http://127.0.0.1:$Port"
+    # 本地模式用例需要真实的 exe（拿不到时由 lua 侧跳过那几条断言）
+    $env:AUTODBG_EXE = $Exe
     & $Nvim --headless -u NONE --cmd "set rtp+=$Rtp" -c "luafile $Smoke" -c "qa!"
     $code = $LASTEXITCODE
     Write-Output "nvim exit=$code"

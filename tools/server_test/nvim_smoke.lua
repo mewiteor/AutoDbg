@@ -150,8 +150,8 @@ check("header.idempotent", adbg.insert_header({ bufnr = hbuf }) == false)
 -- run() 会用标记里的地址（指向一个必然连不上的端口 → 只验证优先级与 res.url）
 set_buffer({ "--!autodbg url=http://127.0.0.1:9", 'print("never")' }, "marker-url.lua")
 local mres = adbg.run({ sync = true, open = "none" })
-check("modeline.run-url", mres.url == "http://127.0.0.1:9" and mres.mode == "modeline",
-  tostring(mres.url) .. " mode=" .. tostring(mres.mode))
+check("modeline.run-url", mres.url == "http://127.0.0.1:9" and mres.url_mode == "modeline" and mres.mode == "remote",
+  tostring(mres.url) .. " url_mode=" .. tostring(mres.url_mode) .. " mode=" .. tostring(mres.mode))
 check("modeline.run-unreachable", mres.status == 0 and mres.ok == false, "status=" .. tostring(mres.status))
 
 -- ---------------------------------------------------------------- LuaLS 注解库（不需要 server）
@@ -235,12 +235,91 @@ for _, s in ipairs(uniq) do
 end
 package.loaded["luasnip"] = nil
 package.loaded["autodbg.snippets"] = nil
+-- ---------------------------------------------------------------- 本地 / 远程模式（modeline exe / arch）
+-- 规则：能拿到 exe → 本地跑；拿不到（或标记的 exe 不存在）→ 回退远程。
+local exe = os.getenv("AUTODBG_EXE")
+local have_exe = exe ~= nil and exe ~= "" and vim.fn.filereadable(exe) == 1
+
+local mlexe = modeline.from_text("--!autodbg exe=C:/x/AutoDbg_64.exe arch=64\n")
+check("modeline.exe", mlexe.found == true and tostring(mlexe.exe):lower():find("autodbg_64%.exe") ~= nil, tostring(mlexe.exe))
+check("modeline.arch-alias", mlexe.arch == "x64", tostring(mlexe.arch))
+check("modeline.arch-x86", modeline.from_text("--!autodbg arch=i386\n").arch == "x86")
+check("modeline.arch-from-exe", modeline.arch_from_exe("C:/x/AutoDbg_86.exe") == "x86")
+
+local local_exe = require("autodbg.local")
+local mode, _ = adbg.resolve_mode({ url = url, exe = "C:/definitely/not/here/AutoDbg_64.exe", mode = "auto" })
+check("mode.missing-exe-falls-back", mode == "remote", tostring(mode))
+check("mode.forced-remote", (adbg.resolve_mode({ url = url, exe = exe, mode = "remote" })) == "remote")
+if have_exe then
+  local m2, found = adbg.resolve_mode({ url = url, exe = exe, mode = "auto" })
+  check("mode.local-exists", m2 == "local" and vim.fs.normalize(found or "") == vim.fs.normalize(exe), tostring(m2))
+else
+  ok("mode.local-exists", "skip（没有 AUTODBG_EXE）")
+end
+
+-- PATH 发现：把 exe 所在目录塞进 PATH，不写 exe= 也应走本地
+if have_exe then
+  local oldpath = vim.env.PATH
+  vim.env.PATH = vim.fs.dirname(exe) .. ";" .. tostring(oldpath)
+  local m3, f3, why3 = adbg.resolve_mode({ url = url, mode = "auto" })
+  vim.env.PATH = oldpath
+  check("mode.path-discovery", m3 == "local" and tostring(why3) == "PATH", tostring(m3) .. "/" .. tostring(why3))
+else
+  ok("mode.path-discovery", "skip（没有 AUTODBG_EXE）")
+end
+
+-- 真实本地执行：带 `--!autodbg` 标记的 buffer 直接跑 exe（launcher 会跳过这个非 flavor 标记）
+if have_exe then
+  set_buffer({ "--!autodbg exe=" .. exe .. " arch=x64", 'print("local-mode-ok")' }, "local.lua")
+  local lres = adbg.run({ sync = true, open = "none" })
+  check("local.mode", lres.mode == "local", tostring(lres.mode))
+  check("local.ok", lres.ok == true and lres.exit == 0, "exit=" .. tostring(lres.exit) .. " err=" .. tostring(lres.stderr))
+  check("local.stdout", (lres.stdout or ""):find("local-mode-ok", 1, true) ~= nil, "stdout=[" .. tostring(lres.stdout) .. "]")
+  check("local.arch", lres.arch == "x64", tostring(lres.arch))
+  local hres = adbg.health({ sync = true })
+  check("local.health", hres.mode == "local" and tostring(hres.body):find("exe=", 1, true) ~= nil, tostring(hres.body))
+else
+  ok("local.mode", "skip（没有 AUTODBG_EXE）")
+  ok("local.ok", "skip")
+  ok("local.stdout", "skip")
+  ok("local.arch", "skip")
+  ok("local.health", "skip")
+end
+
+-- 标记里的 exe 不存在 → 回退远程（这里真的打到正在跑的 server）
+set_buffer({ "--!autodbg exe=C:/nope/AutoDbg_64.exe", 'print("remote-fallback")' }, "fallback.lua")
+local fres = adbg.run({ sync = true, open = "none" })
+check("mode.fallback-remote", fres.mode == "remote" and fres.ok == true, tostring(fres.mode) .. "/" .. tostring(fres.exit))
+check("mode.fallback-stdout", (fres.stdout or ""):find("remote-fallback", 1, true) ~= nil, tostring(fres.stdout))
+
+-- LuaLS 注解库的架构目录（x86 没有 Xmm，x64 有）
+check("lsp.arch.x86-dir", vim.fn.filereadable(lsp.library_dirs("x86")[2] .. "/context.lua") == 1)
+check("lsp.arch.x64-dir", vim.fn.filereadable(lsp.library_dirs("x64")[2] .. "/context.lua") == 1)
+local x86_ctx = table.concat(vim.fn.readfile(lsp.library_dirs("x86")[2] .. "/context.lua"), "\n")
+local x64_ctx = table.concat(vim.fn.readfile(lsp.library_dirs("x64")[2] .. "/context.lua"), "\n")
+check("lsp.arch.x86-fields", x86_ctx:find("---@field Cip", 1, true) ~= nil and x86_ctx:find("---@field Xmm0", 1, true) == nil)
+check("lsp.arch.x64-fields", x64_ctx:find("---@field Xmm15", 1, true) ~= nil and x64_ctx:find("---@field VectorControl", 1, true) ~= nil)
+local abuf = vim.api.nvim_create_buf(false, true)
+vim.api.nvim_buf_set_lines(abuf, 0, -1, false, { "--!autodbg arch=x86" })
+check("lsp.arch.resolve-x86", lsp.resolve_arch(abuf) == "x86")
+local abuf2 = vim.api.nvim_create_buf(false, true)
+vim.api.nvim_buf_set_lines(abuf2, 0, -1, false, { "--!autodbg" })
+check("lsp.arch.resolve-default", lsp.resolve_arch(abuf2) == "x64")
+
+-- 片段：本地标记 adbgl（触发词 + 展开文本是合法 Lua）
+local lsnip = seen["adbgl"]
+check("snippets.trig.adbgl", lsnip ~= nil)
+if lsnip then
+  local text = render(lsnip.nodes)
+  check("snippets.valid-lua.adbgl", load(text) ~= nil, text:gsub("\n", " | "))
+end
+
 -- ---------------------------------------------------------------- /health
 -- 注意：health/cancel 也尊重**当前 buffer** 的标记，所以先换回一个没有标记的 buffer
 -- （上一个用例留了一个指向 127.0.0.1:9 的标记）。
 set_buffer({ "print(1)" }, "health.lua")
 local h = adbg.health({ sync = true })
-check("health.mode", h.mode == "setup", tostring(h.mode))
+check("health.mode", h.mode == "remote" and h.url_mode == "setup", tostring(h.mode) .. "/" .. tostring(h.url_mode))
 check("health.status", h.status == 200, "status=" .. tostring(h.status))
 check("health.body", (h.body or ""):find('"ok":true', 1, true) ~= nil or (h.body or ""):find('"ok": true', 1, true) ~= nil,
   tostring(h.body))
