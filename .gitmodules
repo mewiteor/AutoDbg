@@ -1,0 +1,9 @@
+[submodule "thirdpart/lua"]
+	path = thirdpart/lua
+	url = https://github.com/lua/lua.git
+[submodule "thirdpart/luaJIT"]
+	path = thirdpart/luaJIT
+	url = https://github.com/luaJIT/luaJIT.git
+[submodule "nvim"]
+	path = nvim
+	url = https://github.com/mewiteor/AutoDbg.nvim.git

@@ -1,99 +1,77 @@
 # AutoDbg
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![C](https://img.shields.io/badge/Core-C%2FC%2B%2B-00599C?style=flat&logo=c&logoColor=white)]()
-[![Python](https://img.shields.io/badge/Binding-Python-3776AB?style=flat&logo=python&logoColor=white)]()
-[![Lua](https://img.shields.io/badge/Binding-Lua%2FLuaJIT-2C2D72?style=flat&logo=lua&logoColor=white)]()
+![Core](https://img.shields.io/badge/Core-C%2FC%2B%2B-00599C?style=flat&logo=c&logoColor=white)
+![Scripting](https://img.shields.io/badge/Scripting-Lua%205.5%2FLuaJIT-2C2D72?style=flat&logo=lua&logoColor=white)
+![Client](https://img.shields.io/badge/Client-Neovim-57A143?style=flat&logo=neovim&logoColor=white)
 
 **[English](./README.md)** | **[中文](./README.zh.md)**
 
 > **脚本化 · 无头引擎 · AI 就绪**
 
-**AutoDbg** 是一个专为**自动化逆向工程**与 **AI 辅助分析**设计的现代无头 (Headless) 调试引擎。
+**AutoDbg** 是一个无头 (Headless) 的 Windows 调试引擎（Win32 Debug API），为**自动化逆向工程**与 **AI 辅助分析**提供底层调试原语。
 
-抛弃了传统调试器（如 x64dbg, OllyDbg）臃肿的 UI 耦合与老旧的 API 设计，AutoDbg 采用 **“纯 C 核心 + 多语言中间件”** 的架构。它将极致的底层控制力（C/C++）与高层生态（LuaJIT / Python）完美解耦，让开发者能够以现代脚本语言的优雅，去驾驭 Ring 3 层的断点、内存与线程。
+架构是「纯 C/C++ 核心 + 脚本中间层」：核心不感知任何脚本，Lua 绑定层是唯一的 `lua_State` 使用者；交付物是**单一便携 `.exe`**，运行时从自带载荷里解出模块并**在内存中映射**（不落盘）。
+
+硬性目标：**零 CRT 运行时**、**兼容 Windows 95/98**（x86 *legacy* 变体）、**同时支持 Lua 5.5 与 LuaJIT**。
 
 ---
 
 ## 🌟 为什么选择 AutoDbg？
 
-传统引擎（如 TitanEngine）在应对现代自动化需求时，常面临回调无法传递上下文（无法写闭包）、跨语言 FFI 困难、高频断点卡顿等痛点。AutoDbg 从第一行代码起，就为解决这些问题而生：
-
-- **🧩 真正的闭包与状态机支持**  
-  所有底层回调均强制携带 `void* user_context` 参数。无论是在 Lua 中写嵌套回调，还是在 Python 中传递闭包，状态都能完美映射，彻底告别全局变量。
-- **⚡ 极致性能与内存快照**  
-  针对跨进程 API (`ReadProcessMemory`) 的物理延迟，内置内存快照 (Memory Snapshot) 与 Scatter-Gather 批量读取机制。将高频的跨进程通信转化为本地内存的纳秒级解析。
-- **🧠 AI 与生态友好 (Python 原生)**  
-  提供对 Python `cffi` 极度友好的纯 C ABI (`extern "C"`)。你可以在断点回调中直接 `import capstone` 进行反汇编，或调用 LLM 大模型实时分析寄存器状态。
-- **🪶 轻量级 Lua 独立宿主**  
-  将核心引擎与 Lua/LuaJIT 打包为单一、便携的 `.exe` 文件。无需安装任何环境，即可在 Windows XP 甚至更老的系统上运行复杂的自动化追踪脚本。
+- **🧩 真正带上下文的回调**  
+  所有底层回调都强制携带 `void* user_context`（另有宿主无关的 `callback_ref_t` 令牌），Lua 里的嵌套闭包与状态机无需全局变量即可工作。
+- **🪶 每个架构只有一个文件**  
+  `.out/AutoDbg_86.exe` 覆盖 Win95 → Win11 32 位 × {Lua 5.5, LuaJIT} × {modern, legacy}；`.out/AutoDbg_64.exe` 覆盖 x64。模块以 LZMA 单流内嵌、内存映射加载——无需安装、不写临时文件。
+- **🌐 远程执行 / 编辑器内执行 / AI 就绪**  
+  `--server` 把同一个二进制变成 HTTP 服务（`POST /run` 直接执行**请求体里的 Lua 源码**并把输出随响应返回）；**neovim 插件**一键跑当前 buffer 并把结果显示在 scratch buffer；`POST /mcp` 提供 **MCP** 端点给 AI 代理用。
+- **🖱️ GUI 自动化**  
+  `gui` 表（键鼠注入、窗口与控件枚举、PNG 截图）让脚本——或 AI——能在目标停下时直接操作它的界面。
 
 ---
 
 ## 🏗️ 架构设计
 
-AutoDbg 采用严格的三层分离架构：
+```text
+AutoDbg_<arch>.exe        零 CRT 启动器 → payload (LZMA 单流) → 手工映射模块 → autodbg_run()
+├─ src/core/              调试引擎（C++，禁 Lua）：会话、断点、内存、上下文、栈回溯、GUI 原语
+├─ src/scripting/lua/     唯一感知 lua_State 的层：29 个契约全局 + gui 表 + read_file/write_file
+│                         + server / exec / MCP 会话 / 输出捕获
+├─ src/common/            allocator、containers、dynapi、cmdline、net(winsock)、http、json、png、base64
+└─ src/sys/               零 CRT 运行时：影子头、导入表 .def、MASM、LZMA、打包/映射、启动器
+```
 
-1. **核心引擎 (纯 C/C++ 静态库)**  
-   负责 OS 调试 API 交互（Win32 Debug API / Linux `ptrace`）、PE/ELF 解析与线程上下文管理。**零脚本依赖**，仅导出纯 C ABI 与不透明句柄。
-2. **Lua 中间件 (独立宿主)**  
-   链接核心引擎与 LuaJIT。利用 FFI 实现零开销的底层调用，专为**高频中断响应**与**老旧系统兼容**设计。
-3. **Python 中间件 (扩展模块)**  
-   通过 `cffi` 动态加载核心引擎。提供 `asyncio` 异步事件流封装，完美契合**复杂数据分析**、**网络通信**与 **AI 模型接入**。
+- **核心引擎**（`src/core`）——Win32 调试主循环、软/硬件断点、内存与 PE 解析、线程上下文、栈回溯、PEB 反反调试。零脚本依赖。
+- **Lua 中间层**（`src/scripting/lua`）——用**同一套全局命名**同时绑定 Lua 5.5 与 LuaJIT；HTTP server、持久 MCP 会话与 `gui` 表也在这一层。
+- **客户端**——命令行（`AutoDbg_<arch>.exe script.lua`）、neovim 插件（`nvim/`，独立仓库）、`curl`、MCP 客户端。
 
 ---
 
 ## 🚀 核心特性
 
-- **多类型断点**：INT3 软件断点、硬件断点 (DRx) 与 PageGuard 内存断点。
-- **深度系统感知**：原生支持 x64 `RUNTIME_FUNCTION` 栈回溯、C++ 异常处理 (EH) 对象深度 Dump 以及 TLS 回调拦截。
-- **反反调试基建**：内置 PEB 标志位修复与 Ntdll API 内存 Patch 等基础反检测手段。
-- **线程安全设计**：全面句柄化 (`SessionHandle`)，支持单进程内并发调试多个目标。
+- **断点**：INT3 软件断点、硬件断点 (DRx)，支持一次性断点与批量设置。
+- **深度系统感知**：PE 解析（节/导入/导出）、x86 与 x64 栈回溯（`StackWalk64` + `RUNTIME_FUNCTION` 兜底，全部动态取符号 → legacy 导入表保持干净）。
+- **反反调试**：PEB `BeingDebugged` / `NtGlobalFlag` 修补，modern 变体内置 **ScyllaHide** 集成（legacy 变体用 `/DNO_SCYLLA_HIDE` 编掉）。
+- **server 模式**：无状态 `POST /run`（源码从内存加载执行，**不落盘**）、`/cancel`（100 ms 粒度）、`/shutdown`、`/health`、`--server-token`（默认 loopback 免 token）。
+- **GUI 自动化**：`gui.position/move/click/write/press`、`gui.windows/find/activate/rect/children`、`gui.text/set_text/post/send`、`gui.screenshot`（PNG）。
+- **客户端文件 I/O**：`read_file`/`write_file` 读写的是**客户端**那台机器的磁盘；server 挂起协程、由客户端完成效果后恢复，二进制数据在远程会话里照样安全。
+- **MCP**：`POST /mcp` + `Mcp-Session-Id` 会话，13 个工具（`lua_eval`、调试原语、GUI 原语）。
+- **编辑器集成**：neovim 插件提供 `:AutoDbgRun`（buffer / 选区）、`:AutoDbgCancel`、`:AutoDbgHealth`，错误行进 quickfix。
+- **老系统支持**：x86 子系统版本改写为 4.0，所有 Win9x 风险符号走动态 API 层，静态导入门禁（`tools/api_check`）保证 legacy 导入表里没有 XP+ 符号。
 
 ---
 
 ## 💻 快速开始
 
-### Python：AI 与生态集成
-利用 Python 的 `asyncio` 与丰富的生态系统，构建线性、可读的自动化脚本。
+### 本机跑脚本
 
-```python
-import asyncio
-import capstone
-from autodbg import DebugSession
-
-async def trace_large_allocations():
-    session = DebugSession()
-    await session.start("C:\\target.exe")
-    
-    md = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_64)
-    
-    # 原生支持嵌套闭包与状态机
-    async def on_malloc_hit(ctx):
-        size = ctx.rdi
-        if size > 1000:
-            # 无缝使用 Python 生态 (内存快照)
-            caller_rip = ctx.rsp 
-            code = session.read_memory_snapshot(caller_rip, 32)
-            
-            print(f"\n[!] 发现大块内存分配: {size} bytes")
-            for insn in md.disasm(code, caller_rip):
-                print(f"    0x{insn.address:x}:\t{insn.mnemonic}\t{insn.op_str}")
-                if insn.mnemonic == 'ret': break
-                
-    await session.set_breakpoint("msvcrt.dll", "malloc", on_malloc_hit)
-    await session.resume()
-
-asyncio.run(trace_large_allocations())
+```bat
+.out\AutoDbg_64.exe script.lua
+.out\AutoDbg_86.exe --flavor=luajit script.lua      :: 用 LuaJIT 而不是 Lua 5.5
 ```
 
-### Lua：高频响应与老旧环境
-通过独立的 `autodbg.exe` 运行。零依赖，借助 LuaJIT FFI 实现极致性能。
-
 ```lua
--- autodbg.exe script.lua
-local state = { hits = 0 }
-
+-- script.lua
 Run({
     imagepath = "C:\\target.exe",
     callback = function(pid, tid)
@@ -101,26 +79,75 @@ Run({
             modname = "kernel32.dll",
             rva = FindFuncRva("kernel32.dll", "CreateFileW"),
             callback = function(info)
-                state.hits = state.hits + 1
-                local ctx = GetContext(info.tid)
-                -- LuaJIT FFI 零开销寄存器访问
-                print(string.format("[命中 %d] CreateFileW 被调用! RCX: %p", state.hits, ctx.Ccx))
+                local ctx = GetContext(info.tid)          -- x86 与 x64 同名（Cax…Cip / R8…）
+                print(string.format("CreateFileW 命中, ip=0x%X", ctx.Cip))
             end
         })
     end
 })
 ```
 
+脚本首行也可以指定解释器：`--!lua` / `--!luajit`。
+
+### 远程执行（server 模式）
+
+```bat
+.out\AutoDbg_64.exe --server                       :: 127.0.0.1:8642，loopback 免 token
+```
+
+```bash
+curl -sS --data-binary @- -H 'Content-Type: text/x-lua' \
+     -H 'X-AutoDbg-Filename: buffer.lua' \
+     'http://127.0.0.1:8642/run?format=text' <<'LUA'
+print("hello from", _VERSION)
+LUA
+```
+
+### 在 neovim 里
+
+```lua
+{ dir = "~/src/AutoDbg.nvim", config = function() require("autodbg").setup({ url = "http://127.0.0.1:8642" }) end }
+```
+
+然后 `:AutoDbgRun`（或 `:'<,'>AutoDbgRun`）。详见 [`nvim/README.md`](./nvim/README.md)。
+
+### 给 AI 代理（MCP）
+
+```bash
+curl -sS -X POST http://127.0.0.1:8642/mcp -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05"}}'
+```
+
 ---
 
-## 🗺️ 路线图
+## 📊 进度
 
-- [ ] **阶段 1**: Win32 核心引擎 (软件断点、异常处理、PE 解析、x64 栈回溯)。
-- [ ] **阶段 2**: Lua/LuaJIT 独立宿主集成与闭包回调支持。
-- [ ] **阶段 3**: 硬件断点 (DRx) 与内存断点 (PageGuard) 支持。
-- [ ] **阶段 4**: Python `cffi` 中间件与 `asyncio` 异步事件流封装。
-- [ ] **阶段 5**: 跨平台硬件抽象层 (HAL)，引入 Linux `ptrace` 与 `process_vm_readv`。
-- [ ] **阶段 6**: 集成 Capstone/Unicorn，打造 AI 驱动的自动化脱壳/分析工作流。
+### 已完成
+
+- [x] Win32 核心引擎：软/硬件断点、内存与 PE 解析、线程上下文、x64/x86 栈回溯。
+- [x] 同一份交付物同时支持 Lua 5.5 与 LuaJIT；29 个稳定全局名 + `Var` 元表。
+- [x] 单文件打包：2 个 exe 取代 6 个旧产物，模块内嵌 + 内存映射 + 变体回退。
+- [x] Win9x 静态导入门禁全绿（`tools/api_check`）；x86 子系统版本改写为 4.0。
+- [x] server 模式（HTTP 子集）、取消/超时、nvim 客户端、GUI 自动化、MCP、客户端文件 I/O。
+
+### 待完成
+
+- [ ] Win9x 实机验收（测试矩阵、编码、dynapi 降级路径）——见 `plan_p7_win9x.md`。
+- [ ] 增量流式（脚本执行中推 SSE 帧）、`GET /screenshot`、nvim 的纯 `vim.loop` 传输——见 `plan_server.md`。
+- [ ] PageGuard 内存断点、内存快照 / Scatter-Gather 批量读。
+- [ ] Python (`cffi`) 中间件、Linux `ptrace` HAL、Capstone/Unicorn 集成、`BsonDecode`。
+
+---
+
+## 📚 文档
+
+| 文件 | 内容 |
+| --- | --- |
+| `AGENTS.md` | 构建、门禁、硬约束、风格、架构、打包 ABI、已定决策 |
+| `PITFALLS.md` | 已经踩过的坑（现象 → 根因 → 现在的做法） |
+| `plan_p7_win9x.md` | Win9x 实机测试的剩余工作 |
+| `plan_server.md` | server / MCP / GUI / 客户端文件 I/O 的剩余工作 |
+| `nvim/README.md` | neovim 插件的安装、命令与配置 |
 
 ---
 

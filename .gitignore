@@ -1,0 +1,9 @@
+compile_commands.json
+.out
+.build
+
+# 临时/草稿目录（一次性实验、探针与基线输出，不入库）
+tmp/
+
+# Win9x harness 的本地凭据（不入库）
+tools/w9x_test/config.local.ps1
