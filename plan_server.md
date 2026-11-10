@@ -82,6 +82,7 @@
 | 请求级切换 flavor/variant | server 的 flavor 由「映射到的模块」决定 | 不做（要新增 launcher→module 派发契约 = ABI 变更） |
 | 多租户并发 | 执行严格串行（并发 1），目标进程是全局唯一资源 | **设计如此**：这是「单 operator 的远程调试后端」 |
 | `BsonDecode` | 仍是桩（`bson.cpp` 报 `not implement BsonDecode yet!`） | 不为此单独实现，见 §5 |
+| client 文件 I/O 在**调试回调里**不可用 | `Attach`/`Run` 回调、断点回调里调 `read_file`/`write_file` 无法挂起（LuaJIT 不支持跨 C 边界 yield，Lua 5.5 不允许跨普通 `lua_pcall`） | 不做队列：现在返回 `nil, <可操作提示>`（回调里收集，`Attach`/`Run` 返回后再写；或用 `io.open` 写服务器本机）。判定靠 `helpers.cpp` 的 `callback_depth()` |
 
 ---
 

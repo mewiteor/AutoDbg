@@ -85,9 +85,22 @@ int pcall_pre(lua_State *L)
     return lua_gettop(L);
 }
 
+/* 回调嵌套深度：只有 `pcall()` 会改它，所以它精确对应「引擎正在 C 里调 Lua」这件事。 */
+static int g_callback_depth = 0;
+
+int callback_depth()
+{
+    return g_callback_depth;
+}
+
 bool pcall(lua_State *L, int narg, int nresult, int oldtop, LPCTSTR file, int line)
 {
+    /* ❗进入回调前后维护深度：回调里 `lua_yield` 非法（LuaJIT 不支持跨 pcall，
+     * Lua 5.5 也不允许跨普通 lua_pcall），file_io 靠这个值给出可操作的错误。 */
+    g_callback_depth++;
     int r = lua_pcall(L, narg, nresult, oldtop);
+    g_callback_depth--;
+
     switch (r)
     {
     case 0        : assert(lua_gettop(L) == oldtop + nresult); return true;

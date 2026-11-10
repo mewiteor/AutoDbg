@@ -13,6 +13,8 @@
  * ========================================================================== */
 #include "file_io.hpp"
 
+#include "helpers.hpp" /* callback_depth()：判断是不是在引擎调进来的回调里 */
+
 #include "common/allocator.hpp"
 #include "common/base64.hpp"
 #include "common/json_writer.hpp"
@@ -25,6 +27,34 @@ namespace autodbg::host
 namespace
 {
 bool g_client_io = false;
+
+/* ---- 为什么现在**不能** yield ----
+ * server 模式下 read_file/write_file 靠 `lua_yield` 把活交给客户端，而 `lua_yield` 只能从
+ * 「被 resume 起来的协程最外层」yield：
+ *   · 调试回调（`Attach`/`Run` 的回调、断点回调…）由引擎经 `lua_pcall` 调进来 → **不允许**
+ *     （LuaJIT 完全不支持跨 C 边界 yield；Lua 5.5 也不允许跨普通 `lua_pcall`）。
+ *     不提前拦住的话 Lua 会抛 `attempt to yield across a C-call boundary`，
+ *     然后整个回调（乃至调试会话）被打断，用户只能看到一段 traceback。
+ *   · 非协程上下文（一次性 `exec_on_state` 路径）同理。
+ * 返回 nullptr = 可以 yield；否则返回给 Lua 的错误文案（**无 NUL 之外副作用**）。 */
+const char *yield_blocker(lua_State *L, const char *op)
+{
+    if (scripting::lua::callback_depth() > 0)
+    {
+        if (strcmp(op, "write_file") == 0)
+            return "write_file: 不能在调试回调里用（回调是引擎经 C 调用进来的，无法挂起等客户端）；"
+                   "改法：回调里把数据收集到表里，等 Attach/Run 返回后再 write_file；"
+                   "要写服务器本机文件请用 io.open";
+        return "read_file: 不能在调试回调里用（结果必须当场返回，无法挂起等客户端）；"
+               "改法：脚本开头先把要读的文件读进内存，回调里查表；"
+               "要读服务器本机文件请用 io.open";
+    }
+#if !defined(JIT)
+    if (lua_isyieldable(L) == 0)
+        return "read_file/write_file: 当前执行上下文不能挂起（不在协程里），无法访问客户端文件";
+#endif
+    return nullptr;
+}
 
 void push_err(lua_State *L, const char *msg)
 {
@@ -131,8 +161,7 @@ char *translate_write(const char *data, size_t n, size_t *out_n)
 }
 /* yield 一个效果表给宿主（server 模式）。`nresults` 个值由宿主在 resume 时压回。 */
 int yield_effect(lua_State *L, const char *op, const char *path, const char *mode, long long offset, long long length,
-                 const char *data, size_t data_len, bool append)
-{
+                 const char *data, size_t data_len, bool append){
     lua_createtable(L, 0, 8);
     lua_pushstring(L, op);
     lua_setfield(L, -2, "op");
@@ -320,7 +349,12 @@ int lua_read_file(lua_State *L)
     bool        text   = mode_is_text(mode);
 
     if (g_client_io)
+    {
+        const char *blocked = yield_blocker(L, "read_file");
+        if (blocked != nullptr)
+            return push_err(L, blocked), 2;
         return yield_effect(L, "read_file", path, mode, offset, length, nullptr, 0, false);
+    }
 
     char   *data = nullptr;
     size_t  n    = 0;
@@ -351,7 +385,12 @@ int lua_write_file(lua_State *L)
     bool        text   = mode_is_text(mode);
 
     if (g_client_io)
+    {
+        const char *blocked = yield_blocker(L, "write_file");
+        if (blocked != nullptr)
+            return push_err(L, blocked), 2;
         return yield_effect(L, "write_file", path, mode, 0, 0, data, n, append);
+    }
 
     size_t written = 0;
     char   err[128];

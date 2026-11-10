@@ -400,6 +400,12 @@ payload              // 单条 LZMA 流：各模块原始字节按 entry 顺序�
 - server 模式用**协程挂起 + 效果协议**（D37）：响应回 `pending{token, op, stdout_so_far, effects}`，客户端本地执行后 `POST /effects?token=<sid:gen>` 恢复；token 未知/过期/**重放** → 404。
 - C 侧只做 `lua_yield` 与效果表序列化（`file_io.cpp`）；客户端结果 JSON 交给 `lualib/effects.lua`（`jsonx.decode`）还原成 Lua 值。
 - **服务器从不触碰客户端磁盘**，也**不重放脚本**（挂起/恢复用协程，避免重复副作用）。
+- ❗**调试回调里不可用**（`Attach`/`Run` 的回调、断点/异常回调）：回调是引擎经 `pcall`
+  C 调用进来的，`lua_yield` 跨不过这个边界（LuaJIT 根本不支持，Lua 5.5 也不允许跨普通
+  `lua_pcall`）→ `read_file`/`write_file` 会返回 `nil, <可操作的错误文案>`（不会让 Lua 抛
+  `attempt to yield across a C-call boundary` 把回调/会话打断）。可用的做法：回调里把数据
+  收集到表里，等 `Attach`/`Run` **返回**后再写；或者用 `io.open` 写**服务器本机**文件。
+  判定靠 `helpers.cpp` 的 `callback_depth()`（`pcall()` 维护），`PITFALLS.md` L9。
 
 ### 12.5 neovim 插件（`nvim/`，子模块）
 

@@ -53,6 +53,7 @@
 | L6 | LuaJIT 下 `pcall` 里调 `read_file`/`write_file` 直接报错 | LuaJIT 的 `pcall` 不能跨 yield | 脚本里直接调用（不用 `pcall` 包），MCP 侧走 `call_yielding` 让 yield 穿透 |
 | L7 | `lua_pcall` 返回后循环变量/寄存器莫名其妙变了 | 见 M5（x64 关 SEH 的副作用） | 同 M5 |
 | L8 | LuaJIT 下 `runtime.version` 显示成 `Lua 5.5` | `#ifdef JIT` 判断写反了 | 用 `#ifndef JIT` 输出 5.5 版本串 |
+| L9 | 回调里调 `write_file`/`read_file` 报 `attempt to yield across a C-call boundary`，随后整个调试会话/回调直接断掉 | 回调是引擎经 `lua_pcall` C 调用进来的，而 client 文件 I/O 靠 `lua_yield` 挂起——LuaJIT 不支持跨 C 边界 yield，Lua 5.5 也不允许跨普通 `lua_pcall` | 用 `helpers.cpp` 的 `callback_depth()`（`pcall()` 维护）提前判：非 0 就返回 `nil, <可操作提示>`（回调里收集、`Attach`/`Run` 返回后再写；或用 `io.open` 写服务器本机）；非协程上下文再用 `lua_isyieldable` 兵一道 |
 
 ## M. 手工映射的模块（`src/sys/pack/module_loader`）
 

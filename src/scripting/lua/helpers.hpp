@@ -40,6 +40,13 @@ int pcall_pre(lua_State *L);
 bool pcall(lua_State *L, int narg, int nresult, int oldtop, LPCTSTR file, int line);
 
 #define PCALL(L, narg, nresult, oldtop) pcall(L, narg, nresult, oldtop, TEXT(__FILE__), __LINE__)
+
+/* 引擎→Lua 回调的嵌套深度（`pcall()` 内部维护）。
+ * >0 表示当前在 **C 调用边界内**：此时 `lua_yield` 非法（LuaJIT 根本不支持；
+ * Lua 5.5 也不允许跨普通 `lua_pcall`）——`read_file`/`write_file` 靠它提前给出
+ * 可操作的错误，而不是让 Lua 抛 "attempt to yield across a C-call boundary"
+ * （那会直接打断整个回调/调试会话，用户只能看到 traceback）。 */
+int callback_depth();
 }
 
 #endif /* AUTODBG_SCRIPTING_LUA_HELPERS_HPP */

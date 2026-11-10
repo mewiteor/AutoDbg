@@ -203,6 +203,27 @@ try
     Check 'run.runtime.ok-false' ($j.ok -eq $false) "ok=$($j.ok)"
     Check 'run.runtime.error-text' ($j.error -like '*boom*') "error=[$($j.error)]"
 
+    # --- 调试回调里的 client I/O：必须给出**可操作的错误**，而不是
+    #     “attempt to yield across a C-call boundary”（那会直接打断整个回调）
+    $cbSrc = @'
+Run({
+    cmdline = "C:\\Windows\\System32\\cmd.exe /c exit",
+    callback = function()
+        local okw, errw = write_file("C:\\tmp\\adbg_cb.bin", "abc")
+        print("w", tostring(errw))
+        local okr, errr = read_file("C:\\tmp\\adbg_cb.bin")
+        print("r", tostring(errr))
+        Detach()
+    end,
+})
+'@
+    $cb = Post-Run $cbSrc
+    $cbj = Json $cb
+    Check 'callback-io.ok' ($cbj.ok -eq $true -and $cbj.exit -eq 0) "ok=$($cbj.ok) exit=$($cbj.exit) stdout=[$($cbj.stdout)]"
+    Check 'callback-io.write-hint' ($cbj.stdout -like '*write_file*不能在调试回调里用*') "stdout=[$($cbj.stdout)]"
+    Check 'callback-io.read-hint' ($cbj.stdout -like '*read_file*不能在调试回调里用*') 'stdout should mention read_file'
+    Check 'callback-io.no-yield-error' (-not ($cbj.stdout -like '*yield across*') -and -not ($cbj.error -like '*yield across*')) "should not raise the raw yield error"
+
     # --- core 的输出也要被捕获（ReadMemory 失败会走 core 的 Error*/Print*）
     $j = Json (Post-Run 'ReadMemory(0, 4)')
     Check 'run.core-output-captured' (($j.stderr.Length + $j.stdout.Length) -gt 0 -or $j.ok -eq $false) `
