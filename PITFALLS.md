@@ -89,6 +89,7 @@
 | # | 现象 | 根因 | 现在的做法 |
 | --- | --- | --- | --- |
 | O1 | 重定向到文件后 `Print*` / `Error*` 的输出**整段消失** | 它们走 `WriteConsoleA/W`；句柄不是控制台时 `WriteConsole` 直接失败 | `PrintExN` 已分流：`GetConsoleMode` 成功 → `WriteConsole`（控制台零乱码）；否则 `WriteFile`（UTF-8 无 BOM，行尾 `\n`）。ANSI(legacy) 变体一律 `WriteFile`，分流开关用 **`_UNICODE`**（不是 `AUTODBG_WIN9X`：后者只加在 luajit flavor 上） |
+| O1b | 控制台里中文变乱码：`server: 配置错误 …` 显示成 `閰嶇疆閿欒 …`（ASCII 部分正常） | UNICODE 构建的**窄串是 UTF-8**（`/utf-8` 同时改了执行字符集），而控制台分支原来用 `WriteConsoleA` → 控制台按**代码页**（CP936）解释这些字节 | 控制台分支里先 `utf8_to_utf16_n()` 再 `WriteConsoleW`（代码页无关）；转不出来（非法 UTF-8）才退回按字节写。**UNICODE 构建里不要再出现 `WriteConsoleA`**；重定向路径不变（仍是 UTF-8 字节） |
 | O2 | 重定向后 stdout/stderr 前缀与数字错位、出现乱码 | 前缀走 `out_err`（stderr）而数字走 `out_u32`（stdout） | 同一条输出必须走同一个流 |
 | O3 | 用 PowerShell 的 `>` 抓输出后字节对不上 | `>` 会按 PowerShell 的编码重写 | 取**原始字节**：`Start-Process -RedirectStandardOutput/-RedirectStandardError`，或 `cmd /c "... > file 2>&1"` |
 | O4 | 想在调试期看模块的 stderr 却什么都没有 | `WriteConsole` 在重定向/无控制台下不可见 | 用 PTY（`Start-Pty` 能抓到 `WriteConsole`），或探针**写文件**（绕开标准输出） |

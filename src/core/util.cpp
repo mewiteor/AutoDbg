@@ -136,7 +136,22 @@ void PrintExN(DWORD handle, const char *s, size_t n)
     DWORD mode;
     if (GetConsoleMode(h, &mode))
     {
-        WriteConsoleA(h, s, (DWORD)n, NULL, NULL);
+        /* ❗控制台：窄串是 **UTF-8**（`/utf-8` 同时把执行字符集设成 UTF-8），
+         * 而 `WriteConsoleA` 会按控制台的代码页（中文系统 = CP936）解释这些字节
+         * → 中文全变乱码（实测：`server: 配置错误 …` 显示成 `閰嶇疆閿欒 …`）。
+         * 所以先 UTF-8 → UTF-16，再用不受代码页影响的 `WriteConsoleW`。 */
+        int    wn = (int)n;
+        LPWSTR w  = utf8_to_utf16_n(s, &wn);
+        if (w != nullptr && wn > 0)
+        {
+            WriteConsoleW(h, w, (DWORD)wn, NULL, NULL);
+            common::release(w);
+            return;
+        }
+        if (w != nullptr)
+            common::release(w);
+        /* 不是合法 UTF-8（少数来自 Win32 的 ANSI 串）→ 退回按字节写，至少不丢内容 */
+        write_bytes(h, s, n);
         return;
     }
 #endif

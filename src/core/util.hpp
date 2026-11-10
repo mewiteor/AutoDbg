@@ -22,6 +22,11 @@
  *   装了 sink 且它返回「已消费」时直接返回、不写句柄（`plan_server.md` §5.3）。
  *   未装 sink 时行为与 P7 完全一致。
  *
+ * ❗窄串的控制台分支**不能**用 `WriteConsoleA`：UNICODE 构建的窄串是 **UTF-8**
+ *   （`/utf-8` 同时改了执行字符集），`WriteConsoleA` 会按控制台代码页（中文 = CP936）
+ *   解释这些字节 → 中文全乱（`server: 配置错误 …` 显示成 `閰嶇疆閿欒 …`）。
+ *   现在先 `utf8_to_utf16_n()` 再 `WriteConsoleW`（见 `PITFALLS.md` O1b）。
+ *
  * 注意：`get_lua_str` / `lua_type_error` / `str2integer` 属 Lua 绑定层，见
  *   `src/scripting/lua/helpers.hpp`。
  * ========================================================================== */
