@@ -1,4 +1,4 @@
-﻿# =============================================================================
+# =============================================================================
 # tools/server_test/e2e_mcp.ps1 —— MCP（streamable HTTP 子集）端到端验收（S6）
 #
 # 来源：新写（plan_server.md S6 / §8）。
@@ -100,13 +100,27 @@ try
 
     $j = (Mcp '{"jsonrpc":"2.0","id":3,"method":"tools/list"}' @{ 'Mcp-Session-Id' = $sid }).Content | ConvertFrom-Json
     $names = @($j.result.tools | ForEach-Object { $_.name })
-    Check 'tools.list.count' ($names.Count -eq 11) ("count=" + $names.Count + " [" + ($names -join ',') + "]")
+    Check 'tools.list.count' ($names.Count -eq 12) ("count=" + $names.Count + " [" + ($names -join ',') + "]")
     Check 'tools.list.has-lua-eval' ($names -contains 'lua_eval') ($names -join ',')
     Check 'tools.list.has-gui-screenshot' ($names -contains 'gui_screenshot') ($names -join ',')
     Check 'tools.list.has-dbg-status' ($names -contains 'dbg_status') ($names -join ',')
     # 误导性工具已删：它们拿不到活动会话，参数形状也不对（只有 1 个 lua_eval 能真做事）
     Check 'tools.list.no-broken-dbg' (-not ($names -contains 'dbg_run') -and -not ($names -contains 'dbg_mem_read') -and -not ($names -contains 'dbg_breakpoint_set')) ($names -join ',')
     Check 'tools.list.schema' (($j.result.tools | Where-Object { $_.name -eq 'lua_eval' }).inputSchema.type -eq 'object') 'lua_eval inputSchema'
+    Check 'tools.list.has-lua-api' ($names -contains 'lua_api') ($names -join ',')
+
+    # initialize.instructions：给 AI 的总体说明（必须提到 lua_api）
+    Check 'initialize.instructions' ($initJson.result.instructions -like '*lua_api*' -and $initJson.result.instructions.Length -gt 80) "len=$($initJson.result.instructions.Length)"
+
+    # lua_api：目录 / 单节 / 未知节
+    $j = (ToolCall 'lua_api' '{}' $sid).Content | ConvertFrom-Json
+    $idx = $j.result.content[0].text
+    Check 'tool.lua_api.index' ($idx -like '*topic 目录*' -and $idx -like '*pitfalls*') ("len=" + $idx.Length)
+    $j = (ToolCall 'lua_api' '{"topic":"memory"}' $sid).Content | ConvertFrom-Json
+    Check 'tool.lua_api.topic' ($j.result.isError -ne $true -and $j.result.content[0].text -like '*ReadMemory*' -and $j.result.content[0].text -like '*table*') 'memory topic'
+    $j = (ToolCall 'lua_api' '{"topic":"memory"}' $sid).Content | ConvertFrom-Json
+    $j = (ToolCall 'lua_api' '{"topic":"nope"}' $sid).Content | ConvertFrom-Json
+    Check 'tool.lua_api.unknown-topic' ($j.result.isError -eq $true -and $j.result.content[0].text -like '*unknown topic*') "text=$($j.result.content[0].text)"
 
     # dbg_status：返回真实版本（不再写死 0.1.0）与调试模型说明
     $j = (ToolCall 'dbg_status' '{}' $sid).Content | ConvertFrom-Json

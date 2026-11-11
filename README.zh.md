@@ -55,7 +55,7 @@ AutoDbg_<arch>.exe        零 CRT 启动器 → payload (LZMA 单流) → 手工
 - **server 模式**：无状态 `POST /run`（源码从内存加载执行，**不落盘**）、`/cancel`（100 ms 粒度）、`/shutdown`、`/health`、`--server-token`（默认 loopback 免 token）。
 - **GUI 自动化**：`gui.position/move/click/write/press`、`gui.windows/find/activate/rect/children`、`gui.text/set_text/post/send`、`gui.screenshot`（PNG）。
 - **客户端文件 I/O**：`read_file`/`write_file` 读写的是**客户端**那台机器的磁盘；server 挂起协程、由客户端完成效果后恢复，二进制数据在远程会话里照样安全。
-- **MCP**：`POST /mcp` + `Mcp-Session-Id` 会话，11 个工具（`lua_eval` + `dbg_status` + GUI 原语）。
+- **MCP**：`POST /mcp` + `Mcp-Session-Id` 会话，12 个工具（`lua_eval`、给 AI 用的 `lua_api` 速查、`dbg_status`、GUI 原语）。
 - **编辑器集成**：neovim 插件提供 `:AutoDbgRun`（buffer / 选区）、`:AutoDbgCancel`、`:AutoDbgHealth`，错误行进 quickfix。
 - **老系统支持**：x86 子系统版本改写为 4.0，所有 Win9x 风险符号走动态 API 层，静态导入门禁（`tools/api_check`）保证 legacy 导入表里没有 XP+ 符号。
 

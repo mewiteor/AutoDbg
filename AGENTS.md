@@ -391,8 +391,12 @@ payload              // 单条 LZMA 流：各模块原始字节按 entry 顺序�
 ### 12.3 MCP
 
 - 传输在 C（`POST /mcp`，`Mcp-Session-Id` 头表达会话，D35）；**JSON-RPC 分发在 Lua**（`lualib/mcp.lua`，用 `jsonx`），C 侧不写 JSON 解析器（D28）。
-- 当前 **11 个工具**：`lua_eval`、`dbg_status`、`gui_screenshot`、`gui_windows`、`gui_find`、`gui_click`、
-  `gui_type`、`gui_press`、`gui_text`、`gui_set_text`、`gui_post`。
+- 当前 **12 个工具**：`lua_eval`、**`lua_api`**（Lua API 速查，给 AI 写代码用）、`dbg_status`、
+  `gui_screenshot`、`gui_windows`、`gui_find`、`gui_click`、`gui_type`、`gui_press`、`gui_text`、
+  `gui_set_text`、`gui_post`。
+- **`initialize.instructions`**：一段给模型的总体说明（执行模型 + “先调 lua_api” + 输出/写文件用法）；
+  `lua_api(topic)` 的正文在 `lualib/autodbg_api.lua`（**改绑定层时同步它**，节：model/run/attach/
+  breakpoints/hwbp/memory/variant/context/symbols/scan/events/gui/files/pitfalls/recipes）。
 - ❗**工具集口径**：一次 `tools/call` = 一次 Lua 执行（串行）。`Run`/`Attach` 会阻塞到目标退出/`Detach`，
   所以**不提供**“单独读内存 / 下断点 / 单步”的交互式工具（它们需要「已停止的目标」这个状态，现在没有）。
   调试逻辑写在 `lua_eval` 的场景脚本里，在 `Attach`/`Run` 的回调内做（这是设计，不是缺口，`PITFALLS.md` S12）。

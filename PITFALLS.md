@@ -55,6 +55,7 @@
 | L8 | LuaJIT 下 `runtime.version` 显示成 `Lua 5.5` | `#ifdef JIT` 判断写反了 | 用 `#ifndef JIT` 输出 5.5 版本串 |
 | L9 | 回调里调 `write_file`/`read_file` 报 `attempt to yield across a C-call boundary`，随后整个调试会话/回调直接断掉 | 回调是引擎经 `lua_pcall` C 调用进来的，而 client 文件 I/O 靠 `lua_yield` 挂起——LuaJIT 不支持跨 C 边界 yield，Lua 5.5 也不允许跨普通 `lua_pcall` | **回调里写文件用 `open_file()`（流式，脚本线程直接写 `/run` 连接）**；`write_file`/`read_file` 仍然只能在非回调处用，且现在会返回可操作错误（靠 `helpers.cpp` 的 `callback_depth()`，不会打断会话） |
 | L10 | 流式请求里调 `write_file` 得到“流式请求下请改用 open_file” | 流式响应的头/帧已经发出去了，中途再走 `/effects` 挂起就没法回到同一个响应 | 设计如此：流式请求禁用 effects（`file_io` 的 `yield_blocker`）；要混用就分两次请求，或去掉 `X-AutoDbg-Stream` 头 |
+| L11 | 新写的 `lualib/*.lua` 里明明有内容，但烘焙后就是“加载不了”/语法错 | Lua 的**长字符串会嵌套截断**：外层用 `[[ … ]]` 时，正文里任何 `[[path]]` 会提前闭合外层 | 正文里可能含 `[[ ]]` 就改用 `[==[ … ]==]`（`lualib/autodbg_api.lua` 就是这个坑）；改完用 `lua_<arch>.exe tools/gen_lua_lib.lua x.c lualib/x.lua` 单独跑一遍验证 |
 
 ## M. 手工映射的模块（`src/sys/pack/module_loader`）
 

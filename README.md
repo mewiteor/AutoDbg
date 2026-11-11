@@ -55,7 +55,7 @@ AutoDbg_<arch>.exe        零 CRT 启动器 → payload (LZMA 单流) → 手工
 - **Server mode**: stateless `POST /run` (source executed from memory, never written to disk), `/cancel` with 100 ms granularity, `/shutdown`, `/health`, `--server-token` with loopback-by-default auth.
 - **GUI automation**: `gui.position/move/click/write/press`, `gui.windows/find/activate/rect/children`, `gui.text/set_text/post/send`, `gui.screenshot` (PNG).
 - **Client-side file I/O**: `read_file`/`write_file` touch the *client's* disks; the server suspends a coroutine and the client fulfils the effect, so binary data keeps working across a remote session.
-- **MCP**: `POST /mcp` with `Mcp-Session-Id` sessions and 11 tools (`lua_eval` + status, plus GUI primitives).
+- **MCP**: `POST /mcp` with `Mcp-Session-Id` sessions and 12 tools (`lua_eval`, `lua_api` cheat-sheet for agents, status, GUI primitives).
 - **Editor integration**: neovim plugin with `:AutoDbgRun` (buffer/range), `:AutoDbgCancel`, `:AutoDbgHealth`, quickfix jump-to-error.
 - **Legacy-DOS-era support**: x86 subsystem version patched to 4.0, all Win9x-risky imports go through a dynamic-API layer, and a static import gate (`tools/api_check`) keeps XP+ symbols out of the legacy import table.
 

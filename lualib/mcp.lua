@@ -27,6 +27,16 @@ local SERVER_NAME      = "AutoDbg"
 -- 版本号来自 C 侧 `_autodbg_info()`（构建期 git describe），不再写死
 local SERVER_VERSION   = tostring((type(_autodbg_info) == "function" and _autodbg_info().version) or "unknown")
 
+-- `initialize` 里回给客户端的说明（MCP 规范里的 `instructions`）：尽量短，把 AI 引到 lua_api。
+local INSTRUCTIONS = table.concat({
+  "AutoDbg 是远程 Windows 调试器（Win32 Debug API）+ GUI 自动化，脚本语言是 Lua（5.5 或 LuaJIT）。",
+  "工具模型：一次 tools/call = 一次 Lua 执行（串行）。调试逻辑必须写在 Run{...}/Attach{...} 的回调里；",
+  "它们会阻塞到目标退出或脚本调 Detach()，所以没有“暂停后逐条读内存/下断点”的接口。",
+  "写代码前先调 lua_api（不带参数看目录，再用 topic 取节）；至少读 model 与 pitfalls。",
+  "输出：print() 会随工具结果返回；结构化数据用 print(jsonx.encode(t))。",
+  "写文件到客户端机器用 open_file（回调里也能写）；看界面用 gui_screenshot 工具。",
+}, "\n")
+
 ---------------------------------------------------------------------
 -- 小工具
 ---------------------------------------------------------------------
@@ -172,8 +182,24 @@ define("dbg_status",
       "模型：一次 tools/call = 一次 Lua 执行（串行）。调试必须在脚本里用 Attach/Run 的回调做，",
       "      Run/Attach 会阻塞到目标退出或 Detach；**没有**“暂停后逐条读内存/下断点”的交互式接口。",
       "写文件：流式模式下用 open_file + f:write（回调里也能用）。",
+      "下面两行看 API：lua_api() / lua_api(topic=\"model\") / lua_api(topic=\"pitfalls\")",
     }
     return text(table.concat(lines, "\n"))
+  end)
+
+-- ---------------------------------------------------------------
+-- 工具：Lua API 速查（AI 写代码的依据）
+-- ---------------------------------------------------------------
+define("lua_api",
+  "返回 AutoDbg 的 Lua API 速查（签名 + 可执行示例 + 地雷）。不带 topic = 目录；"
+    .. "topic ∈ model/run/attach/breakpoints/hwbp/memory/variant/context/symbols/scan/events/gui/files/pitfalls/recipes",
+  schema({ topic = { type = "string", description = "节名（省略 = 目录）" } }, {}),
+  function(a)
+    local api = autodbg_api
+    if type(api) ~= "table" then error("autodbg_api 未加载（构建异常）") end
+    local body, err = api.get(a.topic)
+    if body == nil then error(err or "unknown topic") end
+    return text(body)
   end)
 
 ---------------------------------------------------------------------
@@ -318,6 +344,7 @@ local function handle(msg)
       protocolVersion = pv,
       capabilities = { tools = { listChanged = false } },
       serverInfo = { name = SERVER_NAME, version = SERVER_VERSION },
+      instructions = INSTRUCTIONS,
     })
   elseif method == "ping" then
     return respond(id, {})
