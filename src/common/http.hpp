@@ -66,6 +66,7 @@ struct http_request
     /* S6（plan_server.md §8）：MCP 的会话头与流式协商 */
     char     mcp_session_id[80]                = {}; /* Mcp-Session-Id（没给 = 空串） */
     bool     wants_sse                         = false; /* Accept 里含 text/event-stream */
+    bool     wants_stream                      = false; /* X-AutoDbg-Stream: 1 / Accept: application/x-autodbg-stream */
     unsigned header_count                      = 0;
 };
 

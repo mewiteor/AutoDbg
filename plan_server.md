@@ -82,7 +82,8 @@
 | 请求级切换 flavor/variant | server 的 flavor 由「映射到的模块」决定 | 不做（要新增 launcher→module 派发契约 = ABI 变更） |
 | 多租户并发 | 执行严格串行（并发 1），目标进程是全局唯一资源 | **设计如此**：这是「单 operator 的远程调试后端」 |
 | `BsonDecode` | 仍是桩（`bson.cpp` 报 `not implement BsonDecode yet!`） | 不为此单独实现，见 §5 |
-| client 文件 I/O 在**调试回调里**不可用 | `Attach`/`Run` 回调、断点回调里调 `read_file`/`write_file` 无法挂起（LuaJIT 不支持跨 C 边界 yield，Lua 5.5 不允许跨普通 `lua_pcall`） | 不做队列：现在返回 `nil, <可操作提示>`（回调里收集，`Attach`/`Run` 返回后再写；或用 `io.open` 写服务器本机）。判定靠 `helpers.cpp` 的 `callback_depth()` |
+| client 文件 I/O 在**调试回调里**（非流式路径） | `write_file`/`read_file` 靠 yield，回调里不能用 | **已解决**：新增 `open_file()` 流式路径（§6）——脚本线程直接写 `/run` 连接，回调里可用、内存恒定；老路径保留给非流式客户端 |
+| MCP 不支持流式 | `/mcp` 的 JSON-RPC 响应一次性回，带不了帧 | 不做：MCP 客户端消费不了自定义帧；要写大文件请走 `/run` 流式路径 |
 
 ---
 
@@ -109,3 +110,27 @@
 - 更便宜的替代：`GET /screenshot` 直接回原始字节（§2.2）。
 - 若将来仍要做：**只做 `/run` 一条路径**（nvim 专用），不碰 MCP、不碰 `/effects`，并先把 `BsonDecode` 实现掉。
 - 已留的缝：序列化/分发都在 Lua 层（`mcp.lua` / `effects.lua`），真要加时 C 侧几乎不用动。
+
+---
+
+## 6. 流式 `/run`（帧 + chunked）——已实现
+
+> 动机：老的 `write_file` 靠 `lua_yield` 等客户端，而**调试回调里不能 yield**（LuaJIT 不支持跨 C 边界，
+> Lua 5.5 也不允许跨普通 `lua_pcall`）→ 大块数据只能攒在内存里。流式把「写」变成脚本线程直接发字节。
+
+- **订阅**：请求头 `X-AutoDbg-Stream: 1`（或 `Accept: application/x-autodbg-stream`）。
+- **响应**：`200` + `Transfer-Encoding: chunked`；worker 在 `exec_begin` 之前已持有 socket，
+  所以写帧的就是执行脚本的那条线程（无额外线程、无队列、无临时文件）。
+- **帧**（`src/scripting/lua/stream.hpp`）：`u8 type | u8 flags | u16 id | u32 data_len | [json] | [data]`
+  - 1 `open`（json `{path,mode}`）/ 2 `data` / 3 `close` / 4 `out`（flags 0=stdout 1=stderr）/
+    5 `result`（json 与老 JSON 信封同构，不含 stdout/stderr）/ 6 `error`
+- **Lua API**：`open_file(path[, mode])` → `f:write(...)` / `f:flush()` / `f:close()`
+  （本地模式等价 `io.open`；`__gc` 只尽力补 close 帧 + 警告，不会替调用方补数据）。
+- **背压**：`net_send_all` 带超时 → 客户端慢就压内核发送缓冲，断了就 `f:write` 返回 `nil, err`。
+- **与老路径的关系**：流式请求下 `read_file`/`write_file` 被禁用（`yield_blocker` 给出可操作错误）；
+  去掉该头就回到「一次性 JSON + `/effects`」。
+- **客户端**：`nvim/lua/autodbg/stream.lua`（uv TCP + chunked + 帧解析，`data` 帧直接写本地文件，
+  `setup{ stream = false }` 回退到老路径）。
+- **测试**：`e2e.ps1` 的 `stream.*`（裸 `TcpClient` 逐帧校验字节：回调里写 300 KB → 300010 字节、头 `abcxyz`、尾 `tail`）；
+  `nvim_smoke.lua` 的 `io.stream.*`（插件写本地文件后核对大小与内容）。
+- **已知边界**：MCP（`/mcp`）还是一次性 JSON-RPC，不接流；`read_file` 在流式请求下不可用（无「边读边算」的需求）。

@@ -20,6 +20,7 @@
 #include "exec_session.hpp" /* S6：持久会话（MCP） */
 #include "file_io.hpp"     /* S7：client 文件 I/O（效果协议） */
 #include "output.hpp"
+#include "stream.hpp"      /* 流式 /run（帧 + chunked）：open_file / f:write 的落点 */
 
 #include "common/http.hpp"
 #include "common/json_writer.hpp"
@@ -816,6 +817,12 @@ void handle_run(long long sock,
 
     collect_args(req.query, &g_args);
 
+    /* ---- 流式（`X-AutoDbg-Stream: 1`）：响应变成 chunked + 帧；
+     * 之后 `print`/`f:write` 都由**本线程**直接往这条 socket 写。 ---- */
+    const bool streaming = req.wants_stream;
+    if (streaming && !host::stream_begin(sock, k_send_timeout_ms))
+        return; /* 头发不出去（客户端已断开）→ 什么也做不了 */
+
     host::guard_exec_begin(cfg.timeout_sec);
     /* S7：/run 也跑在**会话**里（协程形式），这样 read_file/write_file 才能挂起等客户端；
      * 完成就立刻关掉这个临时会话，挂起则留着等 `/effects`。 */
@@ -847,6 +854,18 @@ void handle_run(long long sock,
 
     if (run.suspended)
     {
+        if (streaming)
+        {
+            /* 流式请求里 client 文件 I/O 被禁（file_io 的 yield_blocker），正常走不到这里；
+             * 真走到了就发 error 帧收尾，别把客户端挂在那里。 */
+            static const char k_err[] = "{\"ok\":false,\"error\":\"unexpected suspend in streaming mode\"}";
+            host::stream_write_frame(host::stream_frame_error, 0, 0, k_err, sizeof k_err - 1, nullptr, 0);
+            host::stream_finish();
+            host::stream_end();
+            host::session_close(sid);
+            return;
+        }
+
         char  op[24]  = {};
         char *eff     = nullptr;
         size_t eff_len = 0;
@@ -869,7 +888,50 @@ void handle_run(long long sock,
     bool canceled  = (reason == host::guard_cancel);
     bool timed_out = (reason == host::guard_timeout);
 
-    if (text_mode)
+    if (streaming)
+    {
+        /* 流式：stdout/stderr 已经以 `out` 帧发过了，这里只补一个 result 帧 + 终止块 */
+        json_writer w;
+        w.begin_object();
+        w.key("ok");
+        w.boolean(ok);
+        w.key("exit");
+        w.number((long long)r.code);
+        w.key("elapsed_ms");
+        w.number((long long)r.elapsed_ms);
+        w.key("truncated");
+        w.boolean(truncated);
+        w.key("canceled");
+        w.boolean(canceled);
+        w.key("timed_out");
+        w.boolean(timed_out);
+        w.key("flavor");
+        w.string(flavor_name(boot->flavor));
+        w.key("variant");
+        w.string(variant_name(boot->variant));
+        w.key("error");
+        if (ok)
+            w.null_value();
+        else
+            w.string(r.error);
+        w.key("loaded");
+        w.boolean(r.loaded);
+        w.key("server");
+        w.begin_object();
+        w.key("version");
+        w.string(k_server_version);
+        w.key("request_id");
+        w.number((long long)request_id);
+        w.key("pid");
+        w.number((long long)GetCurrentProcessId());
+        w.end_object();
+        w.end_object();
+
+        host::stream_write_frame(host::stream_frame_result, 0, 0, w.data(), w.size(), nullptr, 0);
+        host::stream_finish();
+        host::stream_end();
+    }
+    else if (text_mode)
     {
         http_response resp(200, "text/plain; charset=utf-8");
         if (snap.out_len > 0)

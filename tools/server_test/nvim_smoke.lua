@@ -96,18 +96,45 @@ local accepted = adbg.cancel({ sync = true })
 check("cancel.accepted", accepted == true, "accepted=" .. tostring(accepted))
 vim.wait(4000, function() return false end)
 
--- ---------------------------------------------------------------- client 文件 I/O（S7）
--- 脚本让 server 挂起去读写**本机**文件，插件（effects.resolve_sync）负责在本地做完再送回
-local ioPath = vim.fn.tempname() .. "-adbg-nvim.bin"
+-- ---------------------------------------------------------------- client 文件 I/O
+-- ① 流式（默认 `stream = true`）：`open_file` + `f:write` 边跑边写到**本机**文件
+--    （不再靠 /effects 轮次回调，所以回调里也能用；这里先在主 chunk 里验证字节与长度）
+local ioPath = vim.fn.tempname() .. "-adbg-stream.bin"
 set_buffer({ 'local p = [==[' .. ioPath .. ']==]',
+             'local f = open_file(p, "wb")',
+             'print("open", f ~= nil)',
+             'f:write("abc", "\\0", "def")',
+             'f:write(string.rep("Q", 200000))',
+             'f:flush()',
+             'f:close()',
+             'print("done-write")' }, "stream_io.lua")
+local ioRes = adbg.run({ sync = true, open = "none" })
+check("io.stream.ok", ioRes.ok == true and ioRes.stream == true,
+  "status=" .. tostring(ioRes.status) .. " err=" .. tostring(ioRes.error) .. " stream=" .. tostring(ioRes.stream))
+check("io.stream.stdout", (ioRes.stdout or ""):find("open\ttrue", 1, true) ~= nil, "stdout=[" .. tostring(ioRes.stdout) .. "]")
+local fh = io.open(ioPath, "rb")
+local head, fsz = "", vim.fn.getfsize(ioPath)
+if fh then
+  head = fh:read(7) or ""
+  fh:close()
+end
+check("io.stream.size", fsz == 200007, "size=" .. tostring(fsz))
+check("io.stream.content", head == "abc\0def", "head=[" .. tostring((head:gsub("%z", "\\0"))) .. "]")
+pcall(os.remove, ioPath)
+
+-- ② 非流式（`stream = false`）：老的一次性 `write_file` / `read_file`（effects 协议）
+adbg.setup({ url = url, format = "json", open = "none", stream = false })
+local ioPath2 = vim.fn.tempname() .. "-adbg-nvim.bin"
+set_buffer({ 'local p = [==[' .. ioPath2 .. ']==]',
              'print("w", write_file(p, "abc\\0def"))',
              'local s = read_file(p)',
              'print("r", #s, s == "abc\\0def")' }, "io.lua")
-local ioRes = adbg.run({ sync = true, open = "none" })
-check("io.ok", ioRes.ok == true, "status=" .. tostring(ioRes.status) .. " err=" .. tostring(ioRes.error))
-check("io.write", (ioRes.stdout or ""):find("w\t7", 1, true) ~= nil, "stdout=[" .. tostring(ioRes.stdout) .. "]")
-check("io.read-binary", (ioRes.stdout or ""):find("r\t7\ttrue", 1, true) ~= nil, "stdout=[" .. tostring(ioRes.stdout) .. "]")
-pcall(os.remove, ioPath)
+local ioRes2 = adbg.run({ sync = true, open = "none" })
+check("io.ok", ioRes2.ok == true, "status=" .. tostring(ioRes2.status) .. " err=" .. tostring(ioRes2.error))
+check("io.write", (ioRes2.stdout or ""):find("w\t7", 1, true) ~= nil, "stdout=[" .. tostring(ioRes2.stdout) .. "]")
+check("io.read-binary", (ioRes2.stdout or ""):find("r\t7\ttrue", 1, true) ~= nil, "stdout=[" .. tostring(ioRes2.stdout) .. "]")
+pcall(os.remove, ioPath2)
+adbg.setup({ url = url, format = "json", open = "none" }) -- 回到默认（流式）
 
 -- ---------------------------------------------------------------- 脚本头标记（不需要 server）
 -- 远程地址：setup 的 url 是默认值，脚本头部的 `--!autodbg ...` 覆盖它（换机器只改那一行）

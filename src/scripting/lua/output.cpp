@@ -14,6 +14,8 @@
 
 #include "core/util.hpp" /* set_output_sink / PrintN */
 
+#include "stream.hpp"     /* 流式请求：输出直接当 `out` 帧发出去 */
+
 #include "common/allocator.hpp"
 
 #include <string.h>
@@ -187,8 +189,17 @@ bool output_active()
 
 void output_write(int stream, const char *data, size_t len)
 {
-    if (!g_c.active)
+    if (!g_c.active || data == nullptr || len == 0)
         return;
+
+    /* 流式请求（`X-AutoDbg-Stream: 1`）：不攒缓冲，直接当 `out` 帧发出去（长会话也能实时看到）。
+     * 帧由执行脚本的线程写 socket，与 `f:write` 走同一条路径 → 顺序天然一致。 */
+    if (stream_active())
+    {
+        stream_write_frame(stream_frame_out, 0, (stream == 2) ? 1u : 0u, nullptr, 0, data, len);
+        return;
+    }
+
     stream_buf *b = (stream == 2) ? &g_c.err : &g_c.out;
     stream_append(b, &g_c, data, len);
 }

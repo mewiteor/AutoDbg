@@ -389,6 +389,11 @@ http_parse_status http_parse_request(const char *buf, size_t len, http_request *
                 return http_parse_status::too_large;
             out->has_token = true;
         }
+        else if (ieq(name, nlen, "x-autodbg-stream"))
+        {
+            /* 流式 /run（帧 + chunked）：值“1”/“true”/“yes” 都算开；“0” 明确关 */
+            out->wants_stream = !(vlen == 1 && val[0] == '0');
+        }
         else if (ieq(name, nlen, "authorization"))
         {
             if (istarts_with(val, vlen, "bearer "))
@@ -408,12 +413,20 @@ http_parse_status http_parse_request(const char *buf, size_t len, http_request *
         }
         else if (ieq(name, nlen, "accept"))
         {
-            /* 只看「要不要 SSE」，不需要完整 Accept 协商 */
+            /* 只看「要不要 SSE / 帧流」，不需要完整 Accept 协商 */
             for (size_t i = 0; i + 17 <= vlen; i++)
             {
                 if (istarts_with(val + i, vlen - i, "text/event-stream"))
                 {
                     out->wants_sse = true;
+                    break;
+                }
+            }
+            for (size_t i = 0; i + 25 <= vlen; i++)
+            {
+                if (istarts_with(val + i, vlen - i, "application/x-autodbg-stream"))
+                {
+                    out->wants_stream = true;
                     break;
                 }
             }

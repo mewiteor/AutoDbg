@@ -69,6 +69,71 @@ function Read-Shared([string]$path)
     catch { return '' }
 }
 
+# 流式 /run：裸 TCP 发请求，按 chunked + 帧解析；返回
+# @{ status; stdout; files = @{ id = byte[] }; result = json; frames = n }
+function Post-Run-Stream([string]$source, [string]$FileName = 'stream.lua')
+{
+    $body = [System.Text.Encoding]::UTF8.GetBytes($source)
+    $client = [System.Net.Sockets.TcpClient]::new('127.0.0.1', $Port)
+    $ns = $client.GetStream()
+    $head = "POST /run HTTP/1.1`r`nHost: 127.0.0.1:$Port`r`nContent-Type: text/x-lua`r`n" +
+            "X-AutoDbg-Filename: $FileName`r`nX-AutoDbg-Stream: 1`r`nContent-Length: $($body.Length)`r`n`r`n"
+    $hb = [System.Text.Encoding]::ASCII.GetBytes($head)
+    $ns.Write($hb, 0, $hb.Length); $ns.Write($body, 0, $body.Length); $ns.Flush()
+
+    function Read-Exact([int]$n) {
+        $buf = New-Object byte[] $n
+        $got = 0
+        while ($got -lt $n) {
+            $r = $ns.Read($buf, $got, $n - $got)
+            if ($r -le 0) { throw 'stream: short read' }
+            $got += $r
+        }
+        return $buf
+    }
+
+    $sb = New-Object System.Text.StringBuilder
+    while (-not $sb.ToString().EndsWith("`r`n`r`n")) {
+        [void]$sb.Append([char](Read-Exact 1)[0])
+    }
+    $status = 0
+    if ($sb.ToString() -match '^HTTP/\d\.\d\s+(\d+)') { $status = [int]$matches[1] }
+
+    $frames = 0
+    $out = New-Object System.Text.StringBuilder
+    $result = $null
+    $files = @{}
+    while ($true) {
+        $line = New-Object System.Text.StringBuilder
+        while ($true) {
+            $ch = (Read-Exact 1)[0]
+            if ($ch -eq 13) { [void](Read-Exact 1); break }
+            [void]$line.Append([char]$ch)
+        }
+        $size = [Convert]::ToInt32($line.ToString(), 16)
+        if ($size -eq 0) { break }
+        $chunk = Read-Exact $size
+        [void](Read-Exact 2)
+
+        $type  = $chunk[0]
+        $id    = [int][BitConverter]::ToUInt16($chunk, 2)
+        $dlen  = [BitConverter]::ToUInt32($chunk, 4)
+        $jlen  = $size - 8 - $dlen
+        $json  = if ($jlen -gt 0) { [System.Text.Encoding]::UTF8.GetString($chunk, 8, $jlen) } else { '' }
+        $frames++
+        if ($type -eq 4) { [void]$out.Append([System.Text.Encoding]::UTF8.GetString($chunk, 8 + $jlen, $dlen)) }
+        elseif ($type -eq 5) { $result = $json | ConvertFrom-Json }
+        elseif ($type -eq 2) {
+            if (-not $files.ContainsKey($id)) { $files[$id] = New-Object System.Collections.Generic.List[byte] }
+            for ($i = 0; $i -lt $dlen; $i++) { $files[$id].Add($chunk[8 + $jlen + $i]) }
+        }
+    }
+    $ns.Close(); $client.Close()
+    $bytes = @{}
+    foreach ($k in $files.Keys) { $bytes[$k] = $files[$k].ToArray() }
+    return @{ status = $status; stdout = $out.ToString(); files = $bytes; result = $result; frames = $frames }
+}
+
 function Start-Server([string[]]$Extra)
 {
     $script:serverSeq = 1 + [int]$script:serverSeq
@@ -275,6 +340,46 @@ Run({
     $r = Post-Run 'print("x")' @('format=text') @{ 'X-AutoDbg-Token' = 'wrong-token' }
     Check 'auth.401-wrong-token' ($r.StatusCode -eq 401) "status=$($r.StatusCode)"
 
+    Stop-Server
+
+    # ---------------------------------------------------------------- 流式 /run（帧 + chunked）
+    # 关键场景：**调试回调里**写大块数据（老的 write_file 靠 yield，回调里做不到）：
+    # open_file + f:write 由脚本线程直接写响应连接 → 内存恒定、不落盘。
+    if (-not (Start-Server @())) { exit 2 }
+    $streamSrc = @'
+local f = open_file("Z:/ignored-server-side.bin", "wb")
+print("open", f ~= nil)
+f:write("abc")
+Run({
+    cmdline = "C:\\Windows\\System32\\cmd.exe /c exit",
+    callback = function()
+        f:write("xyz")
+        f:write(string.rep("Q", 300000))
+        print("in-callback")
+        Detach()
+    end,
+})
+f:write("tail")
+f:close()
+print("after")
+'@
+    $sf = Post-Run-Stream $streamSrc
+    Check 'stream.status' ($sf.status -eq 200) "status=$($sf.status)"
+    Check 'stream.result-ok' ($sf.result.ok -eq $true -and $sf.result.exit -eq 0) "result=$($sf.result | ConvertTo-Json -Compress)"
+    Check 'stream.stdout' ($sf.stdout -like '*open*true*' -and $sf.stdout -like '*in-callback*' -and $sf.stdout -like '*after*') "stdout=[$($sf.stdout)]"
+    $sfBytes = $sf.files[1]
+    Check 'stream.frames' ($sf.frames -ge 6) "frames=$($sf.frames)"
+    Check 'stream.bytes' ($null -ne $sfBytes -and $sfBytes.Length -eq (3 + 3 + 300000 + 4)) "len=$($sfBytes.Length) (want 300010)"
+    if ($null -ne $sfBytes -and $sfBytes.Length -ge 6) {
+        $sfHead = [System.Text.Encoding]::ASCII.GetString($sfBytes, 0, 6)
+        $sfTail = [System.Text.Encoding]::ASCII.GetString($sfBytes, $sfBytes.Length - 4, 4)
+        Check 'stream.content' ($sfHead -eq 'abcxyz' -and $sfTail -eq 'tail') "head=$sfHead tail=$sfTail"
+    }
+    else { Bad 'stream.content' 'no file bytes' }
+
+    # 非流式路径仍然可用（且流式请求下 write_file 会得到可操作的错误）
+    $nf = Post-Run-Stream 'local ok, e = write_file("Z:/x.bin", "a"); print("wf", tostring(e))'
+    Check 'stream.write_file-blocked' ($nf.stdout -like '*open_file*') "stdout=[$($nf.stdout)]"
     Stop-Server
 
     # ---------------------------------------------------------------- 绑 0.0.0.0：启动横幅列本机网卡地址

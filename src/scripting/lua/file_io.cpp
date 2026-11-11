@@ -14,6 +14,7 @@
 #include "file_io.hpp"
 
 #include "helpers.hpp" /* callback_depth()：判断是不是在引擎调进来的回调里 */
+#include "stream.hpp"  /* 流式请求：`open_file` 的句柄用帧把数据发给客户端 */
 
 #include "common/allocator.hpp"
 #include "common/base64.hpp"
@@ -39,6 +40,10 @@ bool g_client_io = false;
  * 返回 nullptr = 可以 yield；否则返回给 Lua 的错误文案（**无 NUL 之外副作用**）。 */
 const char *yield_blocker(lua_State *L, const char *op)
 {
+    if (stream_active())
+        return "read_file/write_file: 流式请求（X-AutoDbg-Stream: 1）下请改用 open_file + f:write；"
+               "要去掉流式就去掉该请求头（但那样仍然不能在回调里用）";
+
     if (scripting::lua::callback_depth() > 0)
     {
         if (strcmp(op, "write_file") == 0)
@@ -409,6 +414,8 @@ void register_file_api(lua_State *L)
 
     lua_pushcfunction(L, lua_write_file);
     lua_setglobal(L, "write_file");
+
+    register_stream_file_api(L); /* open_file + 文件对象（流式） */
 }
 
 /* ------------------------------ 效果协议助手 ------------------------------ */

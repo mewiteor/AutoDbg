@@ -394,17 +394,34 @@ payload              // 单条 LZMA 流：各模块原始字节按 entry 顺序�
 - 当前 13 个工具：`lua_eval`、`dbg_run`、`dbg_mem_read`、`dbg_breakpoint_set`、`gui_screenshot`、`gui_windows`、`gui_find`、`gui_click`、`gui_type`、`gui_press`、`gui_text`、`gui_set_text`、`gui_post`。
 - 会话是持久 `lua_State`（≤8 个、空闲 30 min 回收），`Accept: text/event-stream` → `chunked` 单事件（D36；增量推帧未做）。
 
-### 12.4 client 文件 I/O（`read_file` / `write_file`）
+### 12.4 client 文件 I/O（`open_file` 流式 / `write_file` 一次性）
 
-- 语义：文件在**客户端**那台机器上；本机脚本模式直接读写本机磁盘，行为与 `io.open` 的模式参数同义（默认二进制）；单次 ≤ 8 MB。
-- server 模式用**协程挂起 + 效果协议**（D37）：响应回 `pending{token, op, stdout_so_far, effects}`，客户端本地执行后 `POST /effects?token=<sid:gen>` 恢复；token 未知/过期/**重放** → 404。
-- C 侧只做 `lua_yield` 与效果表序列化（`file_io.cpp`）；客户端结果 JSON 交给 `lualib/effects.lua`（`jsonx.decode`）还原成 Lua 值。
-- **服务器从不触碰客户端磁盘**，也**不重放脚本**（挂起/恢复用协程，避免重复副作用）。
-- ❗**调试回调里不可用**（`Attach`/`Run` 的回调、断点/异常回调）：回调是引擎经 `pcall`
-  C 调用进来的，`lua_yield` 跨不过这个边界（LuaJIT 根本不支持，Lua 5.5 也不允许跨普通
-  `lua_pcall`）→ `read_file`/`write_file` 会返回 `nil, <可操作的错误文案>`（不会让 Lua 抛
-  `attempt to yield across a C-call boundary` 把回调/会话打断）。可用的做法：回调里把数据
-  收集到表里，等 `Attach`/`Run` **返回**后再写；或者用 `io.open` 写**服务器本机**文件。
+文件在**客户端**那台机器上；本机脚本模式下两者都等价于 `io.open`。
+
+**① 流式（默认，`X-AutoDbg-Stream: 1`）——大块数据、调试回调里都靠它**
+
+- `local f, err = open_file(path [, mode])` → 文件对象；`f:write(...)` / `f:flush()` / `f:close()`。
+- `/run` 的响应变成 `Transfer-Encoding: chunked`，每个 chunk 里套一个帧（`src/scripting/lua/stream.hpp`）：
+  `u8 type | u8 flags | u16 id | u32 data_len | [json] | [data]`；
+  `type` = 1 open / 2 data / 3 close / 4 out / 5 result / 6 error，`out` 的 `flags` 区分 stdout/stderr。
+- **写这条 socket 的就是执行脚本的那条线程**（worker 在 `exec_begin` 之前就拿到了 sock）→
+  `f:write` 既不 yield 也不落盘：**内存 = 单次 send 的那一块**，整个文件多大都行。
+  背压交给 socket（`net_send_all` 带超时）：客户端断了/太慢就 `nil, err`，不会无限卡住调试目标。
+- `print`/`Error*` 在流式请求里也走 `out` 帧（`output.cpp` 先查 `stream_active()`），所以长会话也能实时看到输出。
+- ❗流式请求下 `read_file`/`write_file` 被禁用（它们靠 yield）：返回 `nil, <提示>`（`file_io.cpp`
+  的 `yield_blocker`）；要去掉流式就用旧的非流式路径。
+- 客户端实现：`nvim/lua/autodbg/stream.lua`（uv TCP + chunked + 帧解析，`data` 帧直接写本地文件）。
+
+**② 非流式（老路径）：`write_file` / `read_file` + `/effects`**
+
+- 用**协程挂起 + 效果协议**（D37）：响应回 `pending{token, op, stdout_so_far, effects}`，客户端本地执行后
+  `POST /effects?token=<sid:gen>` 恢复；token 未知/过期/**重放** → 404。单次 ≤ 8 MB。
+- C 侧只做 `lua_yield` 与效果表序列化（`file_io.cpp`）；客户端结果 JSON 交给 `lualib/effects.lua` 还原成 Lua 值。
+- **服务器从不触碰客户端磁盘**，也**不重放脚本**。
+- ❗**调试回调里不可用**（`Attach`/`Run` 回调、断点/异常回调）：回调是引擎经 `pcall` C 调用进来的，
+  `lua_yield` 跨不过这个边界（LuaJIT 根本不支持；Lua 5.5 也不允许跨普通 `lua_pcall`）→ 返回
+  `nil, <可操作错误>`，不会让 Lua 抛 `attempt to yield across a C-call boundary` 打断会话。
+  **回调里想写文件请用 `open_file`**（流式），不要再攒表 + 末尾写。
   判定靠 `helpers.cpp` 的 `callback_depth()`（`pcall()` 维护），`PITFALLS.md` L9。
 
 ### 12.5 neovim 插件（`nvim/`，子模块）

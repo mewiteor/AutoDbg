@@ -53,7 +53,8 @@
 | L6 | LuaJIT 下 `pcall` 里调 `read_file`/`write_file` 直接报错 | LuaJIT 的 `pcall` 不能跨 yield | 脚本里直接调用（不用 `pcall` 包），MCP 侧走 `call_yielding` 让 yield 穿透 |
 | L7 | `lua_pcall` 返回后循环变量/寄存器莫名其妙变了 | 见 M5（x64 关 SEH 的副作用） | 同 M5 |
 | L8 | LuaJIT 下 `runtime.version` 显示成 `Lua 5.5` | `#ifdef JIT` 判断写反了 | 用 `#ifndef JIT` 输出 5.5 版本串 |
-| L9 | 回调里调 `write_file`/`read_file` 报 `attempt to yield across a C-call boundary`，随后整个调试会话/回调直接断掉 | 回调是引擎经 `lua_pcall` C 调用进来的，而 client 文件 I/O 靠 `lua_yield` 挂起——LuaJIT 不支持跨 C 边界 yield，Lua 5.5 也不允许跨普通 `lua_pcall` | 用 `helpers.cpp` 的 `callback_depth()`（`pcall()` 维护）提前判：非 0 就返回 `nil, <可操作提示>`（回调里收集、`Attach`/`Run` 返回后再写；或用 `io.open` 写服务器本机）；非协程上下文再用 `lua_isyieldable` 兵一道 |
+| L9 | 回调里调 `write_file`/`read_file` 报 `attempt to yield across a C-call boundary`，随后整个调试会话/回调直接断掉 | 回调是引擎经 `lua_pcall` C 调用进来的，而 client 文件 I/O 靠 `lua_yield` 挂起——LuaJIT 不支持跨 C 边界 yield，Lua 5.5 也不允许跨普通 `lua_pcall` | **回调里写文件用 `open_file()`（流式，脚本线程直接写 `/run` 连接）**；`write_file`/`read_file` 仍然只能在非回调处用，且现在会返回可操作错误（靠 `helpers.cpp` 的 `callback_depth()`，不会打断会话） |
+| L10 | 流式请求里调 `write_file` 得到“流式请求下请改用 open_file” | 流式响应的头/帧已经发出去了，中途再走 `/effects` 挂起就没法回到同一个响应 | 设计如此：流式请求禁用 effects（`file_io` 的 `yield_blocker`）；要混用就分两次请求，或去掉 `X-AutoDbg-Stream` 头 |
 
 ## M. 手工映射的模块（`src/sys/pack/module_loader`）
 
@@ -85,6 +86,7 @@
 | N8 | 本地模式一跑就 `timed_out`（exit=124）且 stdout/stderr 全空 | `vim.system(...):wait(0)` 是「立即返回」（没跑完就是 `nil`），不是「无限等」 | 无限等要 `:wait()` 不带参；只有 `timeout > 0` 才传 `:wait(timeout)`，拿到 `nil` 时 `:kill()` 并记 `timed_out` |
 | N9 | 脚本首行写 `--!autodbg …` 后，直接命令行跑 exe 报 `launcher: unknown script marker --!autodbg` | launcher 只认 `--!lua` / `--!luajit`，其它 `--!xxx` 一律当 typo 报错（D9） | launcher 把 `--!autodbg` / `--!adbg` 当**编辑器侧标记**跳过整行继续扫（找不到 flavor 就用默认）；未知名字仍报错（D9 不变） |
 | N10 | 换架构后补全里出现了根本取不到的字段（x86 上给 `Xmm0` 之类） | `Context` 的字段集**按架构不同**（x86 23 项 / x64 60 项），而 lua_ls 会把 library 目录**递归扫完** | 注解拆成 `addons/autodbg/library/`（公共）+ `arch/{x86,x64}/context.lua`（二选一），`lsp.lua` 注册时只挂当前架构那份，切架构先摘另一个 |
+| N11 | 插件里解帧/解包报 `attempt to call a nil value (field 'unpack')` | nvim 跑的是 **LuaJIT**，没有 5.3+ 的 `string.unpack` / 整数除法 `//` / 位运算符 | 帧头小端自己手写（`le16`/`le32` 用 `string.byte`）；插件代码里不用 5.3+ 语法（`PITFALLS` 同样适用于 snippets 与 modeline） |
 
 ## O. 输出、日志与排障手法
 
