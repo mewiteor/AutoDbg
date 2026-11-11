@@ -82,6 +82,7 @@
 | 请求级切换 flavor/variant | server 的 flavor 由「映射到的模块」决定 | 不做（要新增 launcher→module 派发契约 = ABI 变更） |
 | 多租户并发 | 执行严格串行（并发 1），目标进程是全局唯一资源 | **设计如此**：这是「单 operator 的远程调试后端」 |
 | `BsonDecode` | 仍是桩（`bson.cpp` 报 `not implement BsonDecode yet!`） | 不为此单独实现，见 §5 |
+| MCP 没有交互式调试工具 | `dbg_begin` / `dbg_continue` / `dbg_mem_read` / `dbg_bp_set` 这类「停下再逐条操作」的接口需要把阻塞的 `run()` 拆成 begin/pump/continue | 本轮先止损：那 3 个名义上存在但拿不到活动会话、参数形状也错的工具已**删除**（S12）；真要做需单独设计一轮（引擎层模型变更） |
 | client 文件 I/O 在**调试回调里**（非流式路径） | `write_file`/`read_file` 靠 yield，回调里不能用 | **已解决**：新增 `open_file()` 流式路径（§6）——脚本线程直接写 `/run` 连接，回调里可用、内存恒定；老路径保留给非流式客户端 |
 | MCP 不支持流式 | `/mcp` 的 JSON-RPC 响应一次性回，带不了帧 | 不做：MCP 客户端消费不了自定义帧；要写大文件请走 `/run` 流式路径 |
 

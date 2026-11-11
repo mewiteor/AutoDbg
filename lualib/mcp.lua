@@ -9,6 +9,12 @@
 --   返回 JSON 字符串 = 要回给客户端的响应；返回 nil = 这条是通知（无需响应）。
 -- 协议：MCP 2024-11-05 的 streamable HTTP 子集（initialize / tools/list / tools/call /
 --   ping / notifications）。会话由 C 侧的 `Mcp-Session-Id` 头负责（§8.3）。
+--
+-- ❗工具集口径（2026 修订）：**一次 tools/call = 一次 Lua 执行（串行）**。
+--   `Run`/`Attach` 会阻塞到目标退出/Detach，所以**不提供**“单独读内存/下断点”的交互式工具
+--   （曾经的 dbg_run / dbg_mem_read / dbg_breakpoint_set 因为拿不到活会话、 且参数形状不对，
+--   实际是死工具，已删除）。调试逻辑请写在 `lua_eval` 的场景脚本里，在 Attach/Run 的回调内做。
+--   现工具：lua_eval、dbg_status、gui_screenshot/windows/find/click/type/press/text/set_text/post。
 -- =============================================================================
 
 local M = {}
@@ -18,7 +24,8 @@ local json = jsonx
 -- 协议版本：客户端要求什么就回什么（本实现只用与版本无关的 tools 能力）
 local DEFAULT_PROTOCOL = "2024-11-05"
 local SERVER_NAME      = "AutoDbg"
-local SERVER_VERSION   = "0.1.0"
+-- 版本号来自 C 侧 `_autodbg_info()`（构建期 git describe），不再写死
+local SERVER_VERSION   = tostring((type(_autodbg_info) == "function" and _autodbg_info().version) or "unknown")
 
 ---------------------------------------------------------------------
 -- 小工具
@@ -55,22 +62,8 @@ local function text(s)
   return { { type = "text", text = tostring(s) } }
 end
 
-local function hexdump(addr, bytes)
-  local lines = {}
-  for off = 1, #bytes, 16 do
-    local chunk = bytes:sub(off, off + 15)
-    local hex = {}
-    local asc = {}
-    for k = 1, #chunk do
-      local byte = chunk:byte(k)
-      hex[#hex + 1] = string.format("%02X", byte)
-      asc[#asc + 1] = (byte >= 32 and byte < 127) and string.char(byte) or "."
-    end
-    lines[#lines + 1] = string.format("%08X  %-47s  %s",
-      (addr + off - 1) % 0x100000000, table.concat(hex, " "), table.concat(asc))
-  end
-  return table.concat(lines, "\n")
-end
+-- 宿主身份（C 侧注册的 `_autodbg_info()`）；拿不到就降级成 unknown
+local INFO = (type(_autodbg_info) == "function") and _autodbg_info() or {}
 
 -- ---------------------------------------------------------------------------
 -- 协程「yield 透传」（S7）：read_file/write_file 会在 Lua 里 yield 一个效果表，
@@ -161,31 +154,26 @@ define("lua_eval",
     return text(table.concat(parts, "\n"))
   end)
 
-define("dbg_run",
-  "启动并调试一个可执行文件（内部调 Run；返回后目标已退出或分离）",
-  schema({ path = { type = "string" }, args = { type = "string" } }, { "path" }),
-  function(a)
-    local r = Run(a.path, a.args or "")
-    return text("Run returned: " .. tostring(r))
-  end)
-
-define("dbg_mem_read",
-  "读取目标进程内存（十六进制 + ASCII）",
-  schema({ addr = { type = "integer" }, size = { type = "integer" } }, { "addr" }),
-  function(a)
-    local size = a.size or 64
-    if size <= 0 or size > 4096 then error("size must be 1..4096") end
-    local bytes = ReadMemory(a.addr, size)
-    if not bytes then error("ReadMemory failed") end
-    return text(hexdump(a.addr, bytes))
-  end)
-
-define("dbg_breakpoint_set",
-  "在模块的 RVA 处下软件断点",
-  schema({ module = { type = "string" }, rva = { type = "integer" } }, { "module", "rva" }),
-  function(a)
-    SetBreakpoint(a.module, a.rva)
-    return text(string.format("breakpoint set: %s+0x%X", a.module, a.rva))
+define("dbg_status",
+  "报告宿主身份与调试模型：版本/ABI/flavor/variant/pid/client_io，以及“本 MCP 不提供交互式暂停”的说明",
+  schema({}, {}),
+  function()
+    local info = (type(_autodbg_info) == "function") and _autodbg_info() or {}
+    local lines = {
+      "version   = " .. tostring(info.version or SERVER_VERSION),
+      "source    = " .. tostring(info.version_source or "unknown"),
+      "abi       = " .. tostring(info.abi or "?"),
+      "flavor    = " .. tostring(info.flavor or _VERSION),
+      "variant   = " .. tostring(info.variant or "?"),
+      "runtime   = " .. tostring(_VERSION) .. (jit and (" (" .. tostring(jit.version) .. ")") or ""),
+      "server_pid= " .. tostring(info.pid or "?"),
+      "client_io = " .. tostring(info.client_io == true),
+      "",
+      "模型：一次 tools/call = 一次 Lua 执行（串行）。调试必须在脚本里用 Attach/Run 的回调做，",
+      "      Run/Attach 会阻塞到目标退出或 Detach；**没有**“暂停后逐条读内存/下断点”的交互式接口。",
+      "写文件：流式模式下用 open_file + f:write（回调里也能用）。",
+    }
+    return text(table.concat(lines, "\n"))
   end)
 
 ---------------------------------------------------------------------

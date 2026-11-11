@@ -391,8 +391,16 @@ payload              // 单条 LZMA 流：各模块原始字节按 entry 顺序�
 ### 12.3 MCP
 
 - 传输在 C（`POST /mcp`，`Mcp-Session-Id` 头表达会话，D35）；**JSON-RPC 分发在 Lua**（`lualib/mcp.lua`，用 `jsonx`），C 侧不写 JSON 解析器（D28）。
-- 当前 13 个工具：`lua_eval`、`dbg_run`、`dbg_mem_read`、`dbg_breakpoint_set`、`gui_screenshot`、`gui_windows`、`gui_find`、`gui_click`、`gui_type`、`gui_press`、`gui_text`、`gui_set_text`、`gui_post`。
-- 会话是持久 `lua_State`（≤8 个、空闲 30 min 回收），`Accept: text/event-stream` → `chunked` 单事件（D36；增量推帧未做）。
+- 当前 **11 个工具**：`lua_eval`、`dbg_status`、`gui_screenshot`、`gui_windows`、`gui_find`、`gui_click`、
+  `gui_type`、`gui_press`、`gui_text`、`gui_set_text`、`gui_post`。
+- ❗**工具集口径**：一次 `tools/call` = 一次 Lua 执行（串行）。`Run`/`Attach` 会阻塞到目标退出/`Detach`，
+  所以**不提供**“单独读内存 / 下断点 / 单步”的交互式工具（它们需要「已停止的目标」这个状态，现在没有）。
+  调试逻辑写在 `lua_eval` 的场景脚本里，在 `Attach`/`Run` 的回调内做（这是设计，不是缺口，`PITFALLS.md` S12）。
+- 会话是持久 `lua_State` + `DebuggerSession`（≤8 个、空闲 30 min 回收，Lua 全局变量跨请求保留），
+  但**不是「后台附加」**：`Attach` 期间 worker 被占住，后续请求只能排队（满了 503）或 `/cancel`。
+- `Accept: text/event-stream` → `chunked` 单事件（D36；增量推帧未做）。
+- 宿主身份全局 `_autodbg_info()`（`registry.cpp`）：`{version, version_source, abi, flavor, variant, pid, client_io}`，
+  MCP 的 `serverInfo.version` 与 `dbg_status` 用它（不再写死 `0.1.0`）。
 
 ### 12.4 client 文件 I/O（`open_file` 流式 / `write_file` 一次性）
 

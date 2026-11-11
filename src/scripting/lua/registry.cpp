@@ -15,6 +15,48 @@
 #include "state.hpp" /* lua_reset_dir（Q7：脚本目录工具，声明在 state.hpp） */
 #include "variant.hpp"
 
+#include "../../sys/pack/boot.h" /* AUTODBG_ABI_VERSION */
+#include "../../sys/version.h"   /* AUTODBG_VERSION（构建期生成，见 make.bat :genversion） */
+
+namespace
+{
+/* `_autodbg_info()` —— 宿主自己的身份（Lua 层拿不到编译期宏；MCP 的 `serverInfo.version`
+ * 与 `dbg_status` 工具靠它，否则只能写死 "0.1.0"）。
+ * 返回：{ version, version_source, abi, flavor, variant, pid, client_io } */
+int lua_autodbg_info(lua_State *L)
+{
+    lua_createtable(L, 0, 7);
+
+    lua_pushstring(L, AUTODBG_VERSION);
+    lua_setfield(L, -2, "version");
+    lua_pushstring(L, AUTODBG_VERSION_SOURCE);
+    lua_setfield(L, -2, "version_source");
+    lua_pushinteger(L, (lua_Integer)AUTODBG_ABI_VERSION);
+    lua_setfield(L, -2, "abi");
+
+#ifdef JIT
+    lua_pushliteral(L, "luajit");
+#else
+    lua_pushliteral(L, "lua");
+#endif
+    lua_setfield(L, -2, "flavor");
+
+#ifdef NO_SCYLLA_HIDE
+    lua_pushliteral(L, "legacy");
+#else
+    lua_pushliteral(L, "modern");
+#endif
+    lua_setfield(L, -2, "variant");
+
+    lua_pushinteger(L, (lua_Integer)GetCurrentProcessId());
+    lua_setfield(L, -2, "pid");
+
+    lua_pushboolean(L, autodbg::host::client_io_enabled() ? 1 : 0);
+    lua_setfield(L, -2, "client_io");
+    return 1;
+}
+} /* namespace */
+
 void register_lua_api(lua_State *L)
 {
     lua_register(L, "Run", lua_run);
@@ -53,6 +95,9 @@ void register_lua_api(lua_State *L)
 
     /* S7：client 文件 I/O（server 模式下走效果协议，本机模式直接读写磁盘） */
     autodbg::host::register_file_api(L);
+
+    /* 宿主身份（MCP 的 serverInfo.version / dbg_status 用；不污染 29 个契约名） */
+    lua_register(L, "_autodbg_info", lua_autodbg_info);
 
     /* 注册M.Var相关函数 */
     luaL_newmetatable(L, "Var");

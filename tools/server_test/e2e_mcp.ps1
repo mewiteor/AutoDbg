@@ -88,6 +88,7 @@ try
     Check 'initialize.server-name' ($j.result.serverInfo.name -eq 'AutoDbg') "name=$($j.result.serverInfo.name)"
     Check 'initialize.capabilities' ($null -ne $j.result.capabilities.tools) "capabilities.tools=$($j.result.capabilities.tools)"
     Check 'initialize.session-header' ([int]$sid -gt 0) "Mcp-Session-Id=$sid"
+    $initJson = $j   # 留给后面与 /version 比对 serverInfo.version
 
     # ------------------------------------------------------------ initialized 通知 → 202
     $r = Mcp '{"jsonrpc":"2.0","method":"notifications/initialized"}' @{ 'Mcp-Session-Id' = $sid }
@@ -99,10 +100,28 @@ try
 
     $j = (Mcp '{"jsonrpc":"2.0","id":3,"method":"tools/list"}' @{ 'Mcp-Session-Id' = $sid }).Content | ConvertFrom-Json
     $names = @($j.result.tools | ForEach-Object { $_.name })
-    Check 'tools.list.count' ($names.Count -ge 10) ("count=" + $names.Count)
+    Check 'tools.list.count' ($names.Count -eq 11) ("count=" + $names.Count + " [" + ($names -join ',') + "]")
     Check 'tools.list.has-lua-eval' ($names -contains 'lua_eval') ($names -join ',')
     Check 'tools.list.has-gui-screenshot' ($names -contains 'gui_screenshot') ($names -join ',')
+    Check 'tools.list.has-dbg-status' ($names -contains 'dbg_status') ($names -join ',')
+    # 误导性工具已删：它们拿不到活动会话，参数形状也不对（只有 1 个 lua_eval 能真做事）
+    Check 'tools.list.no-broken-dbg' (-not ($names -contains 'dbg_run') -and -not ($names -contains 'dbg_mem_read') -and -not ($names -contains 'dbg_breakpoint_set')) ($names -join ',')
     Check 'tools.list.schema' (($j.result.tools | Where-Object { $_.name -eq 'lua_eval' }).inputSchema.type -eq 'object') 'lua_eval inputSchema'
+
+    # dbg_status：返回真实版本（不再写死 0.1.0）与调试模型说明
+    $j = (ToolCall 'dbg_status' '{}' $sid).Content | ConvertFrom-Json
+    $st = $j.result.content[0].text
+    Check 'tool.dbg_status.ok' ($j.result.isError -ne $true) "isError=$($j.result.isError)"
+    Check 'tool.dbg_status.version' ($st -match 'version\s*=\s*\S+' -and $st -notmatch 'version\s*=\s*0\.1\.0\s') "text=[$($st -split "`n" | Select-Object -First 3)]"
+    Check 'tool.dbg_status.model-note' ($st -like '*没有*交互式*') 'should describe the blocking model'
+
+    # 已删的工具 → -32602（未知工具）
+    $j = (ToolCall 'dbg_run' '{"path":"C:\\Windows\\System32\\cmd.exe"}' $sid).Content | ConvertFrom-Json
+    Check 'tools.removed.dbg_run' ($j.error.code -eq -32602) "code=$($j.error.code)"
+
+    # serverInfo.version 与 /version 一致（构建期 git describe）
+    $ver = (Invoke-WebRequest -Uri "http://127.0.0.1:$Port/version" -TimeoutSec 5).Content | ConvertFrom-Json
+    Check 'initialize.version-matches' ($initJson.result.serverInfo.version -eq $ver.server) "mcp=$($initJson.result.serverInfo.version) http=$($ver.server)"
 
     # ------------------------------------------------------------ tools/call: lua_eval
     $r = ToolCall 'lua_eval' '{"code":"print(\"hello mcp\"); return 40 + 2"}' $sid
