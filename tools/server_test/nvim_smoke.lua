@@ -59,6 +59,35 @@ if rb and vim.api.nvim_buf_is_valid(rb) then
     text:find("nvim hello", 1, true) and "ok" or "result buffer 里没有 stdout")
 end
 
+-- 异步路径（uv 读回调 → vim.schedule）：回归「fast event context 里调 nvim API」那个坑
+-- （E5560：uv 回调里不能 nvim_create_buf / setqflist / notify…）
+set_buffer({ 'print("async-ok")' }, "async.lua")
+local slot = { done = false, res = nil }
+adbg.run({
+  open = "split",
+  on_done = function(r)
+    slot.done = true
+    slot.res = r
+  end,
+})
+vim.wait(15000, function()
+  return slot.done
+end, 20)
+check("async.done", slot.done == true and slot.res ~= nil, "done=" .. tostring(slot.done))
+if slot.res then
+  check("async.ok", slot.res.ok == true, "status=" .. tostring(slot.res.status) .. " err=" .. tostring(slot.res.error))
+  check("async.stdout", (slot.res.stdout or ""):find("async-ok", 1, true) ~= nil, "stdout=[" .. tostring(slot.res.stdout) .. "]")
+  check(
+    "async.result-buffer",
+    slot.res.result_buf ~= nil and vim.api.nvim_buf_is_valid(slot.res.result_buf),
+    "result_buf=" .. tostring(slot.res.result_buf)
+  )
+  check("async.no-fast-context-error", tostring(slot.res.error or ""):find("E5560", 1, true) == nil, tostring(slot.res.error))
+else
+  bad("async.ok", "no result")
+end
+
+
 -- ---------------------------------------------------------------- 语法错 → quickfix
 -- ❗真实语法错（`local x = ` 后面直接换行是合法 Lua，S3 先弄错过一次）
 set_buffer({ "local ok = true", "if then end" }, "syntax.lua")

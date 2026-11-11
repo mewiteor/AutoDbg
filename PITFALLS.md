@@ -87,6 +87,7 @@
 | N9 | 脚本首行写 `--!autodbg …` 后，直接命令行跑 exe 报 `launcher: unknown script marker --!autodbg` | launcher 只认 `--!lua` / `--!luajit`，其它 `--!xxx` 一律当 typo 报错（D9） | launcher 把 `--!autodbg` / `--!adbg` 当**编辑器侧标记**跳过整行继续扫（找不到 flavor 就用默认）；未知名字仍报错（D9 不变） |
 | N10 | 换架构后补全里出现了根本取不到的字段（x86 上给 `Xmm0` 之类） | `Context` 的字段集**按架构不同**（x86 23 项 / x64 60 项），而 lua_ls 会把 library 目录**递归扫完** | 注解拆成 `addons/autodbg/library/`（公共）+ `arch/{x86,x64}/context.lua`（二选一），`lsp.lua` 注册时只挂当前架构那份，切架构先摘另一个 |
 | N11 | 插件里解帧/解包报 `attempt to call a nil value (field 'unpack')` | nvim 跑的是 **LuaJIT**，没有 5.3+ 的 `string.unpack` / 整数除法 `//` / 位运算符 | 帧头小端自己手写（`le16`/`le32` 用 `string.byte`）；插件代码里不用 5.3+ 语法（`PITFALLS` 同样适用于 snippets 与 modeline） |
+| N12 | 流式跑完后报 `E5560: nvim_create_buf must not be called in a fast event context` | `vim.uv` 的读回调（`tcp:read_start` / timer）属于 **fast event context**，里面不能调任何 nvim API（buffer/window/qflist/notify 都会报） | `stream.lua` 的 `finish()` 一律用 `vim.schedule()` 调 `on_done`；handlers 里的 nvim API（如 `on_open` 失败提示）也自己 schedule；`nvim_smoke` 的 `async.*` 用例看护这条 |
 
 ## O. 输出、日志与排障手法
 

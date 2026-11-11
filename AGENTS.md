@@ -429,7 +429,8 @@ payload              // 单条 LZMA 流：各模块原始字节按 entry 顺序�
 - 命令：`:AutoDbgRun`（当前 buffer / 选区 / 文件）、`:AutoDbgCancel`、`:AutoDbgHealth`（报本次的模式与地址）、`:AutoDbgHeader [remote|local]`（插入脚本头标记）、`:AutoDbgLsp [on|off]`（挂/摘注解库）。
 - **两种运行模式（D39）**：能拿到 exe（标记 `exe=` > `setup.exe` > PATH 里的 `AutoDbg_{64,86}.exe`）→ **本地模式**直接跑 exe；否则 → **远程模式**（HTTP `/run`）。标记的 exe 不存在时**回落远程**并提示一次；`setup{ mode = "remote" }` 强制远程，`mode = "local"` 则必须本地（找不到就报错）。
 - 本地模式：buffer 写到临时文件跑完即删（AutoDbg 只接受脚本路径），临时路径在输出里被换回 buffer 名（quickfix 仍可用）；默认带 `--quiet`（免 headless 被 MessageBox 挂住）；flavor 由脚本自己的 `--!lua`/`--!luajit` 决定。
-- 远程模式：`vim.system` + `curl`，脚本走 stdin（**不落盘**）；结果落 scratch buffer，`<file>:<line>:` 进 quickfix；默认响应格式 **JSON**（D33）。
+- 远程模式：`vim.system` + `curl`（非流式）或 `vim.uv` TCP（**流式，默认**）；结果落 scratch buffer，`<file>:<line>:` 进 quickfix；默认响应格式 **JSON**（D33）。
+  ❗uv 回调是 **fast event context**：里面不能调 nvim API，`on_done` 一律 `vim.schedule`（`PITFALLS.md` N12）。
 - 客户端效果循环在 `nvim/lua/autodbg/effects.lua`（base64 + `exec_effect`，≤16 轮，把每轮 `stdout_so_far` 拼回最终结果）。
 - **脚本头标记（modeline）**：`nvim/lua/autodbg/modeline.lua` 解析前/后 5 行里的
   `--!autodbg url=… token=… / host=… port=… / exe=… / arch=x86|x64`（也认 `-- autodbg:` / `-- adbg:`），
