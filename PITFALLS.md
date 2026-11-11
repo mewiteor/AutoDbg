@@ -116,6 +116,7 @@
 | S8 | `httptool`/`curl` 发大 body 前先卡 1 s | `curl` 对 >1 KB 的 body 默认发 `Expect: 100-continue`，我们没答 | 必须回 `HTTP/1.1 100 Continue` |
 | S9 | 用 `ws2_32` 的 `htons`/`inet_addr` 后导入表里冒出静态导入 | 它们都是导出函数，直接调就是静态导入 | `net` 层自己实现字节序与点分十进制格式化，全部函数走 dynapi（`ws2_32` → `wsock32` 兜底） |
 | S10 | `/mcp` 的 SSE 一直等到脚本跑完才回 | 响应写入器当前是 `begin/write/end` 一次性形态 | 已知限制：增量推帧未做（D36 后半，见 `plan_server.md` 剩余项） |
+| S11 | 启动横幅里拿到了 token，`curl -H 'X-AutoDbg-Token: <token>'` 仍回 `{"ok":false,"error":"unauthorized"}` | 在 **cmd.exe** 里粘了 bash 写法的**单引号**：cmd 不认 `'`，curl 收到的头名是 `'X-AutoDbg-Token`（带前导单引号）→ 服务端认为没带 token（附带 curl 报 `Could not resolve host: application`） | cmd.exe 用**双引号**（或 PowerShell / Git Bash）；服务端现在会在 stdout 打一行诊断（`server: 401 no-token-header path=/mcp` 或 `401 token-mismatch`），401 体里也加了 `hint` 字段 |
 
 ## W. Win9x 实机自动化（vmrun）与 GUI 自动化
 

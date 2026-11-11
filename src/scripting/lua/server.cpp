@@ -1515,9 +1515,23 @@ bool handle_connection(long long sock,
     /* ---- 认证（尽早拒绝，避免读大 body） ---- */
     if (!token_ok(cfg, req))
     {
+        /* 诊断：区分「没带 token 头」与「值不对」。
+         * ❗典型误判：在 **cmd.exe** 里粘 bash 写法的单引号（`-H 'X-AutoDbg-Token: xxx'`）→
+         *   头名会变成 `'X-AutoDbg-Token`（带前导单引号）→ 看起来就是「没带 token」。
+         * 直接写 stdout（不经 core 的 sink：T1 的诊断不能被捕进别人的响应）。 */
+        {
+            log_line_buf lb;
+            lb.add("server: 401 ");
+            lb.add(req.has_token ? "token-mismatch" : "no-token-header");
+            lb.add(" path=");
+            lb.add(req.path);
+            lb.add("\n");
+            lb.flush_to(GetStdHandle(STD_OUTPUT_HANDLE));
+        }
         http_response resp(401, "application/json; charset=utf-8");
         resp.add_header("WWW-Authenticate", "Bearer");
-        resp.write("{\"ok\":false,\"error\":\"unauthorized\"}");
+        resp.write("{\"ok\":false,\"error\":\"unauthorized\","
+                   "\"hint\":\"send X-AutoDbg-Token: <token> or Authorization: Bearer <token>\"}");
         send_response(sock, &resp);
         buf.free_buf();
         return false;
