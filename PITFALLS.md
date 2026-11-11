@@ -105,6 +105,8 @@
 
 ## S. server 模式 / MCP / client 文件 I/O
 
+> `feat/cli-tcp`（D41 / D44）落地后 **S1 / S5 / S8 / S10 / S11 作废**（它们绑在 HTTP 与效果协议上）。保留备查：这些是当时定位问题的第一手依据，删除后仍是「为什么会写成那样」的答案。S12 的教训——每个对外接口都要有门禁断言——在帧命令面上继续适用。
+
 | # | 现象 | 根因 | 现在的做法 |
 | --- | --- | --- | --- |
 | S1 | 所有第一个 HTTP 请求都变 400（curl 与 .NET 客户端都复现） | 首次 `read_head` 时缓冲是 `nullptr`，而解析器把「空输入」当非法 | 解析器把 `(buf==nullptr, len==0)` 判 `incomplete`，`read_head` 前先 `ensure(4096)`；selftest 补了回归断言 |
@@ -119,6 +121,7 @@
 | S10 | `/mcp` 的 SSE 一直等到脚本跑完才回 | 响应写入器当前是 `begin/write/end` 一次性形态 | 已知限制：增量推帧未做（D36 后半，见 `plan_server.md` 剩余项） |
 | S11 | 启动横幅里拿到了 token，`curl -H 'X-AutoDbg-Token: <token>'` 仍回 `{"ok":false,"error":"unauthorized"}` | 在 **cmd.exe** 里粘了 bash 写法的**单引号**：cmd 不认 `'`，curl 收到的头名是 `'X-AutoDbg-Token`（带前导单引号）→ 服务端认为没带 token（附带 curl 报 `Could not resolve host: application`） | cmd.exe 用**双引号**（或 PowerShell / Git Bash）；服务端现在会在 stdout 打一行诊断（`server: 401 no-token-header path=/mcp` 或 `401 token-mismatch`），401 体里也加了 `hint` 字段 |
 | S12 | MCP 的 `dbg_run` / `dbg_mem_read` / `dbg_breakpoint_set` **看上去存在但一发就报错** | ①参数形状写错：`Run`/`SetBreakpoint` 要**一个 table**（且断点必须带 `callback`），`ReadMemory` 的参数是 **LuaVariant**（`V()`/`U32()`），裸数字/裸字符串不行；②更根本：它们作用于 `current_session()`，而**只有 `Attach`/`Run` 的回调里**才有活着的目标 | 删除这三个工具（只留 `lua_eval` + `dbg_status` + `gui_*`），调试逻辑写在 `lua_eval` 的场景脚本里；每个 MCP 工具都要有 e2e 断言（`e2e_mcp.ps1` 现在校验工具数量/名字/参数错误），否则会静默烂成死工具 |
+| S13 | 回调里 `f:read()` 阻塞等回包时，`cancel`（控制帧 / CLI `--cancel`）打不断它 | `lua_sethook` 只在 **Lua 指令边界**触发，阻塞在 C 调用里不会触发；`on_wait_timeout`（100 ms）也到不了，因为线程不在 `WaitForDebugEvent` 里 | 等待循环按 ≤250 ms 切片 `select`，每片检查 `exec_guard` 标志（D45）。另一半：被取消的请求可能已有 **stale 应答**——必须丢弃该帧并给 client 发 `cancel_notify`，否则协议串位；且执行连接的唯一 reader 只能是脚本线程，其它连接才是控制连接（由 accept 线程处理） |
 
 ## W. Win9x 实机自动化（vmrun）与 GUI 自动化
 

@@ -18,7 +18,8 @@
 | `AGENTS.md`（本文） | 工作约定：构建 / 门禁 / 约束 / 风格 / 架构 / 打包 ABI / 已定决策 |
 | `PITFALLS.md` | **已踩过的坑**（现象 → 根因 → 现在的做法），改代码前先扫对应小节 |
 | `plan_p7_win9x.md` | Win9x 实机测试的**剩余**工作 |
-| `plan_server.md` | server / MCP / GUI / client 文件 I/O 的**剩余**工作 |
+| `plan_server.md` | server / MCP / GUI / client 文件 I/O 的**剩余**工作（其中传输与文件 I/O 的方向已被 `plan_cli.md` 的 D41–D50 取代） |
+| `plan_cli.md` | **已拍板的 CLI + raw TCP 路线**（D41–D50）与落地任务清单 |
 | `nvim/README.md` | neovim 插件的安装、配置与命令 |
 
 ## 1. 构建
@@ -97,8 +98,8 @@ make.bat i <dir>         :: 指定输出目录（默认 .out）
 | 链 | 入口 | 说明 |
 | --- | --- | --- |
 | 导入表门禁 | `uv --directory tools/api_check run scan_dir.py` | 扫 `.out` 下全部产物，按产物自动选口径（`AutoDbgLegacy_*` 与启动器 → `w95`、其余 x86 → `wxp`、x64 → `w7`），有目标系统不可用的导入就打印并返回 1。单文件用法：`uv --directory tools/api_check run main.py <exe\|dll> <w95\|w98\|w982\|wxp>`（x64 免第二个参数） |
-| 纯函数自测 | `.out\AutoDbg_<arch>.exe --selftest` | 覆盖 `http` / `json_writer` / `base64` / `png_writer` / `dbl2str` 等纯计算层（当前 70 条） |
-| server 端到端 | `pwsh tools/server_test/e2e.ps1 -Render <64\|86> [-Variant legacy]`，另有 `e2e_gui.ps1` / `e2e_mcp.ps1` / `e2e_io.ps1` / `nvim_smoke.ps1` | 起 server → 断言 → 停；不需要 VM，也不改产品行为 |
+| 纯函数自测 | `.out\AutoDbg_<arch>.exe --selftest` | 覆盖 `http` / `json_writer` / `base64` / `png_writer` / `dbl2str` 等纯计算层（当前 70 条）；`feat/cli-tcp` 上 `http` / `base64` 段随 D41 / D44 删除，要补帧编解码与 `decide_console_action` 的断言 |
+| server 端到端 | `pwsh tools/server_test/e2e.ps1 -Render <64\|86> [-Variant legacy]`，另有 `e2e_gui.ps1` / `e2e_mcp.ps1` / `e2e_io.ps1` / `nvim_smoke.ps1` | 起 server → 断言 → 停；不需要 VM，也不改产品行为。`feat/cli-tcp`（D41）上 `e2e_mcp.ps1` 删除、新增 `e2e_tcp.ps1`（握手 + 帧 + 回调里阻塞读的超时/取消） |
 | Win9x 实机 | `pwsh tools/w9x_test/w9x.ps1 -Action check\|run\|record` | 需要 VMware 的 Win98 guest 与凭据（`tools/w9x_test/config.local.ps1`，已 gitignore）；**没有 VM / 凭据时 SKIP（exit 0）**。矩阵与剩余项见 `plan_p7_win9x.md` |
 
 - 黄金输出在本仓库 `tests/golden/w9x/`（Win98 guest 的输出），行尾与比较口径见 D15（golden 统一 LF，比较走「CRLF→LF + 去末尾空行」归一化）。
@@ -112,7 +113,7 @@ make.bat i <dir>         :: 指定输出目录（默认 .out）
 3. **Win9x 兼容**：不得用 Vista+ 才引入的 API；新 API 一律走 `src/common/dynapi`（解析失败返回 `nullptr` 是正常路径，必须降级），x86 产物导入表要求零 XP+。
 4. **Lua 双版本**：代码需同时兼容 Lua 5.5 与 LuaJIT。已知地雷三例：① LuaJIT 没有位运算元方法（`__band/__bor/__bxor/__shl/__shr/__bnot` 是 5.3+），涉及位运算的 `LuaVariant` 脚本在 LuaJIT 下不可用；② **`LUAJIT_NO_UNWIND` 只允许 x86**（`PITFALLS.md` M4/M5、D19）；③ LuaJIT 的 `pcall` 不能跨 yield（`PITFALLS.md` L6）。
 5. **架构边界**：`src/core/**` 与 `src/common/**` **不得感知 Lua**（不得 include `lua.h`/`lua.hpp`/`lauxlib.h`/`lualib.h`）。core 对宿主只暴露 `DebugCallbacks`（函数指针 + `void*` 上下文）与宿主无关的回调令牌 `callback_ref_t`。
-6. **脚本 API 名字是契约**：绑定层的 C++ 函数叫 `lua_xxx`（snake_case），但 `lua_register` 的字符串（`Run`/`ReadMemory`/`SetBreakpoint`… 共 29 个，见 `src/scripting/lua/registry.cpp`）和 `Var` 元表方法（`to`/`tos`/`sto`/`write`/`writes`/`swrite`/`off`）**改不得**——改绑定层必须逐字节验证输出。新增能力用**新的全局表**（`gui`）或新名字（`read_file`/`write_file`），不要平铺更多全局函数。
+6. **脚本 API 名字是契约**：绑定层的 C++ 函数叫 `lua_xxx`（snake_case），但 `lua_register` 的字符串（`Run`/`ReadMemory`/`SetBreakpoint`… 共 29 个，见 `src/scripting/lua/registry.cpp`）和 `Var` 元表方法（`to`/`tos`/`sto`/`write`/`writes`/`swrite`/`off`）**改不得**——改绑定层必须逐字节验证输出。新增能力用**新的全局表**（`gui`）或新名字（`read_file`/`write_file`，二者在 `feat/cli-tcp` 上被 `open_file` 的文件对象取代——它们本来不在 29 个契约名内，见 D44；新名字例：`gui.pick()`），不要平铺更多全局函数。
 7. **结构体布局不可动**：`src/core/types.hpp` 里的 `PEInfo` / `BreakpointInfo` / `ThreadInfo` 等是 `#pragma pack(1)`，字段顺序/类型一字不改（`Path[1]`、`modname[1]` 是变长尾数组，参与偏移计算）。侵入式链表要求首成员是 `next` 指针。
 8. **入口与 CRT 兼容层必须保持 C 链接**（`/ENTRY:mainCRTStartup` 与 `msvcrt.def` 按 C 名字查找）；零 CRT 下没有 `_atexit`，带非平凡析构的静态对象会 LNK2019（`main.cpp` 用 `new` 而非静态对象的原因）。
 9. **CRT 缺口的补法**：`msvcrt.dll` / `ucrtbase.dll` 都没有（或只有 XP+ 版本）的符号，在 `src/sys/` 里自己实现，并同步影子头声明，这样各架构导入表零新增。现有两例：① `src/sys/strtoull.c` + `src/sys/include/stdlib.h`（LuaJIT 的 `tonumber(s, base)` 要 `strtoull`；`msvcrt.dll` 只有 XP+ 的 `_strtoui64`，Win9x 连它都没有）；② `src/sys/destruct_eh.c`（LuaJIT 的 `lj_err.c` 无条件引用 `__DestructExceptionObject`，Win9x 的 `msvcrt.dll` 没有它）——后者无法纯自实现，做法是「自己提供符号 + 运行时向已加载的 `msvcrt.dll` 转发，取不到就降级」。
@@ -142,10 +143,10 @@ src/core/            调试引擎（C++，禁 Lua）
   memory / pe / context / breakpoints / hardware_breakpoints / process / stack_trace / hide / util
 src/scripting/lua/   唯一感知 lua_State 的层
   bindings.cpp       29 个契约全局的薄封装（参数编组 → 调 core）+ on_wait_timeout
-  registry.cpp       register_lua_api()：29 个全局 + Var 元表 + gui 表 + read_file/write_file
+  registry.cpp       register_lua_api()：29 个全局 + Var 元表 + gui 表 + read_file/write_file（后者在 feat/cli-tcp 上由 open_file 的文件对象承担，D44）
   state              create_state_with_libs() / run_script_file() / 烘焙 lualib
   main.cpp           autodbg_run（唯一导出）+ CRT 兼容层
-  server / exec / exec_session / exec_guard / output / file_io / gui_bindings / variant / bson / helpers
+  server / exec / exec_guard / output / file_io / gui_bindings / variant / bson / helpers（`exec_session` 与 `http` 在 `feat/cli-tcp` 上随 D43 / D41 删除）
 src/common/          共享基础设施：allocator、containers、dynapi、handle、dbl2str、cmdline、
                      net（winsock 动态载入）、http（HTTP/1.1 子集）、json_writer、base64、rand、png_writer、selftest
 src/sys/             零 CRT 运行时：影子头文件、*.def 导入表、x86 MASM（flt.asm）、mainCRTStartup、
@@ -366,8 +367,11 @@ payload              // 单条 LZMA 流：各模块原始字节按 entry 顺序�
 ## 12. 已实现的扩展面（server / GUI / MCP / client 文件 I/O）
 
 > 这一段只记**现行接口约定**（改之前要知道的事实）；剩余工作与设计取舍见 `plan_server.md`。
+> ❗`plan_cli.md` 的 **D41–D50 已拍板**：MCP 与 HTTP 在 `feat/cli-tcp` 上整体删除，对外只剩 CLI + raw TCP 帧。下面被取代的条目（§12.1 的端点、§12.3 整节、§12.4 的效果协议）都在原地标注，落地前仍按现状读。
 
 ### 12.1 server 模式
+
+> ❗D41 / D42：HTTP 形态整体删除。`--server-*` 的语义保留（认证默认 D21 不变，token 走握手帧），`--server-max-body` → `--server-max-frame`，新增 `--server-read-timeout`（默认 **5000 ms**，单次文件操作）与 `--server-timeout`（整次执行 wall-clock）分开；端点改成帧，`--health` / `--version` 改由 CLI 经 TCP 提供。
 
 - 归属：server 跑在**模块（DLL）里**（需要 `lua_State` 与引擎会话），启动器只解析选项；`--server` 时允许不给脚本。
 - 选项（全部 `--server-*` 前缀）：`--server[=http]`、`--server-addr=<ip:port>`（默认 `127.0.0.1:8642`）、`--server-port=`、`--server-token=<hex|auto|none>`、`--server-max-body=`、`--server-queue=`、`--server-timeout=`、`--server-log=<path>`、`--server-no-echo`。
@@ -388,7 +392,9 @@ payload              // 单条 LZMA 流：各模块原始字节按 entry 顺序�
 - 所有新 API 走 dynapi 并有降级（`PrintWindow`、`MonitorFromWindow`、`SetProcessDPIAware`、`BlockInput`）；静态只多链 `gdi32.lib`（w95 就有）。
 - `gui` 是**唯一**的 GUI 入口：不要为 GUI 再加平铺全局名（§5 第 6 条）。
 
-### 12.3 MCP
+### 12.3 MCP（在 `feat/cli-tcp` 上整节删除，D41）
+
+> 保留备查：本节描述的 HTTP + JSON-RPC 分发在 `feat/cli-tcp` 上整体删除。`lua_api` 与 12 工具的正文（`lualib/autodbg_api.lua`）迁到 **`tools/agent/autodbg-skill/SKILL.md`**（markdown 是所有 coding agent 都读的格式）。S12 的教训（每个对外接口都要有门禁断言）在帧命令面上继续适用。
 
 - 传输在 C（`POST /mcp`，`Mcp-Session-Id` 头表达会话，D35）；**JSON-RPC 分发在 Lua**（`lualib/mcp.lua`，用 `jsonx`），C 侧不写 JSON 解析器（D28）。
 - 当前 **12 个工具**：`lua_eval`、**`lua_api`**（Lua API 速查，给 AI 写代码用）、`dbg_status`、
@@ -407,6 +413,9 @@ payload              // 单条 LZMA 流：各模块原始字节按 entry 顺序�
   MCP 的 `serverInfo.version` 与 `dbg_status` 用它（不再写死 `0.1.0`）。
 
 ### 12.4 client 文件 I/O（`open_file` 流式 / `write_file` 一次性）
+
+> ❗D44 / D45：`read_file` / `write_file` 被文件对象的 io 风格方法取代（`f:read("*a"|"*l"|"*n"|N)`、`f:read_line()`、`f:lines()`、`f:seek()`、`f:tell()`、`f:setbuf()`、`f:write()`、`f:flush()`、`f:close()`）。效果协议 + `base64` + 协程执行器 + `/effects` 一起删。
+> 「调试回调里不可用」这条限制取消：回调里 `f:read()` 可以**阻塞等回包**（等待循环按 ≤250 ms 切片 `select`，每片检查 `exec_guard`），超时 → `nil, "timeout"` 后回调返回、断点继续。前提：执行连接的**唯一 reader 是脚本线程**（三个消费点：`f:read()` 等待循环、`on_wait_timeout` 的非阻塞 poll、`lua_sethook` tick）；其它连接是控制连接，由 accept 线程处理。
 
 文件在**客户端**那台机器上；本机脚本模式下两者都等价于 `io.open`。
 
@@ -505,3 +514,13 @@ payload              // 单条 LZMA 流：各模块原始字节按 entry 顺序�
 | D38 | 挂起/恢复的落地细节 | ①`/run` 也跑在协程里，完成即关、挂起则留；②MCP 用 `call_yielding` 让 yield 穿透 pcall；③`lualib/effects.lua` 顶层不能取 `jsonx`（按文件名烘焙，effects 先于 jsonx） |
 | D39 | nvim 插件的运行模式 | **本地优先**：标记 `exe=` > `setup.exe` > PATH 里的 `AutoDbg_{64,86}.exe`，拿到就跑本地；拿不到（或标记的 exe 不存在）→ **回落远程**（用 `url`/`host`/`port`）。`mode = "remote"` 强制远程，`mode = "local"` 则必须本地（找不到报错，不静默回落） |
 | D40 | 架构决定 LSP 注解 | `Context` 按架构拆成两份：x86 = 23 项、x64 = 60 项（含 `Xmm0-15` / `R8-R15` / `P1Home…`）；`lsp.lua` 只挂当前架构那一份（标记 `arch=` > `exe` 文件名 > `setup.lsp.arch` > 缺省 `x64`），切换时先摘另一个 |
+| D41 | 对外主契约 | **CLI**；MCP 与 HTTP 代码整体删除（落地分支 `feat/cli-tcp`） |
+| D42 | 传输形态 | raw TCP 帧（单端口、握手帧带版本）；**不做 HTTP 嗅探、不留残留报错**；`--health` / `--version` 改由 CLI 经 TCP 提供（D20 的预留位变成唯一形态） |
+| D43 | 会话 | **每次调用无状态**：会话表 / `Mcp-Session-Id`（D35 作废）/ ≤8 上限 / 30 min 空闲回收 / 503 全删；跨调用唯一的状态是**被调试进程本身**，靠 pid 显式指认 |
+| D44 | 文件 I/O | 只有 `open_file` 文件对象（io 风格 API）；`read_file` / `write_file` + 效果协议（D37）+ `base64` + 协程执行器一起删；`jsonx` 保留（`--json` 的 `result` 要在 Lua 侧 encode） |
+| D45 | 回调里的文件读 | `f:read()` **可以阻塞**等回包；超时 → `nil, "timeout"`、回调返回、断点继续；取消立即生效（被取消请求的 stale 应答必须丢弃 + `cancel_notify`）；默认 buffer 4096 |
+| D46 | 控制三档 | `cancel`（硬，`lua_sethook`）/ `kill`（软，`on_wait_timeout`→1）/ `detach`（软，→2）；等价 local mode 的 `q` / `Shift+Q`；执行串行 ⇒ 控制命令不需要 id，直接作用于「当前那次执行」 |
+| D47 | `--detach` 无条件 | NT+ 走 `DebugActiveProcessStop`——**即使目标是我们 `CreateProcess` 起的也是真 detach**，pid 不变、可用于下一次 `Attach`；Win95/98 没有该导出 → 降级 kill，由 `ack` 帧报 reason；`WaitTimeoutAction` 枚举值与 `DebugCallbacks` 布局不动，`can_detach_without_term` 从「许可」改成「能力上报」 |
+| D48 | pid 解析链 | 显式（`--pid=` / 握手帧 / 头标记 `pid=`）> `gui.pick()`（**在目标机上**解析：`GetCursorPos` → `WindowFromPoint` → `GetWindowThreadProcessId`，无交互桌面降级 `gui.foreground_pid()`，取不到就报错）> 脚本字面量；**禁止隐形状态**（「记住的 pid」只存在脚本头标记里） |
+| D49 | `open_file` buffer 与字节 | 默认 4096；`f:tell()` 是逻辑位置（client 位置 − 未消费 buffer）；`f:seek()` 是往返且清空 buffer；帧内字节一律精确（不再做 CRLF 归一） |
+| D50 | `--json` 契约 | `{"ok","exit","canceled","detached","pid","stdout","stderr","images","result"}`；`result` 暴露脚本返回值；`--out=<path>` 写同一份 JSON；legacy 变体一律 UTF-8 + `\uXXXX` |
