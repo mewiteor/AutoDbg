@@ -115,10 +115,96 @@ Then `:AutoDbgRun` (or `:'<,'>AutoDbgRun`). See [`nvim/README.md`](./nvim/README
 
 ### For AI agents (MCP)
 
+`--server` also exposes an **MCP** endpoint on the same port — point any MCP client at
+`http://127.0.0.1:8642/mcp`:
+
+```bat
+.out\AutoDbg_64.exe --server                         :: loopback, token-free (D21)
+.out\AutoDbg_64.exe --server --server-token=auto     :: prints a token in the banner
+.out\AutoDbg_64.exe --server --server-addr=0.0.0.0:8642 --server-token=auto   :: LAN, token mandatory
+```
+
+The transport is the **streamable HTTP** subset of MCP `2024-11-05`: `POST /mcp` carries one
+JSON-RPC message (or a batch), the session is expressed by the `Mcp-Session-Id` header (the
+server returns it on `initialize`, send it back afterwards), and `Accept: text/event-stream`
+is answered with a single `event: message` chunked frame. Methods: `initialize`, `ping`,
+`tools/list`, `tools/call`, notifications.
+
 ```bash
 curl -sS -X POST http://127.0.0.1:8642/mcp -H 'Content-Type: application/json' \
   -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05"}}'
 ```
+
+The 12 tools are `lua_eval` (one call = one Lua run), `lua_api` (binding cheat-sheet — tell the
+model to call it *first*), `dbg_status`, `gui_screenshot`, `gui_windows`, `gui_find`, `gui_click`,
+`gui_type`, `gui_press`, `gui_text`, `gui_set_text`, `gui_post`. Because `Run`/`Attach` block until
+the target exits or the script calls `Detach()`, the whole debugging scenario belongs **inside one
+`lua_eval`** (`Run{ callback = function() ... end }`), not in a sequence of interactive calls.
+
+#### MCP client configuration
+
+**Claude Code**
+
+```bash
+claude mcp add --transport http autodbg http://127.0.0.1:8642/mcp
+# non-loopback / explicit token:
+claude mcp add --transport http autodbg http://127.0.0.1:8642/mcp \
+       --header 'X-AutoDbg-Token: <token>'
+```
+
+**Cursor** (`~/.cursor/mcp.json`)
+
+```json
+{
+  "mcpServers": {
+    "autodbg": {
+      "url": "http://127.0.0.1:8642/mcp",
+      "headers": { "X-AutoDbg-Token": "<token>" }
+    }
+  }
+}
+```
+
+**VS Code** (`.vscode/mcp.json`; note the `servers` key and `"type": "http"`)
+
+```json
+{
+  "servers": {
+    "autodbg": {
+      "type": "http",
+      "url": "http://127.0.0.1:8642/mcp",
+      "headers": { "X-AutoDbg-Token": "<token>" }
+    }
+  }
+}
+```
+
+Drop `headers` on loopback (no token is required there). The server accepts both
+`X-AutoDbg-Token: <token>` and the standard `Authorization: Bearer <token>`, so clients that only
+allow an `Authorization` header work unchanged.
+
+**stdio-only clients** (Claude Desktop, older editor extensions) need a bridge such as
+[`mcp-remote`](https://www.npmjs.com/package/mcp-remote):
+
+```json
+{
+  "mcpServers": {
+    "autodbg": {
+      "command": "npx",
+      "args": ["-y", "mcp-remote", "http://127.0.0.1:8642/mcp"]
+    }
+  }
+}
+```
+
+**Any other MCP client** — URL `http://<host>:8642/mcp`, HTTP transport. Requirements: JSON-RPC over
+`POST`, echo the `Mcp-Session-Id` returned by `initialize`, `Content-Length` on every request
+(chunked request bodies are rejected with 501), body ≤ `--server-max-body` (8 MB default).
+
+Deliberately not implemented, so clients that probe for them should be configured without them:
+`GET /mcp` (persistent SSE stream → `405`), `DELETE /mcp` (explicit session teardown — idle sessions
+are swept after 30 min, at most 8 live), resources/prompts (unknown methods → `-32601`) and
+progress notifications.
 
 ---
 

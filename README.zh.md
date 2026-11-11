@@ -115,10 +115,92 @@ LUA
 
 ### 给 AI 代理（MCP）
 
+`--server` 还会在同一个端口上开户 **MCP** 端点——把任何 MCP 客户端指向 `http://127.0.0.1:8642/mcp`：
+
+```bat
+.out\AutoDbg_64.exe --server                         :: loopback，免 token（D21）
+.out\AutoDbg_64.exe --server --server-token=auto     :: 启动横幅里打印 token
+.out\AutoDbg_64.exe --server --server-addr=0.0.0.0:8642 --server-token=auto   :: 局域网：强制 token
+```
+
+传输是 MCP `2024-11-05` 的 **streamable HTTP** 子集：`POST /mcp` 携带一条（或一批）JSON-RPC 消息，
+会话用 `Mcp-Session-Id` 头表达（`initialize` 时由服务器返回，之后每次请求带上）；带
+`Accept: text/event-stream` 时回一个 chunked 的 `event: message` 单帧。方法：`initialize`、`ping`、
+`tools/list`、`tools/call`、通知。
+
 ```bash
 curl -sS -X POST http://127.0.0.1:8642/mcp -H 'Content-Type: application/json' \
   -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05"}}'
 ```
+
+12 个工具：`lua_eval`（一次调用 = 一次 Lua 执行）、`lua_api`（绑定速查，**让模型先调它**）、
+`dbg_status`、`gui_screenshot`、`gui_windows`、`gui_find`、`gui_click`、`gui_type`、`gui_press`、
+`gui_text`、`gui_set_text`、`gui_post`。因为 `Run`/`Attach` 会阻塞到目标退出或脚本 `Detach()`，
+整套调试场景要写在**一次 `lua_eval` 里**（`Run{ callback = function() ... end }`），而不是拆成
+多次交互式调用。
+
+#### MCP 客户端配置
+
+**Claude Code**
+
+```bash
+claude mcp add --transport http autodbg http://127.0.0.1:8642/mcp
+# 非 loopback / 显式 token：
+claude mcp add --transport http autodbg http://127.0.0.1:8642/mcp \
+       --header 'X-AutoDbg-Token: <token>'
+```
+
+**Cursor**（`~/.cursor/mcp.json`）
+
+```json
+{
+  "mcpServers": {
+    "autodbg": {
+      "url": "http://127.0.0.1:8642/mcp",
+      "headers": { "X-AutoDbg-Token": "<token>" }
+    }
+  }
+}
+```
+
+**VS Code**（`.vscode/mcp.json`；注意键是 `servers` 且要写 `"type": "http"`）
+
+```json
+{
+  "servers": {
+    "autodbg": {
+      "type": "http",
+      "url": "http://127.0.0.1:8642/mcp",
+      "headers": { "X-AutoDbg-Token": "<token>" }
+    }
+  }
+}
+```
+
+loopback 下把 `headers` 整段删掉即可（那里不校验 token）。服务器同时接受 `X-AutoDbg-Token: <token>`
+与标准的 `Authorization: Bearer <token>`，所以只支持 `Authorization` 头的客户端直接就能用。
+
+**只会 stdio 的客户端**（Claude Desktop、较旧的编辑器扩展）需要一个桥接，比如
+[`mcp-remote`](https://www.npmjs.com/package/mcp-remote)：
+
+```json
+{
+  "mcpServers": {
+    "autodbg": {
+      "command": "npx",
+      "args": ["-y", "mcp-remote", "http://127.0.0.1:8642/mcp"]
+    }
+  }
+}
+```
+
+**其它任意 MCP 客户端**——URL `http://<host>:8642/mcp`，HTTP 传输。要求：JSON-RPC 走 `POST`、
+把 `initialize` 返回的 `Mcp-Session-Id` 带回去、每个请求带 `Content-Length`（chunked 请求体
+返回 501）、body 不超 `--server-max-body`（默认 8 MB）。
+
+**有意不实现**的能力（客户端如果会探测，请按不支持配置）：`GET /mcp`（常驻 SSE 流 → `405`）、
+`DELETE /mcp`（显式关闭会话——空闲会话 30 min 回收，同时最多 8 个）、resources/prompts（未知
+方法 → `-32601`）、progress 通知。
 
 ---
 
