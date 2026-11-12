@@ -10,10 +10,14 @@
  * ❗例外（S0，server 模式）：`PrintExN` 顶部多一个 **输出 sink**（`set_output_sink`），
  *   装了 sink 且它返回「已消费」时直接返回、不写句柄（`plan_server.md` §5.3）。
  *   默认（未装 sink）行为与 P7 完全一致。
+ * ❗例外（T1 后续）：legacy 变体的 `LjGetMappedFileNameA` 从「只有 Toolhelp」改成三档回退
+ *   （Toolhelp + `TH32CS_SNAPMODULE32` → `psapi!GetMappedFileNameA` 动态解析 → 自己走目标的
+ *   PEB/Ldr 链表），并带 3 次重试；原因与顺序见该函数前的注释。
  * ========================================================================== */
 #include "util.hpp"
 
 #include "common/dynapi.hpp" /* get_proc_as：Win95 缺失的 user32 API 动态解析 */
+#include "common/handle.hpp"  /* unique_handle：PEB 回退路径里的 OpenProcess 用 RAII 收尾 */
 
 #include <intrin.h>
 #include <assert.h>
@@ -549,28 +553,237 @@ BOOL LjDebugSetProcessKillOnExit(BOOL KillOnExit) { return FALSE; }
 
 HWND LjGetConsoleWindow() { return NULL; }
 
-DWORD LjGetMappedFileNameA(DWORD dwPid, LPVOID lpv, LPSTR lpFilename, DWORD nSize)
+/* =============================================================================
+ * GetMappedFileNameA 的三档代替品（仅 legacy / ANSI 变体；modern 直接用 psapi 的 W 版）
+ *
+ * 为什么要有它：Win95/98 没有 psapi.dll（`tools/api_check/datas.bin` 的 w95/w98 表里
+ *   没有 psapi 条目），所以 `GetMappedFileNameA` 不能静态导入。旧实现只有 Toolhelp 一条路，
+ *   而它对「刚 CreateProcess 出来、还没开始跑」的目标会返回 `ERROR_PARTIAL_COPY`(299)
+ *   （实测 Win11 + `--variant=legacy`：CREATE_PROCESS 拿不到映像路径 → `calc_crc32` 拿着
+ *   空路径 CreateFile("") 失败 → 回调里的 `Detach()` 不被执行 → `Run()` 等于白跑）。
+ *
+ * 现在的顺序（三条都在同一个重试循环里，见 `LjGetMappedFileNameA`）：
+ *   ① Toolhelp（Win95+ 都有、9x 上唯一可用的路）—— 带 `TH32CS_SNAPMODULE32`，否则 32 位
+ *      宿主枚举 WOW64 目标会直接 299；
+ *   ② `psapi.dll!GetMappedFileNameA`（动态解析：Win95 没有这个 DLL → 正常降级）；
+ *   ③ 自己走目标的 PEB → Ldr → InLoadOrderModuleList（只依赖 `ReadProcessMemory` + 动态的
+ *      `NtQueryInformationProcess`，**不新增任何导入**，也不怕 299）。
+ * ========================================================================== */
+namespace
 {
-    HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, dwPid);
-    if (hSnap == INVALID_HANDLE_VALUE)
-    {
-        E("CreateToolhelp32Snapshot(%lu)", dwPid);
+/* 读目标内存：整块成功才算成功（ReadProcessMemory 可能部分成功，不能信返回值） */
+bool rpm(HANDLE hProcess, size_t addr, void *buf, size_t n)
+{
+    SIZE_T got = 0;
+    return ReadProcessMemory(hProcess, (LPCVOID)addr, buf, n, &got) != FALSE && got == n;
+}
+bool rpm_ptr(HANDLE hProcess, size_t addr, size_t *out)
+{
+    ULONG_PTR v = 0;
+    if (!rpm(hProcess, addr, &v, sizeof v))
+        return false;
+    *out = (size_t)v;
+    return true;
+}
+
+/* UNICODE_STRING（x86：Length u16 @+0、MaximumLength u16 @+2、Buffer @+4）→ ANSI 路径。
+ * 返回写入的字符数（不含 NUL）；拿不到就是 0。 */
+DWORD rpm_unicode_string(HANDLE hProcess, size_t addr, LPSTR lpFilename, DWORD nSize)
+{
+    unsigned short len   = 0;
+    size_t         buf   = 0;
+    WCHAR          w[513];
+
+    if (nSize < 2 || !rpm(hProcess, addr, &len, sizeof len) || !rpm_ptr(hProcess, addr + 4, &buf))
         return 0;
-    }
-    MODULEENTRY32 me = {sizeof(me)};
+    if (len == 0 || buf == 0 || len > 1024)   /* 正常的映像路径远小于 512 个宽字符 */
+        return 0;
+    if (!rpm(hProcess, buf, w, len))
+        return 0;
+    w[len / 2] = L'\0';
+
+    int n = WideCharToMultiByte(CP_ACP, 0, w, len / 2, lpFilename, (int)nSize - 1, NULL, NULL);
+    if (n <= 0)
+        return 0;
+    lpFilename[n] = '\0';
+    return (DWORD)n;
+}
+
+/* ① Toolhelp（原有实现 + `TH32CS_SNAPMODULE32` + 范围命中） */
+DWORD mapped_name_from_toolhelp(DWORD dwPid, LPVOID lpv, LPSTR lpFilename, DWORD nSize)
+{
+    HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, dwPid);
+    if (hSnap == INVALID_HANDLE_VALUE)
+        return 0;
+
+    size_t       want         = (size_t)lpv;
+    DWORD        fallback_len = 0;
+    MODULEENTRY32 me          = {sizeof(me)};
     if (Module32First(hSnap, &me))
     {
         do
         {
-            if (me.modBaseAddr == (BYTE *)lpv)
+            size_t mod_base = (size_t)me.modBaseAddr;
+            if (mod_base == want)
             {
                 StringCchCopyA(lpFilename, nSize, me.szExePath);
+                fallback_len = (DWORD)strlen(lpFilename);
                 break;
+            }
+            /* `GetMappedFileName` 的语义是「包含该地址的文件」→ 记下第一个范围命中的候选 */
+            if (fallback_len == 0 && want > mod_base && want < mod_base + me.modBaseSize)
+            {
+                StringCchCopyA(lpFilename, nSize, me.szExePath);
+                fallback_len = (DWORD)strlen(lpFilename);
             }
         } while (Module32Next(hSnap, &me));
     }
     CloseHandle(hSnap);
-    return strlen(lpFilename);
+    return fallback_len;
+}
+
+/* ② psapi!GetMappedFileNameA（非 XP+ 静态导入：走动态层；Win95 上解析失败 = 正常降级） */
+DWORD mapped_name_from_psapi(DWORD dwPid, LPVOID lpv, LPSTR lpFilename, DWORD nSize)
+{
+    typedef DWORD(WINAPI * get_mapped_file_name_a_t)(HANDLE, LPVOID, LPSTR, DWORD);
+    get_mapped_file_name_a_t fn =
+        autodbg::common::get_proc_as<get_mapped_file_name_a_t>("psapi.dll", "GetMappedFileNameA");
+    if (fn == nullptr)
+        return 0;
+
+    HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, dwPid);
+    if (hProcess == nullptr)
+        hProcess = OpenProcess(PROCESS_VM_READ, FALSE, dwPid);   /* 9x 不认 QUERY_INFORMATION */
+    if (hProcess == nullptr)
+        return 0;
+
+    DWORD n = fn(hProcess, lpv, lpFilename, nSize);
+    CloseHandle(hProcess);
+    return n;
+}
+
+/* ③ PEB → Ldr → InLoadOrderModuleList（x86 偏移；legacy 只有 x86） */
+DWORD mapped_name_from_peb(DWORD dwPid, LPVOID lpv, LPSTR lpFilename, DWORD nSize)
+{
+#if defined(_WIN64)
+    (void)dwPid;
+    (void)lpv;
+    (void)lpFilename;
+    (void)nSize;
+    return 0;   /* 偏移是 x86 的；x64 没有 legacy 变体，这个 shim 不会被编译到那边 */
+#else
+    /* PEB / PEB_LDR_DATA / LDR_DATA_TABLE_ENTRY 的 x86 偏移（只用到的几个字段） */
+    const size_t kPebLdr              = 0x0C; /* PEB->Ldr */
+    const size_t kLdrInLoadOrder      = 0x0C; /* PEB_LDR_DATA->InLoadOrderModuleList */
+    const size_t kEntryDllBase        = 0x18; /* LDR_DATA_TABLE_ENTRY->DllBase */
+    const size_t kEntrySizeOfImage    = 0x20; /* ->SizeOfImage */
+    const size_t kEntryFullDllName    = 0x24; /* ->FullDllName（UNICODE_STRING） */
+    const size_t kEntryBaseDllName    = 0x2C; /* ->BaseDllName（同上，老系统上更可靠） */
+    const size_t kMaxListWalk         = 512;  /* 防御：链表被写坏时不至于死循环 */
+
+    typedef LONG(NTAPI * nt_query_information_process_t)(HANDLE, ULONG, PVOID, ULONG, PULONG);
+    nt_query_information_process_t pNt =
+        autodbg::common::get_proc_as<nt_query_information_process_t>("ntdll.dll", "NtQueryInformationProcess");
+    if (pNt == nullptr || lpv == nullptr || nSize < 2)
+        return 0;
+
+    /* 9x 不认 `PROCESS_QUERY_INFORMATION` → 取不到就降级成只要 `PROCESS_VM_READ`。
+     * `unique_handle` 负责收尾（早退分支不需要逐个 CloseHandle）。 */
+    common::unique_handle process(OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, dwPid));
+    if (!process)
+        process.reset(OpenProcess(PROCESS_VM_READ, FALSE, dwPid));
+    if (!process)
+        return 0;
+    HANDLE hProcess = process.get();
+
+    /* ProcessBasicInformation：长度必须与 NT 期望的一致，否则返回 STATUS_INFO_LENGTH_MISMATCH */
+    struct process_basic_information
+    {
+        LONG      exit_status;
+        ULONG_PTR peb_base;
+        ULONG_PTR affinity_mask;
+        LONG      base_priority;
+        ULONG_PTR reserved[2];   /* UniqueProcessId / InheritedFromUniqueProcessId */
+    } pbi = {};
+
+    ULONG len = 0;
+    if (pNt(hProcess, 0 /* ProcessBasicInformation */, &pbi, sizeof pbi, &len) < 0 || pbi.peb_base == 0)
+        return 0;
+
+    size_t ldr = 0;
+    if (!rpm_ptr(hProcess, (size_t)pbi.peb_base + kPebLdr, &ldr) || ldr == 0)
+        return 0;
+
+    size_t head = ldr + kLdrInLoadOrder;   /* 「表头」= 链表的哨兵节点 */
+    size_t cur  = 0;
+    if (!rpm_ptr(hProcess, head, &cur))
+        return 0;
+
+    size_t want      = (size_t)lpv;
+    size_t range_hit = 0;   /* 地址落在模块内部时（GetMappedFileName 的语义）的候选 */
+    DWORD  found     = 0;
+
+    for (size_t i = 0; cur != 0 && cur != head && i < kMaxListWalk; i++)
+    {
+        size_t dll_base = 0;
+        size_t size_of  = 0;
+        if (!rpm_ptr(hProcess, cur + kEntryDllBase, &dll_base) || !rpm_ptr(hProcess, cur + kEntrySizeOfImage, &size_of))
+            break;
+
+        if (dll_base == want)
+        {
+            found = rpm_unicode_string(hProcess, cur + kEntryFullDllName, lpFilename, nSize);
+            if (found == 0)   /* 部分条目的 FullDllName 为空 → 退 BaseDllName */
+                found = rpm_unicode_string(hProcess, cur + kEntryBaseDllName, lpFilename, nSize);
+            if (found != 0)
+                break;
+        }
+        if (range_hit == 0 && want > dll_base && want < dll_base + size_of)
+            range_hit = cur;
+
+        if (!rpm_ptr(hProcess, cur, &cur))   /* InLoadOrderLinks.Flink */
+            break;
+    }
+
+    /* 精确命中没拿到（名字为空）时，用范围命中的那一个 */
+    if (found == 0 && range_hit != 0)
+    {
+        found = rpm_unicode_string(hProcess, range_hit + kEntryFullDllName, lpFilename, nSize);
+        if (found == 0)
+            found = rpm_unicode_string(hProcess, range_hit + kEntryBaseDllName, lpFilename, nSize);
+    }
+    return found;
+#endif
+}
+} /* namespace */
+
+DWORD LjGetMappedFileNameA(DWORD dwPid, LPVOID lpv, LPSTR lpFilename, DWORD nSize)
+{
+    if (lpFilename == nullptr || nSize == 0)
+        return 0;
+    lpFilename[0] = '\0';   /* 旧实现在「没命中」时会把栈垃圾交给调用方，这里至少给空串 */
+
+    /* 三次机会：`CREATE_PROCESS` 到的瞬间目标还卡在「加载器刚初始化」的状态，Toolhelp 快照
+     * 可能返回 ERROR_PARTIAL_COPY(299)；Toolhelp 失败不等于是目标没有模块，所以每次把
+     * 三条路都试一遍（顺序 = 老系统可用性），三次都拿不到才认输。 */
+    for (int attempt = 0; attempt < 3; attempt++)
+    {
+        if (attempt != 0)
+            Sleep(1);   /* 只让出时间片，不改变语义 */
+
+        DWORD n = mapped_name_from_toolhelp(dwPid, lpv, lpFilename, nSize);
+        if (n != 0)
+            return n;
+        n = mapped_name_from_psapi(dwPid, lpv, lpFilename, nSize);
+        if (n != 0)
+            return n;
+        n = mapped_name_from_peb(dwPid, lpv, lpFilename, nSize);
+        if (n != 0)
+            return n;
+    }
+
+    E("LjGetMappedFileNameA(%lu, 0x%zX)", dwPid, (size_t)lpv);
+    return 0;
 }
 #endif
 }
