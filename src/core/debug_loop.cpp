@@ -533,7 +533,14 @@ int DebuggerSession::run(const core::RunParams *params, const core::DebugCallbac
                 info->base          = (size_t)DBGEvent.u.CreateProcessInfo.lpBaseOfImage;
                 info->start_address = (size_t)DBGEvent.u.CreateProcessInfo.lpStartAddress;
                 info->name_offset   = PathFindFileName(translated_name) - translated_name;
+                /* ❗按 TCHAR 的**宽**度拷：legacy（ANSI）变体里 TCHAR 是 1 字节，用 `__movsw`
+                 * 会按 2 字节一个单元拷 `image_name_len` 个 → 越界写掉半个缓冲（分配只有
+                 * `image_name_len * sizeof(TCHAR)` 字节）→ 堆损坏，表现为随机 AV。 */
+#ifdef _UNICODE
                 __movsw((LPWORD)info->Path, (const WORD *)translated_name, image_name_len);
+#else
+                __movsb((PBYTE)info->Path, (const BYTE *)translated_name, image_name_len);
+#endif
                 info->Path[image_name_len] = 0;
                 if (!calc_crc32(info->Path, &info->crc32))
                     cont() = false;
@@ -633,7 +640,13 @@ int DebuggerSession::run(const core::RunParams *params, const core::DebugCallbac
                 info         = peinfos().create_front(image_name_len * sizeof(TCHAR));
                 info->base        = (size_t)DBGEvent.u.LoadDll.lpBaseOfDll;
                 info->name_offset = PathFindFileName(translated_name) - translated_name;
+                /* ❗同 CREATE_PROCESS 那处：legacy（ANSI）的 TCHAR 是 1 字节，`__movsw` 会
+                 * 按 2 字节拷 → 溢出分配的 `image_name_len` 字节 → 堆损坏（随机 AV）。 */
+#ifdef _UNICODE
                 __movsw((LPWORD)info->Path, (const WORD *)translated_name, image_name_len);
+#else
+                __movsb((PBYTE)info->Path, (const BYTE *)translated_name, image_name_len);
+#endif
                 info->Path[image_name_len] = 0;
                 if (!calc_crc32(info->Path, &info->crc32))
                     cont() = false;

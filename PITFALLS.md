@@ -40,6 +40,7 @@
 | K9 | `1.0/0.0` 编译报 `C2124` | MSVC 把它当编译期错误 | 测试里用 `volatile double zero` 挡住常量折叠 |
 | K10 | `GetVersionExA` 报 `C4996` | 该 API 被标记废弃 | 用 `#pragma warning(push/disable/pop)` 局部包住（本项目确实需要它区分 9x） |
 | K11 | `GetProcAddress` 取到的 Win32 API 一调就 `0xC0000005`（**只在 x86**，x64 正常） | 函数指针 typedef 没写 `WINAPI`（x86 上 Win32 导出是 **stdcall**）或**参数个数与真实 API 不一致** → 栈不平衡 | typedef 一律写成 `unsigned long (WINAPI *)(真实参数表)`，参数个数与 SDK 原型**逐个一致**（不能“多传一个没用到的”）；x64 只有一种调用约定，测不出来 |
+| K12 | legacy（ANSI）变体 `Run()` 随机 `0xC0000005`（同一脚本有时能跑完，**只在 `--variant=legacy` 上出现**，modern/x64 正常） | 拷 TCHAR 路径用了 `__movsw`（`CopyMem2` 的语义）：它按 **2 字节** 一个单元拷，而 ANSI 构建的 `TCHAR` 是 1 字节，分配只有 `len * sizeof(TCHAR)` 字节 → 每拷一次就溢出半个缓冲，堆被写坏 | 按 `sizeof(TCHAR)` 选搬运指令：`#ifdef _UNICODE` → `__movsw(…, len)`，否则 `__movsb(…, len)`（`debug_loop.cpp` 的 CREATE_PROCESS / LOAD_DLL 两处）。这类 bug 在「长度恒为 0」的旧路径上不会发作，一旦上游开始返回真名字就立刻显形 |
 
 ## L. Lua / LuaJIT / lualib 烘焙
 
