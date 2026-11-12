@@ -102,6 +102,7 @@ if not exist %BUILDDIR%\pever mkdir %BUILDDIR%\pever
 if not exist %BUILDDIR%\launcher mkdir %BUILDDIR%\launcher
 if not exist %BUILDDIR%\gen mkdir %BUILDDIR%\gen
 if not exist %BUILDDIR%\src\sys\lzma mkdir %BUILDDIR%\src\sys\lzma
+if not exist %BUILDDIR%\tests\fixtures\bin mkdir %BUILDDIR%\tests\fixtures\bin
 
 if %ARCH% == 64 (
     set SUBSYS_VER=
@@ -532,12 +533,14 @@ if "%ARCH%" == "86" (
 )
 :: 交付物只有一个 exe：启动器 + 载荷（64 装 2 个模块，86 装 4 个模块，D14 单流）
 call :buildlauncher %ARCH% || exit /b 1
+if "x%ARCH%" == "x86" call :buildfixture || exit /b 1
 
 :: default 只列交付物 + 自举 host；旧的 AutoDbg_<flavor>_<arch>.exe 已退役（D8）
 set DEFS=
 set DEFS=%DEFS% %INSTALLROOT::=$:%\lua_%ARCH%.exe
 set DEFS=%DEFS% %INSTALLROOT::=$:%\luajit_%ARCH%.exe
 set DEFS=%DEFS% %INSTALLROOT::=$:%\AutoDbg_%ARCH%.exe
+if "x%ARCH%" == "x86" set DEFS=%DEFS% %INSTALLROOT::=$:%\fixtures\x86_loop.exe
 >>%BUILDDIR%\build.ninja echo default %DEFS%
 >>%BUILDDIR%\build.ninja echo.
 
@@ -772,6 +775,26 @@ for /F "delims=" %%i in ('"C:\Program Files (x86)\Microsoft Visual Studio\Instal
     call "%%i\VC\Auxiliary\Build\vcvarsall.bat" %1 && exit /b
 )
 exit /b 1
+
+:: buildfixture
+::   usage: call :buildfixture   (only called for arch 86, T7.2)
+::   defines: ARCH, ROOT, BUILDDIR, INSTALLROOT, LINK_DEPS
+::   x86 debug-target fixture from tests\fixtures\bin\x86_loop.c (plan_t7.md T7.2). Not a
+::     deliverable: it goes into DEFS only (10.8), so :usage text is not rewritten.
+::     Import table must pass the w95 flavour (scan_dir.py picks w95 under .out/fixtures/)
+::     => no NT-only call in the source. x86 product => patched to 4.0 by pever (D12).
+:buildfixture
+if not "x%ARCH%" == "x86" exit /b 0
+
+>>%BUILDDIR%\build.ninja echo build tests\fixtures\bin\x86_loop.obj: cc %ROOT::=$:%tests\fixtures\bin\x86_loop.c
+>>%BUILDDIR%\build.ninja echo.
+>>%BUILDDIR%\build.ninja echo build %BUILDDIR::=$:%\pever\x86_loop.exe: ld tests\fixtures\bin\x86_loop.obj src\sys\main.obj src\sys\msvcrt.lib %LINK_DEPS% ^| t
+>>%BUILDDIR%\build.ninja echo   syslib = kernel32.lib
+>>%BUILDDIR%\build.ninja echo.
+>>%BUILDDIR%\build.ninja echo build %INSTALLROOT::=$:%\fixtures\x86_loop.exe: pever %BUILDDIR::=$:%\pever\x86_loop.exe ^| %BUILDDIR::=$:%\tools\pever.exe
+>>%BUILDDIR%\build.ninja echo   pevertool = %BUILDDIR%\tools\pever.exe
+>>%BUILDDIR%\build.ninja echo.
+exit /b
 
 :usage
 echo %0 [option]

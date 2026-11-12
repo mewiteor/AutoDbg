@@ -7,11 +7,13 @@ auto 口径（与交付面一致，见 AGENTS.md §11.1 / §11.4）：
     - x64（machine 0x8664）        → w7
     - 名字含 `Legacy`（x86 老系统变体）→ w95   （Win95 = 最老的交付目标）
     - 启动器 `AutoDbg_<arch>.exe`  → w95   （它要在 9x 上跑起来才能选 legacy）
+    - `.out/fixtures/` 下的产物（被调试目标 fixture，T7.2）→ w95   （fixture 里禁止 NT-only 调用）
     - 其余 x86（modern 变体 / 构建期 host）→ wxp
 
 用法：
     uv --directory tools/api_check run scan_dir.py [目录] [--os w95|w98|w982|wxp|w7]
     # 目录缺省为 ../../.out；--os 强制单一目标系统（诊断用）
+    # 递归扫子目录（fixture 落在 .out/fixtures/ 下）；只看 .exe / .dll
 
 退出码：0 = 全部通过；1 = 有不可用导入；2 = 用法/路径错误。
 
@@ -31,6 +33,7 @@ SUPPORTED_OS = ('w95', 'w98', 'w982', 'wxp', 'w7')
 
 IMAGE_FILE_MACHINE_I386 = 0x14C
 IMAGE_FILE_MACHINE_AMD64 = 0x8664
+FIXTURE_DIRNAME = 'fixtures'
 
 
 def load_datas():
@@ -43,6 +46,9 @@ def pick_target_os(path, machine):
     name = os.path.basename(path)
     if machine == IMAGE_FILE_MACHINE_AMD64:
         return 'w7'
+    # fixture（被调试目标）要在最老的交付目标上跑 ⇒ w95：fixture 源码里禁止任何 XP+ 才有的调用
+    if os.path.basename(os.path.dirname(path)).lower() == FIXTURE_DIRNAME:
+        return 'w95'
     # 老系统变体与启动器都要能在 Win95 上跑；modern 变体（含构建期 host）只需 XP+
     if name.startswith('AutoDbgLegacy_') or name in ('AutoDbg_86.exe', 'AutoDbg_64.exe'):
         return 'w95'
@@ -104,9 +110,13 @@ def main():
         return 2
 
     datas = load_datas()
+    # 递归：fixture 落在 .out/fixtures/ 下，只看一层目录就不会被计数（门禁口径 12 → 13）。
+    # 只看 .exe / .dll：`.bin` 不会被扫（`.bin` 要不要扫属于 plan_bootloader.md 的
+    # 遗留项），本片不改这条。
     files = sorted(
-        os.path.join(target_dir, n)
-        for n in os.listdir(target_dir)
+        os.path.join(root, n)
+        for root, _, names in os.walk(target_dir)
+        for n in names
         if n.lower().endswith(('.exe', '.dll'))
     )
 
