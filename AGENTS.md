@@ -82,7 +82,7 @@ make.bat i <dir>         :: 指定输出目录（默认 .out）
 ```
 
 - 无脚本参数时弹文件对话框（启动器里的 `GetOpenFileNameW`，9x 降级 A 版）选脚本。
-- 选项（启动器层）：`-h` / `--help`（打 usage 后退出 0）、`--version`（版本/ABI/架构后退出 0；版本串来自构建期的 `git describe`，见 §1）、`--flavor=lua|luajit`（默认 lua 5.5）、`--variant=modern|legacy`（仅排障；正常靠平台探测 + 映射失败回退）、`--list`（列出载荷里的模块）、`--module-dir=<dir>`（调试：从磁盘取同名 DLL，仍走内存映射）、`--quiet`（关错误弹窗）、`--selftest`（跑纯函数自测）、`--json` / `--out=<path>`（机器可读结果信封，§12.6；两者互斥于 `--server`，同时给 → 启动器报错、退出码 2）、`--server[=http]` 及其 `--server-*` 子选项（§12）。
+- 选项（启动器层）：`-h` / `--help`（打 usage 后退出 0）、`--version`（版本/ABI/架构后退出 0；版本串来自构建期的 `git describe`，见 §1）、`--flavor=lua|luajit`（默认 lua 5.5）、`--variant=modern|legacy`（仅排障；正常靠平台探测 + 映射失败回退）、`--list`（列出载荷里的模块）、`--module-dir=<dir>`（调试：从磁盘取同名 DLL，仍走内存映射）、`--quiet`（关错误弹窗）、`--selftest`（跑纯函数自测）、`--json` / `--out=<path>`（机器可读结果信封，§12.6；两者互斥于 `--server`，同时给 → 启动器报错、退出码 2）、`--server[=http|tcp]` 及其 `--server-*` 子选项（§12.1）、**客户端（T3/D42）**：`--remote=<host:port>`、`--remote-token=<hex>`、`--pid=<n>`、`--read-timeout=<ms>`、`--max-frame=<bytes>`、`--cancel` / `--kill` / `--detach` / `--health`（这四条离开 `--remote` → 启动器报错、退出码 2；带 `--remote` 时 `--version` 变成「查 server 版本」）。
   启动器的输出一律 **ASCII**（它走 `WriteFile` 写字节，中文在 CP936 控制台上会乱码；模块那边走 `WriteConsoleW` 才例外）。
 - **脚本首行标记**也能选 flavor：`--!lua` / `--!luajit`（优先级：命令行 > 首行标记 > 字节码 magic > 默认 lua）。
   其它 `--!xxx` 一律报错退出（D9）；例外：`--!autodbg` / `--!adbg` 是**编辑器侧标记**
@@ -100,7 +100,7 @@ make.bat i <dir>         :: 指定输出目录（默认 .out）
 | 导入表门禁 | `uv --directory tools/api_check run scan_dir.py` | 扫 `.out` 下全部产物，按产物自动选口径（`AutoDbgLegacy_*` 与启动器 → `w95`、其余 x86 → `wxp`、x64 → `w7`），有目标系统不可用的导入就打印并返回 1。单文件用法：`uv --directory tools/api_check run main.py <exe\|dll> <w95\|w98\|w982\|wxp>`（x64 免第二个参数） |
 | 纯函数自测 | `.out\AutoDbg_<arch>.exe --selftest` | 覆盖 `http` / `json_writer` / `base64` / `png_writer` / `dbl2str` / **帧编解码** 等纯计算层（基线 70 → T1/D50 转义口径 +11 = 81 → **T2 帧编解码 +20 = 101**）；`feat/cli-tcp` 上 `http` / `base64` 段随 D41 / D44 删除，要补 `decide_console_action` 的断言 |
 | server 端到端 | `pwsh tools/server_test/e2e.ps1 -Render <64\|86> [-Variant legacy]`，另有 `e2e_gui.ps1` / `e2e_mcp.ps1` / `e2e_io.ps1` / `nvim_smoke.ps1` | 起 server → 断言 → 停；不需要 VM，也不改产品行为。`feat/cli-tcp`（D41）上 `e2e_mcp.ps1` 删除 |
-| raw TCP 帧（T2/D42） | `pwsh tools/server_test/e2e_tcp.ps1 -Render <64\|86> [-Variant legacy]` | `--server=tcp`：握手帧（`id` = 协议版本、`data` = token）→ `info`；版本不符 / 首帧非握手 / 错 token 的 `error` 帧；`script` → `out`+`result`+`end`（含语法错误透传 `exit`）；`control` 的 health / version / cancel / 未知 / shutdown；**执行期的 control**（Lua 死循环里的 cancel、引擎空转时的 cancel / kill / detach）—— 26 条断言，legacy 同样必须真过 |
+| raw TCP 帧（T2/T3/D42） | `pwsh tools/server_test/e2e_tcp.ps1 -Render <64\|86> [-Variant legacy]` | `--server=tcp`：握手帧（`id` = 协议版本、`data` = token）→ `info`；版本不符 / 首帧非握手 / 错 token 的 `error` 帧；`script` → `out`+`result`+`end`（含语法错误透传 `exit`）；`control` 的 health / version / cancel / 未知 / shutdown；**执行期的 control**（Lua 死循环 + 引擎空转）；**`--remote` 客户端**（跑脚本 / `--json` 信封 / 语法错误 / health / version / **另一个进程的 `--cancel`**）。35 条断言，legacy 同样必须真过 |
 | JSON 信封（T1/D50） | `pwsh tools/server_test/e2e_json.ps1 -Render <64\|86> [-Variant legacy]` | 本地模式 `--json` / `--out=<path>`：那一行 JSON 独占 stdout、字段齐全、`result` / `pid` / `detached` / `images` 口径、`--json` 与 `--server` 互斥（退出码 2）、退出码口径不变；那一行必须**纯 ASCII**（CP936 → UTF-8 或逐字节降级）。`-Variant legacy` **必须真过**（这段就是用来暴露 GBK 的） |
 | Win9x 实机 | `pwsh tools/w9x_test/w9x.ps1 -Action check\|run\|record` | 需要 VMware 的 Win98 guest 与凭据（`tools/w9x_test/config.local.ps1`，已 gitignore）；**没有 VM / 凭据时 SKIP（exit 0）**。矩阵与剩余项见 `plan_p7_win9x.md` |
 
@@ -341,7 +341,8 @@ payload              // 单条 LZMA 流：各模块原始字节按 entry 顺序�
 - `script_a` / `script_w`：启动器已选定的脚本（UNICODE 模块只看 `script_w`，所以启动器两份都填）。
 - `flavor` / `variant`：仅供诊断（模块内容已由载荷决定）。
 - `selftest` / `server_mode` / `server_*`：S0 追加的字段（D27），ABI 版本因此到 **2**。
-- `json_mode` / `json_out`：T1（D50）追加的字段（`--json` / `--out=<path>`），ABI 版本因此到 **3**；T3 的 `remote_*` / `pid` / `read_timeout` / `max_frame` 顺延到 **4**（`plan_cli.md` §4）。
+- `json_mode` / `json_out`：T1（D50）追加的字段（`--json` / `--out=<path>`），ABI 版本因此到 **3**。
+- `remote_host` / `remote_port` / `remote_cmd` / `pid` / `read_timeout_ms` / `max_frame`：T3（D42）追加的字段（`--remote` / `--pid` / `--read-timeout` / `--max-frame`），ABI 版本因此到 **4**。
 
 改这个结构或导出名 = 改 ABI，必须同步 `AUTODBG_ABI_VERSION` 并重跑全部运行路径。
 

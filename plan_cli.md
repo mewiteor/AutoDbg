@@ -215,6 +215,14 @@ D43 说「每次调用无状态」，所以**不能有隐形状态**：「记住
    ❗还没做的：`read_req` / `read_resp`（回调里阻塞读）属于 T4；握手 json 里的 `pid` / `filename` /
    `read_timeout` / `max_frame` 尚未消费（客户端字段齐全后才用得上）。
 3. **T3 `--remote`**（一次 ABI 变更把 `remote_*` / `pid` / `read_timeout` / `max_frame` 一起加进去，不要分两次；ABI **3 → 4**，因为 T1 已经用 3）。
+   ✅ **已完成**：`boot` 加 6 个字段（ABI 4）；launcher 解析 `--remote[=host:port]` / `--remote-token=` /
+   `--pid=` / `--read-timeout=` / `--max-frame=` / `--cancel|--kill|--detach|--health`（带 `--remote` 时
+   `--version` = 查 server 版本）；模块新增 `client.cpp`（握手 → `script`/`control` → `result` 帧的
+   `id` 当退出码，D28 不解 JSON）；服务端改成 **accept 线程 + worker**：控制连接在执行期间也接得住
+   （所以 `AutoDbg --remote h:p --cancel` 能从**另一个进程**打断正在跑的脚本），一个执行连接可发多段 `script`。
+   门禁 `e2e_tcp.ps1` 26 → 35 条。
+   ❗尚未做：握手 json 里的 `pid` / `filename` / `read_timeout` / `max_frame` 还没被服务端消费（`--pid` 也还没
+   影响 Attach）；`read_req`/`read_resp` 属 T4。
 4. **T4 `open_file():read` 的阻塞语义** + buffer + stale 帧 + `cancel_notify` + `gui.pick()`；跑通「回调里阻塞读 → 超时返回 `nil,"timeout"` → 断点继续」。
 5. **T5 删除**：`http.*` / `mcp.lua` / `effects.lua` / base64 / 协程执行器 / 会话表 / `yield_blocker` / nvim 的 `http.lua` + chunked 半边。**必须排在 T2/T4 之后**，否则 `open_file` 在回调里写/读的能力会先失去。
 6. **T6 agent 文档**：`tools/agent/autodbg-skill/SKILL.md`（Agent Skills 格式）+ 三五个 recipe。在 CLI 口径下这份 markdown 是**唯一契约文档**，不是锦上添花 —— `autodbg_api.lua` 的内容搬过去，否则模型只能靠训练数据猜参数形状（就是 S12 复发）。

@@ -54,6 +54,11 @@ long long net_listen(const char *host, unsigned port, unsigned *actual_port, net
 /* accept：`timeout_ms < 0` 阻塞等待。返回 socket；-1 = 错误；0 表示「没连进来」（超时） */
 long long net_accept(long long listener, int timeout_ms, unsigned *peer_ip);
 
+/* 连接（T3：客户端模式，D42）。成功返回 socket（>= 0）；-1 = 失败并填 `*why`。
+ * ❗用**阻塞 connect**（Winsock 1.1 的常规做法）：不可达地址由系统决定超时，本层不另加超时；
+ *   对已知的 server 或「拒绝连接的本地端口」它立即返回。 */
+long long net_connect(const char *host, unsigned port, net_status *why);
+
 /* 关闭 socket（`< 0` 时什么也不做） */
 void net_close(long long sock);
 

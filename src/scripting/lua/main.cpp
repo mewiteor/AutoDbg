@@ -26,6 +26,7 @@
 #include "core/core.hpp" /* DebuggerSession + set_current_session */
 #include "core/util.hpp" /* E / ErrorS / Error / ErrorN / macro helpers */
 #include "state.hpp"     /* run_script_file / g_wfilepath */
+#include "client.hpp"    /* T3（D42）：`--remote` 客户端模式 */
 #include "server.hpp"    /* S0：server 模式入口（plan_server.md §3.1 / D27） */
 #include "output.hpp"    /* T1（D50）：stdout/stderr 分桶 + `images` 登记表 */
 #include "exec_guard.hpp" /* T1（D50）：`canceled`（guard_stop_reason）与 `detached`（guard_detached） */
@@ -498,6 +499,12 @@ extern "C" __declspec(dllexport) int __cdecl autodbg_run(const autodbg_boot *boo
         }
     }
 #endif
+
+    /* ---- T3（D42）：客户端模式：不跑本地脚本，连 server 把脚本/控制命令发过去。
+     * ❗必须在**装输出收集器之前**分派：客户端的 stdout/stderr 是它自己控制的
+     *   （非 JSON 时直通、JSON 时自己组一行信封），收集器那是给本地脚本用的。 */
+    if (boot->remote_host != nullptr)
+        return autodbg::host::client_main(boot);
 
     /* ---- T1（D50）：JSON 模式 —— 在跑脚本**之前**装收集器（不 echo）：
      *      `print` / `Error*` / `log_msg` 都只进缓冲，stdout 才能被那一行 JSON 独占；

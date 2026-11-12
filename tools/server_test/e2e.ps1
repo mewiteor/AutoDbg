@@ -215,7 +215,7 @@ try
 
     $verOut = & $Exe --version 2>&1 | Out-String
     Check 'cli.version.exit' ($LASTEXITCODE -eq 0) "exit=$LASTEXITCODE"
-    Check 'cli.version.format' ($verOut -match '^AutoDbg \S+ \(.*abi 3, (x64|x86)\)') "out=$($verOut.Trim())"
+    Check 'cli.version.format' ($verOut -match '^AutoDbg \S+ \(.*abi 4, (x64|x86)\)') "out=$($verOut.Trim())"
     # 版本串应该是 tag 或 commit 短哈希（没有 tag 时就是 7 位以上的十六进制）
     Check 'cli.version.identity' ($verOut -match '^AutoDbg ([0-9a-f]{7,40}|v?\d[^ ]*)(-dirty)? ') "out=$($verOut.Trim())"
 
@@ -234,7 +234,7 @@ try
     Check 'health.ok' ($hj.ok -eq $true) "body=$($h.Content)"
 
     $v = Json (Invoke-WebRequest -Uri "http://127.0.0.1:$Port/version" -SkipHttpErrorCheck)
-    Check 'version.abi' ($v.abi -eq 3) "abi=$($v.abi)"
+    Check 'version.abi' ($v.abi -eq 4) "abi=$($v.abi)"
     Check 'version.arch' ($v.arch -eq $(if ($Render -eq '64') { 'x64' } else { 'x86' })) "arch=$($v.arch)"
     if ($Variant) { Check 'version.variant' ($v.variant -eq $Variant) "variant=$($v.variant)" }
     Check 'version.winsock' ($v.winsock -eq 'ws2_32.dll') "winsock=$($v.winsock)"

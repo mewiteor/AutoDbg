@@ -46,10 +46,13 @@ enum stream_frame_type
     stream_frame_data   = 2,  /* 原始字节（不编码、不转义）；id = 句柄号 */
     stream_frame_close  = 3,  /* id = 句柄号 */
     stream_frame_out    = 4,  /* flags：0 = stdout / 1 = stderr */
-    stream_frame_result = 5,  /* json = `--json` 的同一份信封 */
+    stream_frame_result = 5,  /* json = `--json` 的同一份信封；❗`id` = 退出码（u16 二补数）、
+                               * `flags` 位：0x01 ok / 0x02 canceled / 0x04 timed_out / 0x08 truncated
+                               * （客户端要退码与状态但**不得解 JSON**（D28）⇒ 走帧头） */
     stream_frame_error  = 6,  /* json {error} */
     stream_frame_read_req  = 7,  /* json {id, format | bytes, whence, offset} */
-    stream_frame_ack       = 8,  /* json {applied, reason, pid}（控制命令的回执） */
+    stream_frame_ack       = 8,  /* json {applied, reason, pid}（控制命令的回执）；
+                                  * ❗`flags` bit0 = applied（客户端不看 json 就能判成败） */
     stream_frame_info      = 9,  /* json（health / version 的应答，替代 GET /health、/version） */
 
     /* ---- 入向 ---- */
