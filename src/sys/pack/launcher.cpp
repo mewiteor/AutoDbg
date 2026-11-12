@@ -10,6 +10,10 @@
  *      未知标记**报错退出**（D9），不静默降级；
  *   ② variant 回退链（F12）：先按平台探测选，`map()` 失败则换另一个变体重试，并打印原因；
  *   ③ 无参时的文件对话框（D7）：优先 `GetOpenFileNameW`（动态取，9x 无 W 版则降级 A 版）。
+ * T1（D50）：解析 `--json` / `--out=<path>` → 填进 `autodbg_boot`（ABI 3 的两个追加字段），
+ *   信封本身在模块里组装（`main.cpp`）。`--out` 单独给也算 JSON 模式；与 `--server` 互斥
+ *   （同时给 → 报错、退出码 2）；JSON 模式不弹文件对话框，启动器自己的诊断走 stderr
+ *   （stdout 必须被那一行 JSON 独占）。
  *
  * ❗启动器是 **ANSI 编译**（要能在 Win9x 上跑）：所有 API 显式带 A/W 后缀；
  *   `GetCommandLineW` / `GetOpenFileNameW` 一律走 `GetProcAddress`（9x 的 kernel32/comdlg32 没有 W 版）。
@@ -554,6 +558,8 @@ void print_usage()
     out("      --module-dir=<dir>     load module DLLs from <dir> (still memory-mapped)\n");
     out("      --quiet                do not show error message boxes\n");
     out("      --selftest             run built-in pure-function self test\n");
+    out("      --json                 print one machine-readable JSON line (D50)\n");
+    out("      --out=<path>           write the same JSON to <path>; stdout stays empty\n");
     out("      --server[=http]        run as HTTP server (see below)\n");
     out("      --server-addr=<ip:port>  listen address (default 127.0.0.1:8642)\n");
     out("      --server-port=<port>     only override the port\n");
@@ -562,7 +568,8 @@ void print_usage()
     out("      --server-queue=<n>       queue depth (default 8)\n");
     out("      --server-timeout=<sec>   per-request timeout (0 = none)\n");
     out("      --server-log=<path>      diagnostic log file\n");
-    out("      --server-no-echo         do not echo executed output to console\n\n");
+    out("      --server-no-echo         do not echo executed output to console\n");
+    out("      (--json/--out are mutually exclusive with --server, exit code 2)\n\n");
     out("script head markers:\n");
     out("  --!lua / --!luajit         select interpreter (CLI --flavor wins)\n");
     out("  --!autodbg ...             editor-side marker (ignored, line is skipped)\n\n");
@@ -581,6 +588,12 @@ extern "C" int launcher_main(int argc, char **argv)
     bool        version_only   = false;
     const char *module_dir     = nullptr;
     const char *script         = nullptr;
+
+    /* T1（D50）：`--json` / `--out=<path>`（机器可读结果信封）。`--out` 单独给也算 JSON 模式。
+     * ❗与 `--server` 互斥（同时给 → 启动器报错、退出码 2）；JSON 模式下不弹文件对话框，
+     *   且启动器自己的诊断走 stderr（stdout 必须被那一行 JSON 独占）。 */
+    bool        json_mode      = false;
+    static char g_json_out[260];
 
     /* S0（plan_server.md）：server / 自测模式的选项；字符串拷到静态缓冲，
      * 保证在 `autodbg_run` 调用期间有效。 */
@@ -652,6 +665,16 @@ extern "C" int launcher_main(int argc, char **argv)
         else if (str_eq(a, "--selftest"))
         {
             selftest_mode = true;
+        }
+        else if (str_eq(a, "--json"))
+        {
+            json_mode = true;
+        }
+        else if (starts_with(a, "--out="))
+        {
+            g_json_out[0] = '\0';
+            append(g_json_out, sizeof g_json_out, a + 6);
+            json_mode = true;   /* `--out` 单独给也生成信封（内容写文件、stdout 留空） */
         }
         else if (str_eq(a, "--server") || starts_with(a, "--server="))
         {
@@ -727,6 +750,14 @@ extern "C" int launcher_main(int argc, char **argv)
         /* 其余位置参数属于脚本（模块侧按 boot.cmdline_a 重新拆一次，拿到全部） */
     }
 
+    /* ---- T1（D50）：`--json` / `--out` 与 `--server` 互斥（同时给 → 报错、退出码 2）：
+     *      server 的输出口径是帧（信封走 `result` 帧），与「stdout 只有一行 JSON」不能共存。 */
+    if (json_mode && server_mode)
+    {
+        out_err("launcher: --json/--out cannot be combined with --server\n");
+        return 2;
+    }
+
     /* ---- `--help` / `--version`：不碰载荷、不弹对话框，直接打印退出 ---- */
     if (help_requested)
     {
@@ -744,8 +775,9 @@ extern "C" int launcher_main(int argc, char **argv)
     {
         set_script_ansi(script);
     }
-    else if (!list_only && !server_mode && !selftest_mode)
+    else if (!list_only && !server_mode && !selftest_mode && !json_mode)
     {
+        /* JSON 模式不弹窗：它是机器可读接口，拿不到交互桌面时应该直接报错（退出码 -1） */
         if (!ask_script())
             return (GetLastError() == 0) ? 0 : -1;   /* 取消 = 正常退出 */
         script = g_script_a;
@@ -840,7 +872,11 @@ extern "C" int launcher_main(int argc, char **argv)
             out_err("launcher: cannot read module from --module-dir\n");
             return 2;
         }
-        out("launcher: module from disk (--module-dir)\n");
+        /* JSON 模式：启动器自己的诊断不能进 stdout（那一行 JSON 必须独占）→ 走 stderr */
+        if (json_mode)
+            out_err("launcher: module from disk (--module-dir)\n");
+        else
+            out("launcher: module from disk (--module-dir)\n");
     }
 
     /* ---- 映射 + 启动：modern 失败则回退 legacy（F12；`--variant` 强制时不回退） ---- */
@@ -961,6 +997,10 @@ extern "C" int launcher_main(int argc, char **argv)
     boot.server_timeout_sec = server_timeout;
     boot.server_log         = (g_server_log[0] != '\0') ? g_server_log : nullptr;
     boot.server_no_echo     = server_no_echo;
+
+    /* ---- T1（D50）：JSON 信封（ABI 3）---- */
+    boot.json_mode = json_mode ? 1u : 0u;
+    boot.json_out  = (g_json_out[0] != '\0') ? g_json_out : nullptr;
 
     int rc = run(&boot);
 

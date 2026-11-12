@@ -16,6 +16,10 @@
  *      `__getmainargs` + `ExitProcess`（用 `boot.cmdline_*` + `autodbg_split_cmdline_*`），
  *      并用 `boot.script_*` 覆盖 `argv[1]`；
  *   ③ 文件对话框逻辑**保留**（旧 exe 的行为不变），但启动器总会传脚本 → DLL 侧不会弹窗（P4 再搬到启动器）。
+ * T1（D50）：`--json` / `--out=<path>`（plan_cli.md §0 D50）——本层是信封的组装点：
+ *   ④ 读 `boot->json_mode` / `boot->json_out` → 跑脚本 → 组装并输出那一行 JSON；
+ *   ⑤ JSON 模式下 `puts("done")` 被跳过（那一行必须独占 stdout），`print` 由 `output.hpp`
+ *      收进缓冲（见 state.cpp）；`--out` 时 stdout 为空、内容改写文件。
  * ========================================================================== */
 #include <windows.h>
 
@@ -23,7 +27,11 @@
 #include "core/util.hpp" /* E / ErrorS / Error / ErrorN / macro helpers */
 #include "state.hpp"     /* run_script_file / g_wfilepath */
 #include "server.hpp"    /* S0：server 模式入口（plan_server.md §3.1 / D27） */
+#include "output.hpp"    /* T1（D50）：stdout/stderr 分桶 + `images` 登记表 */
+#include "exec_guard.hpp" /* T1（D50）：`canceled`（guard_stop_reason）与 `detached`（guard_detached） */
 #include "common/dynapi.hpp" /* get_proc_as：Win95 缺失的 kernel32 API 动态解析 */
+#include "common/allocator.hpp"   /* T1（D50）：result 片段的释放 */
+#include "common/json_writer.hpp" /* T1（D50）：信封的全转义出口（非 ASCII → \uXXXX） */
 #include "common/selftest.hpp" /* S0：--selftest 纯函数自测（§11 验收） */
 
 #include "../../common/cmdline.h"  /* autodbg_split_cmdline_a/w（P3） */
@@ -33,6 +41,7 @@
 #include <commdlg.h>
 #include <intrin.h>
 #include <shlwapi.h>
+#include <string.h>      /* T1（D50）：strlen（信封字段长度） */
 #include <strsafe.h>
 
 #define _CRTDBG_MAP_ALLOC
@@ -52,6 +61,14 @@ using autodbg::core::init_tab; /* CRC 表（原 lib.c → core/util） */
  *   **没有 `_atexit`**，带非平凡析构的静态对象会让链接器要 `_atexit`（LNK2019）。
  *   会话在进程生命期内常驻、退出时随进程释放（与旧实现同为“不释放链表”，行为中性）。 */
 static autodbg::core::DebuggerSession *s_session = nullptr;
+
+/* ---- T1（D50）：JSON 模式的进程级状态（一次进程只跑一次，不需要重置） ----
+ * `s_json_mode` 被 `run_once` 读（跳 `puts("done")`），`s_json_result` 由 `run_script_file`
+ * 的可选出参交回，`s_json_pid` 是**被调试进程**的 pid（未附加 = 0）。 */
+static bool        s_json_mode   = false;
+static const char *s_json_out    = nullptr;   /* `--out=<path>`（启动器给的 CP936 字节） */
+static const char *s_json_result = nullptr;
+static unsigned long s_json_pid  = 0;
 
 int _tmain(int argc, LPTSTR argv[])
 {
@@ -91,7 +108,14 @@ int _tmain(int argc, LPTSTR argv[])
         return -1;
     }
     /* P4.1：建状态 → 注册 → 烘焙库 → 加载并运行脚本（原 `_tmain` 后半段，现 state.cpp） */
-    return run_script_file(argc, argv);
+    int r = run_script_file(argc, argv, s_json_mode ? &s_json_result : nullptr);
+
+    /* T1（D50）：`pid` 取的是被调试进程（D43/D48：跨调用唯一的状态就是它，靠 pid 指认）。
+     * 会话在 `run_once` 末尾被 delete，所以在这里取；未附加过就是 0。 */
+    if (s_json_mode && s_session != nullptr)
+        s_json_pid = s_session->proc().dwProcessId;
+
+    return r;
 }
 
 /* P3.B 模块 11：原来的 `init()` / `release()` 已并入 `DebuggerSession` 的构造/析构
@@ -228,11 +252,102 @@ int __isa_available_init()
 extern "C" int __tgetmainargs(int *, LPTSTR **, LPTSTR **, int, int *);
 
 /* =============================================================================
+ * finish_json_envelope —— T1（D50）：组装并输出机器可读结果（plan_cli.md §0 D50）
+ *
+ * 字段顺序就是契约：
+ *   {"ok":bool,"exit":int,"canceled":bool,"detached":bool,"pid":int,
+ *    "stdout":"...","stderr":"...","images":[...],"result":<脚本 return 值>}
+ * 编码：一律 UTF-8 + 非 ASCII 走 `\uXXXX`（`json_writer::string_escaped` / `raw_escaped`），
+ *   所以这一行是**纯 ASCII** —— legacy 变体（执行字符集 GBK）也能逐字节安全地写出去，
+ *   不必改 `json_writer::string()` 的非 ASCII 原样输出口径。
+ * 输出口径：`--out=<path>` → 二进制写文件（`\n` 不转 CRLF），内容 = 那一行 + 结尾 `\n`，
+ *   stdout 留空；否则 stdout 只有那一行（`puts("done")` 与 `print` 的直接输出都被让位）。
+ * 字段永远齐全：`images` 为空也输出 `[]`，`result` 编不了也输出 `null`（不省字段）。
+ * `pid` = **被调试进程**（未附加 = 0）：与 `_autodbg_info().pid` / server JSON 里那个
+ *   「AutoDbg 自己」的 pid 不是一个含义（两个含义不混用同一个字段名）。
+ * `canceled` 走 `guard_stop_reason()`（本地 CLI 没有 guard 通道 → false）；`detached` 走
+ *   `guard_detached()`（只有目标存活才算 true，D47）。
+ * ========================================================================== */
+static int finish_json_envelope(int exit_code)
+{
+    autodbg::host::output_snapshot snap = autodbg::host::output_end();
+
+    autodbg::common::json_writer w;
+    w.begin_object();
+    w.key("ok");       w.boolean(exit_code == 0);
+    w.key("exit");     w.number((long long)exit_code);
+    w.key("canceled"); w.boolean(autodbg::host::guard_stop_reason() == autodbg::host::guard_cancel);
+    w.key("detached"); w.boolean(autodbg::host::guard_detached() != 0);
+    w.key("pid");      w.number((long long)s_json_pid);
+    w.key("stdout");   w.string_escaped(snap.out, snap.out_len);
+    w.key("stderr");   w.string_escaped(snap.err, snap.err_len);
+    w.key("images");
+    w.begin_array();
+    for (size_t i = 0; i < autodbg::host::output_path_count(); i++)
+    {
+        const char *p = autodbg::host::output_path_at(i);
+        if (p != nullptr)
+            w.string_escaped(p, strlen(p));
+    }
+    w.end_array();
+    w.key("result");
+    w.raw_escaped(s_json_result, (s_json_result != nullptr) ? strlen(s_json_result) : 0);
+    w.end_object();
+
+    if (w.data() == nullptr)
+        return exit_code;   /* 缓冲分配失败：不输出半行 */
+
+    size_t n = w.size();
+
+    if (s_json_out != nullptr)
+    {
+        /* `--out`：内容 = 那一行 + 结尾 `\n`，stdout 留空。路径是启动器给的 ACP（CP936）字节。 */
+        HANDLE h;
+#ifdef _UNICODE
+        wchar_t wpath[260];
+        int wn = MultiByteToWideChar(CP_ACP, 0, s_json_out, -1, wpath, (int)(sizeof wpath / sizeof wpath[0]));
+        if (wn <= 0)
+        {
+            ErrorS("autodbg_run: cannot convert --out path\n");
+            return exit_code;
+        }
+        h = CreateFileW(wpath, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+#else
+        h = CreateFileA(s_json_out, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+#endif
+        if (h == INVALID_HANDLE_VALUE)
+        {
+            ErrorS("autodbg_run: cannot write --out file\n");
+            return exit_code;
+        }
+
+        DWORD written = 0;
+        BOOL  okw     = WriteFile(h, w.data(), (DWORD)n, &written, NULL);
+        BOOL  oke     = WriteFile(h, "\n", 1, &written, NULL);
+        CloseHandle(h);
+        if (!okw || !oke)
+            ErrorS("autodbg_run: short write to --out file\n");
+        return exit_code;
+    }
+
+    /* 无 `--out`：那一行就是 stdout 的全部内容（此时 sink 已被 output_end 卸掉） */
+    autodbg::core::PrintN(w.data(), n);
+    autodbg::core::PrintS("\n");
+
+    if (s_json_result != nullptr)
+        autodbg::common::release((void *)s_json_result);
+
+    return exit_code;
+}
+
+/* =============================================================================
  * run_once —— 宿主无关的「跑一次」（P3 新提出来，原为 mainCRTStartup 内联体）
  *
  * 顺序与旧 `mainCRTStartup` 逐字一致：isa 初始化 → init_tab → _tmain → 释放会话 → puts("done")。
  * 不含 `ExitProcess`、不含控制台 CP 切换（那两件事归调用方：exe 入口做 ExitProcess，
  * DLL 的 `autodbg_run` 把返回值交给启动器）。
+ * T1（D50）：JSON 模式时 `puts("done")` 被跳过（那一行 JSON 必须独占 stdout），改为
+ *   组装信封；非 JSON 路径逐字节不变。
  * ========================================================================== */
 static int run_once(int argc, LPTSTR argv[])
 {
@@ -248,6 +363,9 @@ static int run_once(int argc, LPTSTR argv[])
     delete s_session;
     s_session = nullptr;
     autodbg::core::set_current_session(nullptr);
+
+    if (s_json_mode)
+        return finish_json_envelope(r);   /* T1（D50）：stdout 只有一行（或写 --out 文件） */
 
     puts("done");
     return r;
@@ -286,6 +404,9 @@ static int run_selftest_mode()
  *   ② 从 `boot->cmdline_a/w` 自己拆 argv（映射后的模块拿不到进程参数）；
  *   ③ `boot->script_a/w` 非空则覆盖 `argv[1]`（启动器已经确定好脚本了）；
  *   ④ 调 `run_once`，返回值即退出码（由启动器负责 ExitProcess）。
+ * T1（D50）：`boot->json_mode` / `boot->json_out` → 跑脚本前装输出收集器（不 echo），
+ *   并把被调试进程的 std 句柄改成 stderr 副本（`set_child_stdio_capture`，命 stdout 只留那一行），
+ *   跑完后由 `finish_json_envelope` 输出那一行（或写 `--out` 文件）。退出码语义不变。
  * ========================================================================== */
 extern "C" __declspec(dllexport) int __cdecl autodbg_run(const autodbg_boot *boot)
 {
@@ -378,9 +499,26 @@ extern "C" __declspec(dllexport) int __cdecl autodbg_run(const autodbg_boot *boo
     }
 #endif
 
+    /* ---- T1（D50）：JSON 模式 —— 在跑脚本**之前**装收集器（不 echo）：
+     *      `print` / `Error*` / `log_msg` 都只进缓冲，stdout 才能被那一行 JSON 独占；
+     *      `--quiet` + `--json` 时 stdout 仍然只有那一行。`--out` 单独给也算 JSON 模式。 */
+    s_json_mode = (boot->json_mode != 0 || boot->json_out != nullptr);
+    s_json_out  = boot->json_out;
+    if (s_json_mode)
+    {
+        autodbg::host::output_begin(0, false);
+        /* T1（D50）：被调试进程的 stdout/stderr 不能落到我们的 stdout 上（否则 `cmd /c ping`
+         * 这类目标的输出会顶在那一行 JSON 前面）。core 不认识 json ⇒ 开关放宿主层。
+         * 目标是把它指到我们 stderr 的可继承副本（见 `core/util.hpp` 的注释）。 */
+        autodbg::core::set_child_stdio_capture(true);
+    }
+
     if (argc < 2 || s_argv[1] == nullptr)
     {
         ErrorS("autodbg_run: no script\n");
+        /* T1（D50）：字段必须齐全 —— 没有脚本也要给出那一行（ok=false、exit=-1） */
+        if (s_json_mode)
+            return finish_json_envelope(-1);
         return -1;
     }
 

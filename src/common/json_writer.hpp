@@ -8,6 +8,14 @@
  *   **只写不解析**：请求里的 JSON 由 Lua 层的 `jsonx.decode` 处理（D28），C 侧不写 parser。
  * 约束：零 CRT + 无 STL（缓冲走 `common::alloc/release`）；不抛异常（项目禁 C++ 异常）；
  *   所有边界都检查，超限时**停止追加**并置 `overflow()`，绝不越界。
+ * T1（D50）新增的**全转义出口**（`string_escaped` / `raw_escaped`）——与现有 `string()` 共存、
+ *   不改 `string()` 的非 ASCII 原样输出口径：
+ *   · 非 ASCII 一律 `\uXXXX` ⇒ 输出**纯 ASCII**（`--json` 的信封要在 CP936 控制台上逐字节安全，
+ *     legacy 变体的执行字符集是 GBK，靠这个才不用改 `string()`）；
+ *   · 解码优先按 UTF-8；非法 UTF-8 的高位字节串按 **CP936** 解一个字符（脚本字面量就是 GBK 字节）；
+ *   · ❗降级：CP936 转换取不到时**逐字节** `\u00XX`（仍是合法 JSON，但码点=原字节，不是字符）。
+ *   转换用**既有静态导入**（`src/core/util.cpp` 已导入 `MultiByteToWideChar`，在 w95 白名单内）：
+ *   走 dynapi 不会减少导入、反而可能把已放行的导入变成新的。
  * 与旧实现的差异：无（新模块）。
  * ========================================================================== */
 #include <stddef.h>
@@ -43,6 +51,11 @@ public:
      * 类型（`w.number(1LL)`），否则 `int` → 三者都是同级别的转换 → C2668 重载歧义。 */
     void string(const char *s) noexcept;            /* NUL 结尾 */
     void string(const char *s, size_t n) noexcept;  /* 任意字节，做 JSON 转义 */
+    /* T1（D50）：全转义出口（非 ASCII → \uXXXX，输出纯 ASCII）。`raw_escaped` 给
+     * `jsonx.encode` 的结果用（C 侧不写 parser，D28）：片段本身不动，只把非 ASCII 转义。 */
+    void string_escaped(const char *s) noexcept;            /* NUL 结尾 */
+    void string_escaped(const char *s, size_t n) noexcept;
+    void raw_escaped(const char *json, size_t n) noexcept;
     void number(long long v) noexcept;
     void number(unsigned long long v) noexcept;
     void number(double v) noexcept;
@@ -67,6 +80,11 @@ private:
     void      put(char c) noexcept;
     void      put(const char *s, size_t n) noexcept;
     void      put_escaped(const char *s, size_t n) noexcept;
+    void      put_escaped_full(const char *s, size_t n) noexcept; /* 全转义（非 ASCII → \uXXXX） */
+    void      put_escaped_nonascii(const char *s, size_t n) noexcept; /* raw 片段：只转非 ASCII，结构字符不动 */
+    size_t    put_nonascii_unit(const char *s, size_t n, size_t i) noexcept; /* 返回消耗的字节数 */
+    bool      put_escaped_cp936(const char *s, size_t n) noexcept; /* 非法 UTF-8 串按 CP936 整段解 */
+    void      put_codepoint(unsigned long cp) noexcept;
     void      put_u64(unsigned long long v) noexcept;
     bool      reserve(size_t extra) noexcept;
 

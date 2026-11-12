@@ -1529,11 +1529,20 @@ static int lua_on_wait_timeout(void *ctx, bool can_detach_without_term)
         if (!autodbg::host::guard_should_stop())
             return autodbg::core::WAIT_TIMEOUT_CONTINUE;
         /* 取消：能保留目标就保留（调试器不该因为「脚本被取消」而杀掉目标进程） */
-        return can_detach_without_term ? autodbg::core::WAIT_TIMEOUT_DETACH_KEEP_ALIVE
-                                       : autodbg::core::WAIT_TIMEOUT_DETACH_AND_TERMINATE;
+        if (can_detach_without_term)
+        {
+            autodbg::host::guard_mark_detached(true);   /* T1（D50）：真 detach → 目标存活 */
+            return autodbg::core::WAIT_TIMEOUT_DETACH_KEEP_ALIVE;
+        }
+        return autodbg::core::WAIT_TIMEOUT_DETACH_AND_TERMINATE;
     }
 
-    return CheckConsoleInput(a->L, a->on_console_event, can_detach_without_term);
+    int ret = CheckConsoleInput(a->L, a->on_console_event, can_detach_without_term);
+    /* T1（D50）：`decide_console_action` 只在 SHIFT_PRESSED 且引擎能不终止时才报 2，
+     * 所以这里「ret == 2」就是「目标存活」的口径（`q` = 1 = 被终止 → 不算 detached）。 */
+    if (ret == autodbg::core::WAIT_TIMEOUT_DETACH_KEEP_ALIVE)
+        autodbg::host::guard_mark_detached(can_detach_without_term);
+    return ret;
 }
 
 /* 断点销毁通知：core 内所有删除路径统一走它 → 这里就是**唯一**的令牌释放点 */
@@ -1801,18 +1810,26 @@ int lua_attach(lua_State *L)
 int lua_detach(lua_State *L)
 {
     S().to_detach() = true;
+    /* T1（D50）：`detached` 只在目标真的存活时才算 true（D47）。Win95/98 没有
+     * `DebugActiveProcessStop` → 引擎会降级成 kill → 不能算 detached。走 dynapi
+     * （与 core 的 `debug_loop.cpp` 同一口径，不新增静态导入）。 */
+    typedef BOOL(WINAPI * DebugActiveProcessStopT)(DWORD);
+    autodbg::host::guard_mark_detached(
+        autodbg::common::get_proc_as<DebugActiveProcessStopT>("kernel32.dll", "DebugActiveProcessStop") != nullptr);
     return 0;
 }
 
 int lua_kill(lua_State *L)
 {
     S().cont() = false;
+    autodbg::host::guard_mark_detached(false);   /* T1（D50）：Kill = 被终止 → detached = false */
     return 0;
 }
 
 int lua_force_kill(lua_State *L)
 {
     S().cont() = false;
+    autodbg::host::guard_mark_detached(false);   /* T1（D50）：同上（这里是直接 Terminate） */
     if (S().proc().hProcess)
         TerminateProcess(S().proc().hProcess, 0);
     if (S().proc().hThread)

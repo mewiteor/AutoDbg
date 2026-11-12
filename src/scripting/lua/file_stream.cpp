@@ -12,9 +12,12 @@
  *     小数据请继续用 `write_file`）；
  *   · 本层不做文本行尾以外的编码转换：二进制安全，字节原样；
  *   · `__gc` 只做「尽力关闭 + 警告」，不会替调用方补数据。
+ * T1（D50）：`open_file` 的 w/a 句柄会进 `images` 登记表（`output.hpp`）——只记路径，
+ *   内容不动；去重与上限都在登记层，这里只在**真的打开成功**后记一笔。
  * ========================================================================== */
 #include "file_io.hpp"
 
+#include "output.hpp"   /* T1（D50）：`images` 登记表 */
 #include "stream.hpp"
 
 #include "common/allocator.hpp"
@@ -44,6 +47,13 @@ struct file_obj
 };
 
 unsigned g_next_id = 0;
+
+/* T1（D50）：写入模式（w / a）才进 `images`；纯读句柄不算「本次运行写出的文件」 */
+void record_written_path(const file_obj *o)
+{
+    if (o->mode[0] == 'w' || o->mode[0] == 'a')
+        output_record_path(o->path);
+}
 
 file_obj *to_obj(lua_State *L, int idx)
 {
@@ -292,6 +302,7 @@ int lua_open_file(lua_State *L)
         o->fp = fopen(path, norm);
         if (o->fp == nullptr)
             return push_err(L, "open_file: cannot open file"), 2;
+        record_written_path(o);
         return 1;
     }
 
@@ -314,6 +325,7 @@ int lua_open_file(lua_State *L)
     w.end_object();
     if (!stream_write_frame(stream_frame_open, o->id, 0, w.data(), w.size(), nullptr, 0))
         return push_err(L, "open_file: stream send failed (client disconnected?)"), 2;
+    record_written_path(o);
     return 1;
 }
 

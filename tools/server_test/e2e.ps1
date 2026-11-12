@@ -10,6 +10,7 @@
 # 覆盖（对应 plan_server.md §4.3 / §4.5）：
 #   /health、/version、/run（text + json、语法错、运行时错、args、大输出截断）、
 #   404、405、401（显式 token 时）、请求体上限 413、/shutdown。
+# ❗`--json` / `--out=<path>`（T1 / D50）的本地模式段在 `e2e_json.ps1`（门禁表见 AGENTS.md §4）。
 # =============================================================================
 [CmdletBinding()]
 param(
@@ -214,7 +215,7 @@ try
 
     $verOut = & $Exe --version 2>&1 | Out-String
     Check 'cli.version.exit' ($LASTEXITCODE -eq 0) "exit=$LASTEXITCODE"
-    Check 'cli.version.format' ($verOut -match '^AutoDbg \S+ \(.*abi 2, (x64|x86)\)') "out=$($verOut.Trim())"
+    Check 'cli.version.format' ($verOut -match '^AutoDbg \S+ \(.*abi 3, (x64|x86)\)') "out=$($verOut.Trim())"
     # 版本串应该是 tag 或 commit 短哈希（没有 tag 时就是 7 位以上的十六进制）
     Check 'cli.version.identity' ($verOut -match '^AutoDbg ([0-9a-f]{7,40}|v?\d[^ ]*)(-dirty)? ') "out=$($verOut.Trim())"
 
@@ -233,7 +234,7 @@ try
     Check 'health.ok' ($hj.ok -eq $true) "body=$($h.Content)"
 
     $v = Json (Invoke-WebRequest -Uri "http://127.0.0.1:$Port/version" -SkipHttpErrorCheck)
-    Check 'version.abi' ($v.abi -eq 2) "abi=$($v.abi)"
+    Check 'version.abi' ($v.abi -eq 3) "abi=$($v.abi)"
     Check 'version.arch' ($v.arch -eq $(if ($Render -eq '64') { 'x64' } else { 'x86' })) "arch=$($v.arch)"
     if ($Variant) { Check 'version.variant' ($v.variant -eq $Variant) "variant=$($v.variant)" }
     Check 'version.winsock' ($v.winsock -eq 'ws2_32.dll') "winsock=$($v.winsock)"

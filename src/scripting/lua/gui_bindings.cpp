@@ -12,6 +12,8 @@
  * ========================================================================== */
 #include "gui_bindings.hpp"
 
+#include "output.hpp"   /* T1（D50）：`images` 登记表 */
+
 #include "core/gui.hpp"
 #include "core/util.hpp" /* TCHAR / alloc_ / free_ 宏 */
 
@@ -318,6 +320,8 @@ int lua_gui_screenshot_to(lua_State *L)
 
     if (written != len)
         return fail(L, "short write");
+    /* T1（D50）：写盘成功才算「本次运行写出的文件」（与 open_file 的 w/a 句柄同一口径） */
+    host::output_record_path(lua_tostring(L, 1));
     lua_pushinteger(L, (lua_Integer)len);
     return 1;
 }

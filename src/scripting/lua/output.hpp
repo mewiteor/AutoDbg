@@ -10,6 +10,12 @@
  *   · 覆写 Lua 的全局 `print`（Lua 5.5 与 LuaJIT 都适用），使脚本输出也进同一缓冲
  *     ——否则脚本里最常见的那句 `print("…")` 会跑进 msvcrt 的 stdout 而抓不到；
  *   · 大小上限：每条流超过 `limit_per_stream` 就停止追加、置 `truncated` 并统计丢弃字节。
+ * T1（D50）新增：
+ *   · `images` 的登记表——本次运行写出的文件路径清单（`open_file` 的 w/a 句柄 +
+ *     `gui.screenshot_to`）。只在收集期间记录，去重（同一个句柄多次 `f:write` 只留首次），
+ *     上限 64 条；超出就丢弃并记数（`output_path_dropped`），不越界。
+ *   · 登记的路径一律是 **UTF-8**（Lua 字符串原本的口径），所以 `--json` 的信封里走
+ *     `json_writer::string_escaped`（非 ASCII → `\uXXXX`）。
  * 口径（与 plan_p7_win9x.md §2.4 一致）：缓冲里一律是 **UTF-8 无 BOM**、行尾 `\n`。
  * ❗已知取舍：`print` 的输出**不回显控制台**（只进响应）；`io.write` / `puts` 走真实
  *   stdout（fd 级重定向是 §5.3 的层 B，v1 不做）。这些都记录在 plan_server.md §5.3。
@@ -46,7 +52,15 @@ bool output_active();
 /* 写一帧到收集器（`stream`：1 = stdout、2 = stderr）；无收集器时静默丢弃 */
 void output_write(int stream, const char *data, size_t len);
 
-/* 覆写全局 `print`（只在收集期间安装；语义照抄 Lua 5.5：`tostring` + `\t` + `\n`） */
+/* ---- T1（D50）：`images` 登记表（本次运行写出的文件路径） ----
+ * 只在收集期间记录；`output_begin` 清空。路径必须是 UTF-8（与缓冲同口径）。 */
+void output_record_path(const char *path);
+size_t output_path_count();
+size_t output_path_dropped();
+const char *output_path_at(size_t idx);
+
+/* 覆写全局 `print`（只在收集期间安装；语义照抄 Lua 5.5：`tostring` + `\t` + `\n`）。
+ * `--json`（D50）时它必装：stdout 只允许那一行 JSON，脚本里的 `print` 也要进缓冲。 */
 void install_print_override(lua_State *L);
 } /* namespace autodbg::host */
 

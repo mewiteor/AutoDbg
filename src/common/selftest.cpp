@@ -4,7 +4,8 @@
  * 来源：新写。
  * 与旧实现的差异：无（新文件）。
  * 覆盖：HTTP 请求解析（含各种拒绝路径）、HTTP 响应生成、json_writer（转义/嵌套/数字/
- *   深度溢出）、base64（向量/往返/非法输入）、rand（hex 形状与两次不相等）。
+ *   深度溢出、**T1（D50）的全转义出口**）、base64（向量/往返/非法输入）、rand（hex 形状与
+ *   两次不相等）。
  * 说明：断言用 `strcmp`/`memcmp` 逐字节比较（跨架构/跨编译器稳定）；
  *   期望值都是**手写的字面量**，不要在这里用被测代码生成期望值（否则等于没测）。
  * ========================================================================== */
@@ -397,6 +398,85 @@ void test_json(test_ctx *t)
         w.reset();
         w.string("汉");
         check_str(t, "json.escape.utf8-passthrough", w.data(), "\"汉\"");
+    }
+
+    /* ---- T1（D50）：全转义出口 `string_escaped` / `raw_escaped`（输出必须纯 ASCII）----
+     * 期望值是手写字面量；`\u6c49` 在两个变体里都成立：modern 的源字面量是 UTF-8（走
+     * UTF-8 解码），legacy 的执行字符集是 GBK（走 CP936 分支）——两边结果同一。 */
+    {
+        json_writer w;
+        w.string_escaped("");
+        check_str(t, "json.esc.empty", w.data(), "\"\"");
+
+        w.reset();
+        w.string_escaped("a\"b\\c\td");
+        check_str(t, "json.esc.short-escapes", w.data(), "\"a\\\"b\\\\c\\td\"");
+
+        w.reset();
+        w.string_escaped("汉");
+        check_str(t, "json.esc.utf8-codepoint", w.data(), "\"\\u6c49\"");
+
+        w.reset();
+        const char astral[4] = {(char)0xF0, (char)0x9F, (char)0x98, (char)0x80}; /* U+1F600 */
+        w.string_escaped(astral, 4);
+        check_str(t, "json.esc.astral-surrogate-pair", w.data(), "\"\\ud83d\\ude00\"");
+
+        /* 非法 UTF-8（GBK 字节串）：跨环境唯一不变的性质是「纯 ASCII」（CP936 分支或逐字节降级
+         * 都只能写 \uXXXX）。具体码点取决于能否转换 → 不断言具体值。 */
+        w.reset();
+        const char gbk[2] = {(char)0xB0, (char)0xA1};
+        w.string_escaped(gbk, 2);
+        bool all_ascii = (w.data() != nullptr);
+        for (const char *p = w.data(); p != nullptr && *p != '\0'; p++)
+            if ((unsigned char)*p >= 0x80u)
+                all_ascii = false;
+        check_bool(t, "json.esc.high-bytes-escaped-as-ascii", all_ascii, w.data());
+        check_bool(t, "json.esc.gbk-run-escapes-lossless",
+                   w.size() >= 8 && w.size() <= 14, "一个 CP936 字符（1 个 \\u）或逐字节（2 个 \\u）");
+
+        /* 纯 ASCII 输入 → 与既有 `string()` 逐字节相同（全转义出口只多改了非 ASCII） */
+        w.reset();
+        w.string("x\n");
+        const char *want_plain = w.data();
+        char cmp[64];
+        size_t cn = 0;
+        for (const char *p = want_plain; *p != '\0' && cn + 1 < sizeof cmp; p++)
+            cmp[cn++] = *p;
+        cmp[cn] = '\0';
+        w.reset();
+        w.string_escaped("x\n");
+        check_str(t, "json.esc.ascii-identical-to-string", w.data(), cmp);
+
+        /* 嵌套 + raw 片段（`result` 的路径：C 侧不写 parser，片段直通） */
+        w.reset();
+        w.begin_object();
+        w.key("stdout");
+        w.string_escaped("b\tc");
+        w.key("result");
+        w.raw_escaped("{\"k\":1}", 7);
+        w.end_object();
+        check_str(t, "json.esc.nested-raw", w.data(), "{\"stdout\":\"b\\tc\",\"result\":{\"k\":1}}");
+
+        /* raw 片段里的非 ASCII（jsonx.encode 可能交回 GBK/UTF-8 字节）也被转义 */
+        w.reset();
+        const char frag[5] = {'"', (char)0xE6, (char)0xB1, (char)0x89, '"'};
+        w.raw_escaped(frag, 5);
+        check_str(t, "json.esc.raw-fragment-escaped", w.data(), "\"\\u6c49\"");
+
+        /* 空片段 / NULL → null（信封里 `result` 编不了也要占位，不能省字段） */
+        w.reset();
+        w.raw_escaped(nullptr, 0);
+        check_str(t, "json.esc.raw-null", w.data(), "null");
+
+        /* double 的口径不变（Ryu：最短且可精确回读），与全转义字符串混排也照旧 */
+        w.reset();
+        w.begin_object();
+        w.key("d");
+        w.string_escaped("汉");
+        w.key("n");
+        w.number(0.5);
+        w.end_object();
+        check_str(t, "json.esc.double-ryu-unchanged", w.data(), "{\"d\":\"\\u6c49\",\"n\":0.5}");
     }
 
     {

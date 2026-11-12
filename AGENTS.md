@@ -82,14 +82,14 @@ make.bat i <dir>         :: 指定输出目录（默认 .out）
 ```
 
 - 无脚本参数时弹文件对话框（启动器里的 `GetOpenFileNameW`，9x 降级 A 版）选脚本。
-- 选项（启动器层）：`-h` / `--help`（打 usage 后退出 0）、`--version`（版本/ABI/架构后退出 0；版本串来自构建期的 `git describe`，见 §1）、`--flavor=lua|luajit`（默认 lua 5.5）、`--variant=modern|legacy`（仅排障；正常靠平台探测 + 映射失败回退）、`--list`（列出载荷里的模块）、`--module-dir=<dir>`（调试：从磁盘取同名 DLL，仍走内存映射）、`--quiet`（关错误弹窗）、`--selftest`（跑纯函数自测）、`--server[=http]` 及其 `--server-*` 子选项（§12）。
+- 选项（启动器层）：`-h` / `--help`（打 usage 后退出 0）、`--version`（版本/ABI/架构后退出 0；版本串来自构建期的 `git describe`，见 §1）、`--flavor=lua|luajit`（默认 lua 5.5）、`--variant=modern|legacy`（仅排障；正常靠平台探测 + 映射失败回退）、`--list`（列出载荷里的模块）、`--module-dir=<dir>`（调试：从磁盘取同名 DLL，仍走内存映射）、`--quiet`（关错误弹窗）、`--selftest`（跑纯函数自测）、`--json` / `--out=<path>`（机器可读结果信封，§12.6；两者互斥于 `--server`，同时给 → 启动器报错、退出码 2）、`--server[=http]` 及其 `--server-*` 子选项（§12）。
   启动器的输出一律 **ASCII**（它走 `WriteFile` 写字节，中文在 CP936 控制台上会乱码；模块那边走 `WriteConsoleW` 才例外）。
 - **脚本首行标记**也能选 flavor：`--!lua` / `--!luajit`（优先级：命令行 > 首行标记 > 字节码 magic > 默认 lua）。
   其它 `--!xxx` 一律报错退出（D9）；例外：`--!autodbg` / `--!adbg` 是**编辑器侧标记**
   （远程地址 / exe / 架构），launcher 会**跳过它继续看下一行**（所以同一份脚本既能被 nvim 插件跑，
   也能直接命令行跑；`PITFALLS.md` N9）。
 - `state.cpp` **不再**往脚本目录写任何文件（`cdebugger.d.lua` / `.luarc.json` 已移除）：编辑器补全改由 neovim 插件的 LuaLS 注解库提供（§12.5）。
-- 脚本参数从 `argv[2..]` 压入 Lua；退出码 0 = 成功，-1 = 加载/运行失败，Lua 运行时错误为 LuaJIT/Lua 的错误码（2 等），启动器自己的错误为 2（另有 `--list` / `--selftest` / `/shutdown` 等正常返回 0）。
+- 脚本参数从 `argv[2..]` 压入 Lua；退出码：`0` = 成功；**脚本不存在/无法打开** → `-1`；脚本的**语法错误**是 Lua 的 `LUA_ERRSYNTAX`（Lua 5.5 = **3**）、**运行时错误**是 `LUA_ERRRUN`（= **2**）——两者**透传 Lua 错误码**（启动器与引擎不另外发明）；启动器自己的错误为 `2`（另有 `--list` / `--selftest` / `/shutdown` 等正常返回 0）。
 
 ## 4. 测试与门禁
 
@@ -98,8 +98,9 @@ make.bat i <dir>         :: 指定输出目录（默认 .out）
 | 链 | 入口 | 说明 |
 | --- | --- | --- |
 | 导入表门禁 | `uv --directory tools/api_check run scan_dir.py` | 扫 `.out` 下全部产物，按产物自动选口径（`AutoDbgLegacy_*` 与启动器 → `w95`、其余 x86 → `wxp`、x64 → `w7`），有目标系统不可用的导入就打印并返回 1。单文件用法：`uv --directory tools/api_check run main.py <exe\|dll> <w95\|w98\|w982\|wxp>`（x64 免第二个参数） |
-| 纯函数自测 | `.out\AutoDbg_<arch>.exe --selftest` | 覆盖 `http` / `json_writer` / `base64` / `png_writer` / `dbl2str` 等纯计算层（当前 70 条）；`feat/cli-tcp` 上 `http` / `base64` 段随 D41 / D44 删除，要补帧编解码与 `decide_console_action` 的断言 |
+| 纯函数自测 | `.out\AutoDbg_<arch>.exe --selftest` | 覆盖 `http` / `json_writer` / `base64` / `png_writer` / `dbl2str` 等纯计算层（基线 70 条，T1/D50 给 `json_writer` 的转义口径 +11 → 当前 81 条）；`feat/cli-tcp` 上 `http` / `base64` 段随 D41 / D44 删除，要补帧编解码与 `decide_console_action` 的断言 |
 | server 端到端 | `pwsh tools/server_test/e2e.ps1 -Render <64\|86> [-Variant legacy]`，另有 `e2e_gui.ps1` / `e2e_mcp.ps1` / `e2e_io.ps1` / `nvim_smoke.ps1` | 起 server → 断言 → 停；不需要 VM，也不改产品行为。`feat/cli-tcp`（D41）上 `e2e_mcp.ps1` 删除、新增 `e2e_tcp.ps1`（握手 + 帧 + 回调里阻塞读的超时/取消） |
+| JSON 信封（T1/D50） | `pwsh tools/server_test/e2e_json.ps1 -Render <64\|86> [-Variant legacy]` | 本地模式 `--json` / `--out=<path>`：那一行 JSON 独占 stdout、字段齐全、`result` / `pid` / `detached` / `images` 口径、`--json` 与 `--server` 互斥（退出码 2）、退出码口径不变；那一行必须**纯 ASCII**（CP936 → UTF-8 或逐字节降级）。`-Variant legacy` **必须真过**（这段就是用来暴露 GBK 的） |
 | Win9x 实机 | `pwsh tools/w9x_test/w9x.ps1 -Action check\|run\|record` | 需要 VMware 的 Win98 guest 与凭据（`tools/w9x_test/config.local.ps1`，已 gitignore）；**没有 VM / 凭据时 SKIP（exit 0）**。矩阵与剩余项见 `plan_p7_win9x.md` |
 
 - 黄金输出在本仓库 `tests/golden/w9x/`（Win98 guest 的输出），行尾与比较口径见 D15（golden 统一 LF，比较走「CRLF→LF + 去末尾空行」归一化）。
@@ -339,6 +340,7 @@ payload              // 单条 LZMA 流：各模块原始字节按 entry 顺序�
 - `script_a` / `script_w`：启动器已选定的脚本（UNICODE 模块只看 `script_w`，所以启动器两份都填）。
 - `flavor` / `variant`：仅供诊断（模块内容已由载荷决定）。
 - `selftest` / `server_mode` / `server_*`：S0 追加的字段（D27），ABI 版本因此到 **2**。
+- `json_mode` / `json_out`：T1（D50）追加的字段（`--json` / `--out=<path>`），ABI 版本因此到 **3**；T3 的 `remote_*` / `pid` / `read_timeout` / `max_frame` 顺延到 **4**（`plan_cli.md` §4）。
 
 改这个结构或导出名 = 改 ABI，必须同步 `AUTODBG_ABI_VERSION` 并重跑全部运行路径。
 
@@ -469,6 +471,22 @@ payload              // 单条 LZMA 流：各模块原始字节按 entry 顺序�
   `adbp` / `adrunbp` / `adhw` / `adctx` / `admem` / `adstack` / `adexcept` / `adgui` / `adclick` / `adfile`。
   ❗LuaSnip 的 `t{"a","b"}` 是**多行**文本节点（元素之间自动换行）——写片段时把「续行」
   拆成独立元素会把一行拆成两行（`PITFALLS.md` N6）。
+
+### 12.6 CLI 的机器可读输出（`--json` / `--out=<path>`，D50）
+
+- 落点：launcher 解析选项 → `boot.json_mode` / `boot.json_out`（ABI **3**，§11.3）→ `main.cpp` 组装信封。
+- 契约（一行，字段齐全、缺一不可）：`{"ok","exit","canceled","detached","pid","stdout","stderr","images","result"}`。
+  - `--json`：stdout **只有那一行**；launcher 自己的诊断走 stderr，`--quiet` 下仍然只有那一行。
+    `--out=<path>`：同一份 JSON 写文件（二进制、结尾 `\n`，不转 CRLF），stdout 留空；两者同时给 → 只写文件。
+  - `exit` = 进程退出码（口径不变：0 / -1 / 2 / Lua 错误码），`--json` 不改退出码。
+  - ❗顶层 `pid` 是**被调试进程**（未附加为 0），不是 AutoDbg 自己的 pid（`_autodbg_info().pid` / server JSON 里的 `pid` 是后者）。
+  - `detached` 只在目标存活时为 true（真 detach、或 `on_wait_timeout` 的 keep-alive）；被 kill / Win95-98 降级成 kill → false。
+  - `images` = 本次执行里落盘过的路径登记表（`open_file` 的写/追加模式、`gui.screenshot_to`），去重、上限 64，**空也要输出 `[]`**。
+  - ❗**被调试进程的 stdout/stderr 不进信封**：JSON 模式下 `core::set_child_stdio_capture(true)` 让 `CreateProcess` 用 `STARTF_USESTDHANDLES` 把目标的 stdout/stderr 指到**本进程 stderr 的可继承副本**（stdin = NUL）。这是「那一行独占 stdout」的实现手段（否则 `cmd /c ping` 的输出会顶在它前面）；`stderr` 字段只装**本进程**的诊断。要看目标输出就重定向进程 stderr，或用 `on_output_debug_string`。不用匿名管道的理由（`--detach` 后没人排空 → 目标要么阻塞要么拿到 `ERROR_BROKEN_PIPE`）写在 `core/util.hpp`。
+  - `result` = 脚本返回值（1 个 → 那个值，0 个 → `null`，多个 → 数组）；编不了（function / 无 `val` 的 userdata / 稀疏表 / NaN / 循环引用）→ `null`，`ok` 仍可 true。C 侧不写 JSON 解析器：用 `json_writer` 的 raw 片段 + 烘焙的 `jsonx.encode`（`state.cpp` 在 `lua_close` 前编）。
+- ❗编码口径：那一行必须**纯 ASCII**。优先按 UTF-8 解码；非法 UTF-8 的高位字节串按 **CP936** 解（legacy 变体的执行字符集是 GBK）；解不出（函数取不到 / 分配失败）→ 逐字节 `\u00XX`（仍是合法 JSON，但码点 = 原字节）。文件头注释里写明这个假设与降级。
+- `--json` / `--out` 与 `--server` **互斥**（同时给 → 启动器报错、退出码 2）；JSON 模式不弹文件对话框。
+- 门禁：`tools/server_test/e2e_json.ps1`（见 §4）。
 
 ## 13. 已定决策（不要再讨论/推翻；改之前先在 `PITFALLS.md` 查有没有相关坑）
 

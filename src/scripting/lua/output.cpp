@@ -9,6 +9,8 @@
  *   ② `print` 覆写用「调全局 tostring」的办法（而不是 `luaL_tolstring`）：LuaJIT 的
  *      兼容层对 5.2 的 `luaL_tolstring` 支持不完全，用全局 `tostring` 两个版本一致。
  *   ③ 缓冲走 `common::alloc/resize/release`；`print` 的 echo 不做（见头文件取舍说明）。
+ *   ④ T1（D50）：`images` 登记表 —— 固定 64 条 + 去重 + 丢弃计数，不越界；路径按
+ *      UTF-8 存（就是 Lua 字符串原本的字节），`output_begin` 时清空。
  * ========================================================================== */
 #include "output.hpp"
 
@@ -25,6 +27,7 @@ namespace autodbg::host
 namespace
 {
 constexpr size_t k_default_limit = 4u * 1024u * 1024u; /* 每条流 4 MB */
+constexpr size_t k_max_paths     = 64;                 /* `images` 上限（T1 / D50） */
 
 struct stream_buf
 {
@@ -45,6 +48,24 @@ struct collector
 };
 
 collector g_c;
+
+/* `images` 登记表（T1 / D50）：本次运行写出的文件路径。不拥有 Lua 内存，
+ * 所以存的是自己的副本（`common::alloc`），`output_begin` 时统一释放。 */
+const char *g_paths[k_max_paths] = {};
+size_t      g_path_count   = 0;
+size_t      g_path_dropped = 0;
+
+void paths_clear()
+{
+    for (size_t i = 0; i < g_path_count; i++)
+    {
+        if (g_paths[i] != nullptr)
+            common::release((void *)g_paths[i]);
+        g_paths[i] = nullptr;
+    }
+    g_path_count   = 0;
+    g_path_dropped = 0;
+}
 
 void stream_free(stream_buf *b)
 {
@@ -161,9 +182,51 @@ bool output_begin(size_t limit_per_stream, bool echo_to_console)
     g_c.dropped = 0;
     stream_clear(&g_c.out);
     stream_clear(&g_c.err);
+    paths_clear();
 
     core::set_output_sink(sink, nullptr);
     return true;
+}
+
+void output_record_path(const char *path)
+{
+    if (!g_c.active || path == nullptr || path[0] == '\0')
+        return;   /* 非收集期（本地直路）不记录：D50 只在 `--json` 时需要 */
+
+    for (size_t i = 0; i < g_path_count; i++)
+        if (strcmp(g_paths[i], path) == 0)
+            return;   /* 去重：同一个文件只记首次（多次 f:write 不重复） */
+
+    if (g_path_count >= k_max_paths)
+    {
+        g_path_dropped++;
+        return;
+    }
+
+    size_t n    = strlen(path);
+    char  *copy = (char *)common::alloc(n + 1);
+    if (copy == nullptr)
+    {
+        g_path_dropped++;
+        return;
+    }
+    memcpy(copy, path, n + 1);
+    g_paths[g_path_count++] = copy;
+}
+
+size_t output_path_count()
+{
+    return g_path_count;
+}
+
+size_t output_path_dropped()
+{
+    return g_path_dropped;
+}
+
+const char *output_path_at(size_t idx)
+{
+    return (idx < g_path_count) ? g_paths[idx] : nullptr;
 }
 
 output_snapshot output_end()

@@ -9,6 +9,9 @@
  *   ② `GetTickCount` 的 ~49.7 天回绕用**有符号差值**处理（`(LONG)(now - deadline) >= 0`）；
  *   ③ 计数钩子每 100 万条指令触发一次 → 对正常脚本的开销可忽略（`lua_sethook` 本身
  *      在 LuaJIT 下也支持 LUA_MASKCOUNT）。
+ *   ④ T1（D50）：多一个「目标是否存活」的标志（`guard_mark_detached` / `guard_detached`），
+ *      给 `--json` 的 `detached` 字段。本地 CLI 不走 `guard_exec_begin` → 这份状态是进程级的
+ *      （一个进程只跑一个脚本），不需要重置。
  * ========================================================================== */
 #include "exec_guard.hpp"
 
@@ -24,6 +27,7 @@ volatile LONG g_active     = 0; /* 1 = 有执行在进行 */
 volatile LONG g_cancel_seq = 0; /* `/cancel` 计数（每次 /cancel +1） */
 volatile LONG g_seq        = 0; /* 本次执行的基线（begin 时快照） */
 volatile LONG g_stop       = 0; /* 0 = 无；1 = cancel；2 = timeout */
+volatile LONG g_detached   = 0; /* T1（D50）：1 = 目标存活（真 detach） */
 volatile DWORD g_deadline  = 0; /* 截止 tick；0 = 不限 */
 
 /* 有符号比较：正确处理 GetTickCount 回绕 */
@@ -37,6 +41,7 @@ void guard_exec_begin(unsigned timeout_sec)
 {
     InterlockedExchange(&g_seq, InterlockedCompareExchange(&g_cancel_seq, 0, 0));
     InterlockedExchange(&g_stop, 0);
+    InterlockedExchange(&g_detached, 0);   /* T1（D50） */
 
     if (timeout_sec != 0)
     {
@@ -93,6 +98,18 @@ bool guard_should_stop()
 int guard_stop_reason()
 {
     return (int)InterlockedCompareExchange(&g_stop, 0, 0);
+}
+
+/* T1（D50）：`--json` 的 `detached`。只有「目标真的存活」才传 true（D47：Win95/98 取不到
+ * `DebugActiveProcessStop` → 降级成 kill → 不算 detached）。 */
+void guard_mark_detached(bool target_alive)
+{
+    InterlockedExchange(&g_detached, target_alive ? 1 : 0);
+}
+
+int guard_detached()
+{
+    return (int)InterlockedCompareExchange(&g_detached, 0, 0);
 }
 
 const char *guard_stop_message()

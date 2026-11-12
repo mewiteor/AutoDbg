@@ -187,8 +187,8 @@ D43 说「每次调用无状态」，所以**不能有隐形状态**：「记住
 | 双向帧 + 握手 | `src/scripting/lua/stream.hpp/.cpp` | `stream.*` 从 130 行涨到约 200 行（不是净减）：`read_req` / `ack` / `info` / `end` + `control` |
 | 控制命令在两个点的 poll | `bindings.cpp` 的 `lua_on_wait_timeout` + `lua_sethook` 钩 | 100 ms 空闲轮询里加一次非阻塞 `select`；这是「引擎空转期间还能收到控制帧」的唯一途径 |
 | `f:read()` 的阻塞读 + buffer | `file_stream.cpp` | 切片 `select`（≤250 ms）、每片查 `exec_guard`、stale 帧丢弃、`cancel_notify` |
-| `--json` | `launcher.cpp`（选项 → boot）→ `main.cpp` → `output.cpp` | 契约：`{"ok","exit","canceled","detached","pid","stdout","stderr","images","result"}`；`--out=<path>` 写同一份 JSON。❗legacy 变体是 GBK 执行字符集 ⇒ 一律 UTF-8 + `\uXXXX` 转义非 ASCII |
-| `--remote` / `--pid` / `--pid=pick` | `boot.h`（ABI **2 → 3**：`remote_*`、`pid`、`read_timeout`、`max_frame`）→ `launcher.cpp` → 模块新增 `client.cpp` | 落点在模块（launcher 不链 winsock）；client 用现成的 local 文件后端 |
+| `--json` | `launcher.cpp`（选项 → boot，ABI **2 → 3**：`json_mode` / `json_out`，T1 已用）→ `main.cpp` → `output.cpp` | 契约：`{"ok","exit","canceled","detached","pid","stdout","stderr","images","result"}`；`--out=<path>` 写同一份 JSON。❗legacy 变体是 GBK 执行字符集 ⇒ 一律 UTF-8 + `\uXXXX` 转义非 ASCII（`AGENTS.md` §12.6） |
+| `--remote` / `--pid` / `--pid=pick` | `boot.h`（ABI **3 → 4**：`remote_*`、`pid`、`read_timeout`、`max_frame`；T1 已把 ABI 用到 3）→ `launcher.cpp` → 模块新增 `client.cpp` | 落点在模块（launcher 不链 winsock）；client 用现成的 local 文件后端 |
 | `--server-*` 口径 | `AGENTS.md` §12.1 | `--server-read-timeout`（默认 **5000 ms**，单次文件操作）与 `--server-timeout`（整次执行 wall-clock）分开；`--server-max-body` → `--server-max-frame`；`--server-queue` 保留（执行连接队列）；D21 的认证默认不变，token 走握手帧；前缀保留 `--server-`，client 侧新增 `--remote` |
 | `gui.pick()` | `src/core/gui.cpp` + `gui_bindings.cpp` | 新名字，不动 29 契约名 |
 | nvim（独立仓库，单独提交） | `nvim/lua/autodbg/*` | `http.lua`、`effects.lua`、chunked 半边删；`modeline.lua` 加 `pid=`；`:AutoDbgKill` / `:AutoDbgDetach` / `:AutoDbgPick` 新增；`addons/.../file_io.lua` 与 `lualib.lua`（`mcp` / `effects` 全局声明）同步；`snippets.lua` 的 `adfile` 片段重写 |
@@ -199,7 +199,7 @@ D43 说「每次调用无状态」，所以**不能有隐形状态**：「记住
 
 1. **T1 `--json`**（与传输无关，是 `structuredContent` 的唯一替代；先做它）。
 2. **T2 双向帧 + 握手**（`read_req` / `ack` / `info` / `end` / `control`）。这一轮先把 `stream.*` 做成传输无关的核。
-3. **T3 `--remote`**（一次 ABI 变更把 `remote_*` / `pid` / `read_timeout` / `max_frame` 一起加进去，不要分两次）。
+3. **T3 `--remote`**（一次 ABI 变更把 `remote_*` / `pid` / `read_timeout` / `max_frame` 一起加进去，不要分两次；ABI **3 → 4**，因为 T1 已经用 3）。
 4. **T4 `open_file():read` 的阻塞语义** + buffer + stale 帧 + `cancel_notify` + `gui.pick()`；跑通「回调里阻塞读 → 超时返回 `nil,"timeout"` → 断点继续」。
 5. **T5 删除**：`http.*` / `mcp.lua` / `effects.lua` / base64 / 协程执行器 / 会话表 / `yield_blocker` / nvim 的 `http.lua` + chunked 半边。**必须排在 T2/T4 之后**，否则 `open_file` 在回调里写/读的能力会先失去。
 6. **T6 agent 文档**：`tools/agent/autodbg-skill/SKILL.md`（Agent Skills 格式）+ 三五个 recipe。在 CLI 口径下这份 markdown 是**唯一契约文档**，不是锦上添花 —— `autodbg_api.lua` 的内容搬过去，否则模型只能靠训练数据猜参数形状（就是 S12 复发）。

@@ -47,6 +47,14 @@ bool guard_should_stop();
 /* guard_none / guard_cancel / guard_timeout（给响应里的 canceled / timed_out 用） */
 int guard_stop_reason();
 
+/* T1（D50）：`detached` 的口径 —— 只有「目标真的存活」才算 true（D47 的前置：真 detach
+ *   时 pid 不变、可被下一次 Attach 复用）。置位点只在绑定层：`Detach()`（且引擎能不终止）
+ *   与 `on_wait_timeout` 返回 2；被终止（action 1 / Kill）必须 false。
+ * ❗本地 CLI（非 server）不走 `guard_exec_begin`，所以这份状态是**进程级**的：
+ *   一个进程只跑一个脚本，不需要重置。 */
+void guard_mark_detached(bool target_alive);
+int  guard_detached();
+
 /* 停止原因的可读文本（给 Lua 错误信息用，ASCII） */
 const char *guard_stop_message();
 

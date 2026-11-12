@@ -10,14 +10,27 @@
  *   ③ **`generate_templete()` 已删除**：原先生成在脚本目录旁的 `cdebugger.d.lua` +
  *      `.luarc.json` 改由编辑器侧提供（neovim 插件的 LuaLS 注解库，见插件仓库的
  *      `addons/autodbg/` 与 `lua/autodbg/lsp.lua`）。模块因此不再往脚本目录写文件。
+ * T1（D50）的两处新行为（都只在 `--json` 模式走，非 JSON 模式逐字节不变）：
+ *   ④ 可选出参 `result_json`：`lua_close` **之前**把脚本的 `return` 值交给烘焙的
+ *      `jsonx.encode`（C 侧不写 JSON parser，D28），拷贝成调用方可用的片段；
+ *      1 个值 → 该值、0 个 → `null`、多个 → 数组；编不了（function / 无 `val` 的
+ *      userdata / 稀疏表 / NaN / 循环引用）→ `null`（pcall 包住，不打断脚本）。
+ *   ⑤ `print` 覆写（`output.hpp`）只在有收集器时装：`--json` 要求 stdout 只有一行
+ *      JSON，所以 `print` 必须进缓冲。
+ *   ⑥ 报错文本的长度：两处 `utf8_to_utf16_n` 的入参刻意**不加** `+1` —— `n` 是
+ *      `lua_tolstring` 给的不含 NUL 的字节数，加 1 会把 0x00 当成一个宽字符写出去
+ *      （`--json` 的 `stderr` 里就是 `\u0000`）。这是 T1 门禁暴露出来的旧缺陷。
  * ========================================================================== */
 #include "state.hpp"
 
 #include "registry.hpp" /* register_lua_api（P4.2 搬出） */
 
+#include "output.hpp"   /* T1（D50）：print 覆写（`--json` 要求 stdout 只有一行 JSON） */
+
 #include "core/types.hpp" /* MAX_FILEPATH / TCHAR（类型统一后只有这一份） */
 #include "core/util.hpp"
 
+#include "common/allocator.hpp" /* T1（D50）：result 片段的拷贝 */
 #include "common/handle.hpp" /* P6.1：HANDLE RAII */
 
 #include <intrin.h> /* ZeroMem/CopyMem 宏（__stosb/__movsb）——`RemoveAllFiles` 用到 */
@@ -202,6 +215,69 @@ int lua_reset_dir(lua_State *L)
     return 1;
 }
 
+/* =============================================================================
+ * encode_returns —— T1（D50）：把 pcall 的返回值交给烘焙的 `jsonx.encode`
+ *
+ * 口径（plan_cli.md D28 / D50）：C 侧不写 JSON parser ——序列化在 Lua 层，这里只是
+ *   `jsonx.encode` 的调用点 + 把结果拷出 `lua_State`（`lua_close` 后仍有效）。
+ *   · 1 个返回值 → 那个值；0 个 → `null`；多个 → 数组（造一个顺序表让 jsonx 按数组编）；
+ *   · 编不了（function / 无 `val` 的 userdata / 稀疏表 / NaN / 循环引用）→ `null`：
+ *     `pcall` 包住，不把 Lua 错误抛出去（不打断脚本）——不改 `jsonx` 本身。
+ * 返回的缓冲区由调用方 `common::release`。
+ * ========================================================================== */
+static const char *copy_json_fragment(const char *s, size_t n)
+{
+    char *buf = (char *)autodbg::common::alloc(n + 1);
+    for (size_t i = 0; i < n; i++)
+        buf[i] = s[i];
+    buf[n] = '\0';
+    return buf;
+}
+
+static const char *encode_returns(lua_State *L, int base)
+{
+    int n = lua_gettop(L) - base;
+    if (n <= 0)
+        return copy_json_fragment("null", 4);
+
+    int start = lua_gettop(L);
+
+    lua_getglobal(L, "jsonx");
+    if (lua_istable(L, -1))
+        lua_getfield(L, -1, "encode");
+    if (!lua_isfunction(L, -1))
+    {
+        lua_settop(L, start);
+        return copy_json_fragment("null", 4);
+    }
+
+    if (n == 1)
+    {
+        lua_pushvalue(L, base + 1);
+    }
+    else
+    {
+        lua_createtable(L, n, 0);
+        for (int i = 0; i < n; i++)
+        {
+            lua_pushvalue(L, base + 1 + i);
+            lua_rawseti(L, -2, i + 1);
+        }
+    }
+
+    if (lua_pcall(L, 1, 1, 0) != 0)
+    {
+        lua_settop(L, start);
+        return copy_json_fragment("null", 4);
+    }
+
+    size_t      len = 0;
+    const char *s   = lua_tolstring(L, -1, &len);
+    const char *out = (s != nullptr) ? copy_json_fragment(s, len) : copy_json_fragment("null", 4);
+    lua_settop(L, start);
+    return out;
+}
+
 /* 从 `_tmain` 搬来的引导 + 运行段（逐字；只把整段收进一个函数） */
 /* =============================================================================
  * create_state_with_libs —— 建状态 → 注册 API → 烘焙内核库（S0，`plan_server.md` §5.1）
@@ -228,7 +304,9 @@ lua_State *create_state_with_libs(void)
             size_t n;
             LPCSTR err = lua_tolstring(L, -1, &n);
 #ifdef _UNICODE
-            int    nn   = (int)n + 1;
+            /* ❗不要 +1：`utf8_to_utf16_n` 的入参是**不含** NUL 的字节数；多给一个字节会把
+             * 0x00 也算成一个宽字符 → NUL 被写进输出（`--json` 信封里表现为 `\u0000`） */
+            int    nn   = (int)n;
             LPWSTR werr = utf8_to_utf16_n(err, &nn);
             ErrorN(werr, nn);
             free_(werr);
@@ -248,7 +326,7 @@ lua_State *create_state_with_libs(void)
     return L;
 }
 
-int run_script_file(int argc, LPTSTR argv[])
+int run_script_file(int argc, LPTSTR argv[], const char **result_json)
 {
     lua_State *L = create_state_with_libs();
     if (L == nullptr)
@@ -256,6 +334,13 @@ int run_script_file(int argc, LPTSTR argv[])
         ErrorS(TEXT("luaL_newstate 失败\n"));
         return -1;
     }
+
+    /* T1（D50）：`--json` 要求 stdout 只有一行 JSON，所以 `print` 必须进收集器。
+     * 非 JSON 的本地模式 `output_active()` 是 false → 这里不会执行（行为逐字节不变）。 */
+    if (autodbg::host::output_active())
+        autodbg::host::install_print_override(L);
+
+    int base = lua_gettop(L);   /* T1（D50）：返回值的基准（push 脚本参数之前的栈顶） */
 
     int r = my_loadfile(L, g_wfilepath);
     if (r > 0)
@@ -274,6 +359,11 @@ int run_script_file(int argc, LPTSTR argv[])
 #endif
         }
         r = lua_pcall(L, argc > 2 ? argc - 2 : 0, LUA_MULTRET, 0);
+
+        /* T1（D50）：只在调用方要（= JSON 模式）时编；NULL → 与旧实现逐字节一致 */
+        if (result_json != nullptr)
+            *result_json = (r == 0) ? encode_returns(L, base) : copy_json_fragment("null", 4);
+
         if (r > 0)
             ErrorS(L"运行\"");
     }
@@ -284,7 +374,8 @@ int run_script_file(int argc, LPTSTR argv[])
         size_t n;
         LPCSTR err = lua_tolstring(L, -1, &n);
 #ifdef _UNICODE
-        int    nn   = (int)n + 1;
+        /* ❗不要 +1：同 `create_state_with_libs` 的字节码段 —— NUL 不算一个字符（见那里的注释） */
+        int    nn   = (int)n;
         LPWSTR werr = utf8_to_utf16_n(err, &nn);
         ErrorN(werr, nn);
         free_(werr);

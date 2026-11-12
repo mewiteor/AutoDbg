@@ -63,6 +63,19 @@ bool output_sink_active()
     return g_output_sink != nullptr;
 }
 
+/* T1（D50）：子进程 std 句柄策略（详见 util.hpp 的注释） */
+static bool g_child_stdio_capture = false;
+
+void set_child_stdio_capture(bool enable)
+{
+    g_child_stdio_capture = enable;
+}
+
+bool child_stdio_capture()
+{
+    return g_child_stdio_capture;
+}
+
 /* STD_ERROR_HANDLE → 2，其余 → 1（与 plan_server.md §4.5 的 stdout/stderr 对应） */
 static int output_stream_of(DWORD handle)
 {

@@ -8,6 +8,12 @@
  *   · 任何一次写入越界 → 置 `m_overflow` 并**放弃后续写入**（已写入部分保持合法前缀）；
  *   · 字符串转义按 RFC 8259：`"` / `\` / 控制字符（< 0x20，用 `\u00XX` 与短转义）；
  *     非 ASCII 字节**原样输出**（项目内一律 UTF-8，`jsonx` 也是这个口径）。
+ * T1（D50）的全转义出口（`string_escaped` / `raw_escaped`）——新增，不改 `string()` 的口径：
+ *   · 非 ASCII 一律 `\uXXXX` ⇒ 输出纯 ASCII（详见 `json_writer.hpp` 的文件头）；
+ *   · 优先按 UTF-8 解码；非法 UTF-8 的高位字节串按 **CP936** 整段解（legacy 变体的执行字符集）；
+ *   · ❗降级：CP936 解不出（函数取不到 / 分配失败）时逐字节 `\u00XX` —— JSON 仍然合法，
+ *     但读回的是字节值而不是字符。转换用**既有静态导入**（`MultiByteToWideChar`，w95 白名单内），
+ *     不走 dynapi：dynapi 不会减少导入，反而可能把已放行的导入变成新的。
  * ========================================================================== */
 #include "json_writer.hpp"
 
@@ -15,18 +21,244 @@
 #include "dbl2str.h" /* Ryu：最短且可精确回读的 double → 字符串 */
 
 #include <string.h> /* memcpy（影子头 → msvcrt.dll） */
+#include <windows.h> /* MultiByteToWideChar / WideCharToMultiByte（**既有**静态导入，w95 白名单内） */
 
 namespace autodbg::common
 {
 namespace
 {
-constexpr size_t k_default_cap = 256;
+constexpr size_t   k_default_cap = 256;
+constexpr unsigned k_cp936       = 936;   /* 项目里 legacy 变体的执行字符集（/execution-charset:gbk） */
+constexpr unsigned long k_undecoded = 0xFFFFFFFFu;
 
 inline bool is_control(unsigned char c)
 {
     return c < 0x20;
 }
+
+/* UTF-8 序列长度（按首字节）；不是合法起始字节返回 0 */
+size_t utf8_seq_len(unsigned char c)
+{
+    if (c >= 0xC0 && c <= 0xDF) return 2;
+    if (c >= 0xE0 && c <= 0xEF) return 3;
+    if (c >= 0xF0 && c <= 0xF4) return 4;   /* 0xF5.. 超出 Unicode 范围 */
+    return 0;
+}
+
+/* 解 `s[i]` 起的一个 UTF-8 序列；失败（含前导字节/超出 BMP 平面之上的合法范围）返回 k_undecoded */
+unsigned long utf8_decode(const char *s, size_t n, size_t i, size_t *consumed)
+{
+    *consumed = 0;
+    size_t len = utf8_seq_len((unsigned char)s[i]);
+    if (len == 0 || i + len > n)
+        return k_undecoded;
+
+    unsigned long cp = (unsigned long)((unsigned char)s[i] & (0xFFu >> (len + 1)));
+    for (size_t k = 1; k < len; k++)
+    {
+        unsigned char b = (unsigned char)s[i + k];
+        if ((b & 0xC0u) != 0x80u)
+            return k_undecoded;
+        cp = (cp << 6) | (unsigned long)(b & 0x3Fu);
+    }
+
+    /* 前导字节（overlong）与代理区（UTF-8 不允许直接编）都算非法 */
+    unsigned long lowest = (len == 2) ? 0x80u : (len == 3) ? 0x800u : 0x10000u;
+    if (cp < lowest || cp > 0x10FFFFu || (cp >= 0xD800u && cp <= 0xDFFFu))
+        return k_undecoded;
+
+    *consumed = len;
+    return cp;
+}
 } /* namespace */
+
+/* `\uXXXX`（码点 > 0xFFFF 时写代理对） */
+void json_writer::put_codepoint(unsigned long cp) noexcept
+{
+    static const char k_hex[] = "0123456789abcdef";
+
+    unsigned long unit = cp;
+    if (cp > 0xFFFFu)
+    {
+        unsigned long x = cp - 0x10000u;
+        unit = 0xD800u + (x >> 10);
+    }
+
+    char esc[6];
+    esc[0] = '\\';
+    esc[1] = 'u';
+    esc[2] = k_hex[(unit >> 12) & 0xF];
+    esc[3] = k_hex[(unit >> 8) & 0xF];
+    esc[4] = k_hex[(unit >> 4) & 0xF];
+    esc[5] = k_hex[unit & 0xF];
+    put(esc, 6);
+
+    if (cp <= 0xFFFFu)
+        return;
+
+    unsigned long x = cp - 0x10000u;
+    unsigned long low = 0xDC00u + (x & 0x3FFu);
+    char esc2[6];
+    esc2[0] = '\\';
+    esc2[1] = 'u';
+    esc2[2] = k_hex[(low >> 12) & 0xF];
+    esc2[3] = k_hex[(low >> 8) & 0xF];
+    esc2[4] = k_hex[(low >> 4) & 0xF];
+    esc2[5] = k_hex[low & 0xF];
+    put(esc2, 6);
+}
+
+/* 一段**已知不是 UTF-8** 的高位字节串：按 CP936 整段解（GBK 字符可以是 1 或 2 字节）。
+ * 成功返回 true（已把每个码点写成 `\uXXXX`）；取不到函数或解不出 → false（调用方逐字节）。 */
+bool json_writer::put_escaped_cp936(const char *s, size_t n) noexcept
+{
+    if (n == 0)
+        return false;
+
+    wchar_t *w = (wchar_t *)alloc(n * sizeof(wchar_t));
+    if (w == nullptr)
+        return false;
+
+    int wn = MultiByteToWideChar(k_cp936, 0, s, (int)n, w, (int)n);
+    if (wn <= 0)
+    {
+        release(w);
+        return false;
+    }
+    for (int i = 0; i < wn; i++)
+        put_codepoint((unsigned long)w[i]);
+
+    release(w);
+    return true;
+}
+
+/* 一个非 ASCII 单元：优先按 UTF-8 解；非法则把从 i 起的极大高位字节串整段按 CP936 解；
+ * 取不到函数或解不出就逐字节 `\u00XX`（降级）。返回消耗的字节数（>= 1）。 */
+size_t json_writer::put_nonascii_unit(const char *s, size_t n, size_t i) noexcept
+{
+    static const char k_hex[] = "0123456789abcdef";
+
+    size_t used = 0;
+    unsigned long cp = utf8_decode(s, n, i, &used);
+    if (cp != k_undecoded)
+    {
+        put_codepoint(cp);
+        return used;
+    }
+
+    size_t run = i;
+    while (run < n && (unsigned char)s[run] >= 0x80u)
+        run++;
+    if (put_escaped_cp936(s + i, run - i))
+        return run - i;
+
+    char esc[6];
+    esc[0] = '\\';
+    esc[1] = 'u';
+    esc[2] = '0';
+    esc[3] = '0';
+    esc[4] = k_hex[((unsigned char)s[i] >> 4) & 0xF];
+    esc[5] = k_hex[(unsigned char)s[i] & 0xF];
+    put(esc, 6);
+    return 1;
+}
+
+/* 全转义：控制字符照旧，非 ASCII 一律 `\uXXXX`（所以输出纯 ASCII） */
+void json_writer::put_escaped_full(const char *s, size_t n) noexcept
+{
+    static const char k_hex[] = "0123456789abcdef";
+
+    for (size_t i = 0; i < n; )
+    {
+        unsigned char c = (unsigned char)s[i];
+        if (c < 0x80u)
+        {
+            switch (c)
+            {
+            case '"': put("\\\"", 2); break;
+            case '\\': put("\\\\", 2); break;
+            case '\b': put("\\b", 2); break;
+            case '\f': put("\\f", 2); break;
+            case '\n': put("\\n", 2); break;
+            case '\r': put("\\r", 2); break;
+            case '\t': put("\\t", 2); break;
+            default:
+                if (is_control(c))
+                {
+                    char esc[6];
+                    esc[0] = '\\';
+                    esc[1] = 'u';
+                    esc[2] = '0';
+                    esc[3] = '0';
+                    esc[4] = k_hex[(c >> 4) & 0xF];
+                    esc[5] = k_hex[c & 0xF];
+                    put(esc, 6);
+                }
+                else
+                {
+                    put((char)c);
+                }
+                break;
+            }
+            i++;
+            continue;
+        }
+
+        i += put_nonascii_unit(s, n, i);
+    }
+}
+
+/* 只转非 ASCII（raw 片段用）：结构字符（`"` / `\` / 括号）原样保留，否则片段就不是 JSON。
+ * jsonx 的输出总是合法 JSON，所以高位字节只可能出现在串内 —— 写成 `\uXXXX` 不改变值。 */
+void json_writer::put_escaped_nonascii(const char *s, size_t n) noexcept
+{
+    size_t i = 0;
+    while (i < n)
+    {
+        unsigned char c = (unsigned char)s[i];
+        if (c < 0x80u)
+        {
+            put((char)c);
+            i++;
+            continue;
+        }
+        i += put_nonascii_unit(s, n, i);
+    }
+}
+
+void json_writer::string_escaped(const char *s) noexcept
+{
+    if (s == nullptr)
+    {
+        null_value();
+        return;
+    }
+    string_escaped(s, strlen(s));
+}
+
+void json_writer::string_escaped(const char *s, size_t n) noexcept
+{
+    if (s == nullptr)
+    {
+        null_value();
+        return;
+    }
+    before_value();
+    put('"');
+    put_escaped_full(s, n);
+    put('"');
+}
+
+void json_writer::raw_escaped(const char *json, size_t n) noexcept
+{
+    if (json == nullptr || n == 0)
+    {
+        null_value();
+        return;
+    }
+    before_value();
+    put_escaped_nonascii(json, n);
+}
 
 json_writer::json_writer() noexcept : json_writer(k_default_cap) {}
 

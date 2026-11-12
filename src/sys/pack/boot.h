@@ -11,10 +11,12 @@
  *   - **纯 C 头**（两侧都 include，DLL 侧是 C++ 但按 C 布局用）；字段顺序/类型一字不改。
  *   - 只加字段不改语义时 `abi` 也要加 1：旧启动器配新 DLL 会因 `size` 不符被拒，
  *     但我们要的是「明确拒绝」而不是「读到半个结构」。
+ *   - 版本号占用：1 = 初版，2 = S0（server / selftest，D27），**3 = T1（`--json` / `--out`，D50）**；
+ *     `plan_cli.md` §4 的 T3（`--remote` / `pid` / `read_timeout` / `max_frame`）因此从 3 起跳 → **4**。
  *   - 所有指针由启动器填、DLL 只读。
  * ========================================================================== */
 
-#define AUTODBG_ABI_VERSION 2u
+#define AUTODBG_ABI_VERSION 3u
 
 typedef struct autodbg_boot
 {
@@ -42,6 +44,12 @@ typedef struct autodbg_boot
     unsigned server_timeout_sec; /* in : 单请求执行超时秒；0 = 不限 */
     const char *server_log;      /* in : 诊断日志路径；NULL = 不打 */
     unsigned server_no_echo;     /* in : 1 = 执行输出不回显到控制台 */
+    /* ---- ABI 3（T1，plan_cli.md D50）：机器可读结果信封 ----
+     * 仍是追加式（不改已有字段顺序）。`json_mode` = 1 时 stdout **只有一行 JSON**
+     * （`puts("done")` 与 `print` 的直接输出都被让位），`--out=<path>` 时那一行改写文件、
+     * stdout 留空。两个字段都允许只给其中一个：只给 `--out` 也算 JSON 模式（写文件）。 */
+    unsigned json_mode;          /* in : 1 = 生成 D50 的 JSON 信封（`--json` 或 `--out`） */
+    const char *json_out;        /* in : `--out=<path>` 的路径（CP936 字节；NULL = 只打 stdout） */
 } autodbg_boot;
 
 /* DLL 必须导出的唯一入口（C 链接，__cdecl）：返回码即进程退出码 */
