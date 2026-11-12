@@ -45,6 +45,10 @@
 - ❗引号口径必须与 `autodbg_split_cmdline_a/w` 一致（child 不用 CRT 拆 argv）——这是最容易出 bug 的地方。
 - `GetModuleFileName(NULL)` 在 child 里是 tmpdir 路径 ⇒ 脚本相对路径基准变（§11.5 第 5 条是**想要的**语义）⇒ 必须显式把原始 exe 目录传过去（建议 `--base-dir=<dir>` → `boot.base_dir`）。
 - handoff 后 child 不得弹对话框（脚本路径已由主 exe 选定，D7 归主 exe）。
+- `-h` / `--list` / `--version` **归主 exe，不触发 handoff**。但 `arch` 的口径必须是「执行脚本的那个进程」⇒ 主 exe 要按 host 算（64 位 host → `x64`，32 位 host → `x86`）；`proto`/`abi` 是同一份 build 的常量 ⇒ 两边必须一致。❗必须有对照断言 `version.parity.main-vs-exec`（同一 build、同一脚本，主 exe 报的 == child 报的）——同一份源码但编译口径不同（legacy 的 ANSI/GBK vs modern 的 UNICODE），分叉只能靠断言挡。
+- `--version` 不触发落盘 ⇒ 它在只读目录/无权限目录上也能跑（它是出问题时第一个跑的诊断命令）→ 断言 `version.no-extract`。
+- `--list` 要能区分「可映射的模块」与「blob 条目」→ manifest 加 `kind`（`module` / `exec`），断言 `list.blob-entry-kind`。
+- `--base-dir` 走 **env var**（`AUTODBG_BASE_DIR`）：handoff 是进程边界，不是 `boot` 契约 ⇒ 不占 boot 字段 ⇒ 不与 T7.5 的 `repl_mode` bump 撞车。落点：launcher 解析 `--base-dir` → 设 env → 模块读 env（`Get/SetEnvironmentVariableA` 全 w95 有），要在 `AGENTS.md` §11.3 写明这一条例外。
 
 ---
 
@@ -86,7 +90,7 @@
 | 新 | 命令行 / 退出码 | 引导器透传命令行（引号口径 = `autodbg_split_cmdline_a/w`）+ 透传退出码 + 不写 stdout |
 | 新 | 脚本相对路径基准 | 显式传原始 exe 目录（`--base-dir`）→ `boot` 加字段 |
 
-❗**ABI 撞车**：T7 要 `repl_mode`（4 → 5），本方案要 `base_dir` ⇒ 必须一次 bump 加两个字段，或排好顺序。`e2e_tcp.ps1` 的 `client.version-abi` 与 `nvim_smoke.lua` 的 `version.abi` 会跟着改。
+❗**ABI**：`base_dir` 走 env var 后不占 boot 字段 ⇒ 唯一的 bump 是 T7.5 的 `repl_mode`（4 → 5）。`e2e_tcp.ps1` 的 `client.version-abi` 与 `nvim_smoke.lua` 的 `version.abi` 会跟着改。
 
 ---
 
@@ -100,8 +104,11 @@ handoff.identical-no-rewrite     build 串一致 → 不清写；被锁 → 明�
 handoff.job-kill-on-close        主 exe 被强杀 → child 不留
 handoff.job-nested-fails-clean   已在 job 里 → 干净降级（不报错退 2）
 handoff.no-dialog                handoff 后 child 不弹对话框
-handoff.script-relative-base     --base-dir 生效（脚本相对路径解析到原始目录）
+handoff.script-relative-base     env（或 --base-dir）生效，脚本相对路径解析到原始目录
 handoff.ro-media                 只读/无权限目录 → 明确报错（case 23 的口径从「只影响对话框」升级）
+version.no-extract               --version 不触发落盘（只读目录上也能跑）
+version.parity.main-vs-exec      主 exe 报的 arch/proto/abi == child 报的
+list.blob-entry-kind             --list 能区分 module / exec
 boot.no-wow64-branch             98 上：dynapi 取不到 → 不 exec（这是 9x 唯一能覆盖的 handoff 断言）
 boot.is-x86                      主 exe 必须是 32 位 PE（便携性前提）
 handoff.non-exe-name             CreateProcess 按 PE 头判断、不看扩展名（若用 `.bin` 必须先实测）
@@ -111,10 +118,10 @@ handoff.non-exe-name             CreateProcess 按 PE 头判断、不看扩展�
 
 ## 7. 待确认
 
-1. `--version` / `--list` / `-h` 归谁：引导器只能报自己那部分（arch、build 串），`proto`/`abi` 是 child 的 ⇒ 要么 `--version` 也走 handoff（要为它落盘），要么把 `arch`/`abi` 重新定义为「执行脚本的那个进程」，引导器另加一个 `bootstrapper` 字段。
+1. ~~`--version` / `--list` / `-h` 归谁~~ —— 已定：全部归主 exe（见 `§2` 第 6–8 条）；`arch` 按 host 算，靠 `version.parity.main-vs-exec` 挡分叉。剩下的只是「主 exe 自己算 flavor 时读脚本文件」这条与 D7/D10 的口径要不要写在一起（建议写：flavor 选择归主 exe，child 收到的是已选定的结果——但 child 是独立可跑的产物，所以它必须能自己算 ⇒ 两边算法必须同源，这是 `version.parity` 断言存在的原因）。
 2. 同目录伙伴文件优先还是永远 tmpdir：已定 tmpdir；「同目录已有且 build 串一致就直接 exec」能省一次写与一次锁风险 ⇒ 要不要作为例外（建议不，保持路径单一）。
 3. `adbg64.bin` 的扩展名（要实测）+ `scan_dir.py` 要不要加 `.bin`。
-4. `--base-dir` 走 CLI 还是 env var（`Set/GetEnvironmentVariableA` 全 w95 有）；建议 CLI（进 usage、可断言）。
+4. `--base-dir` 已定走 env var（不占 boot 字段）；剩下的只是 env 名字的大小写与 `AGENTS.md` §11.3 的例外描述。
 5. `--module-dir` 在 handoff 时的语义（要透传；child 的模块来自落盘文件）。
 6. job 是否值得做（正常路径靠 wait 已保证；job 只覆盖「主 exe 被强杀」这一种）。
 7. 落盘文件的复用口径：同一 build 串能否跨进程共享（两个主 exe 实例）→ 只读共享还是加锁。
