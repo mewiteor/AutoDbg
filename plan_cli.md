@@ -242,6 +242,10 @@ D43 说「每次调用无状态」，所以**不能有隐形状态**：「记住
    ⏳ **剩下**：`nvim/`（子模块、独立仓）的 `http.lua` / `effects.lua` / chunked 半边 ——
    随插件改到 raw TCP 客户端时在它自己的仓里删，并恢复一份 `nvim_smoke` 等价门禁。
 6. **T6 agent 文档**：`tools/agent/autodbg-skill/SKILL.md`（Agent Skills 格式）+ 三五个 recipe。在 CLI 口径下这份 markdown 是**唯一契约文档**，不是锦上添花 —— `autodbg_api.lua` 的内容搬过去，否则模型只能靠训练数据猜参数形状（就是 S12 复发）。
+   ✅ **已完成**：`tools/agent/autodbg-skill/`（`SKILL.md` + `references/{cli,lua-api,pitfalls}.md` +
+   `recipes/{run-and-break,attach-existing,scan-and-patch,gui-automation,remote-agent}.md` + `README.md`）。
+   `lua-api.md` 的正文从 `09174da:lualib/autodbg_api.lua` 用脚本按 topic 搬出来（不是手抄），
+   并按 T5 的新口径改写了 `files` 段（`read_file`/`write_file` → `open_file` 文件对象）。
 7. **T7（可选，独立立项）**引擎 `begin/pump/continue` + `--repl`。D45 之后它不再是文件读的前提，但「不靠回调、看着目标跑」仍然需要它。
 
 ---

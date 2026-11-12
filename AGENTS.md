@@ -102,6 +102,7 @@ make.bat i <dir>         :: 指定输出目录（默认 .out）
 | GUI 自动化（本地） | `pwsh tools/server_test/e2e_gui.ps1 -Render <64\|86> [-Variant legacy]` | 起一个 `gui_target.ps1` 靶子窗口，用**本地 CLI** 跑 `gui.*` 脚本断言（屏幕/窗口/控件/截图/`gui.pick`）；`-AllowInput` 才跑会动真鼠标/键盘的用例。T5 之前它走 HTTP `/run`，现已改成本地（`gui.*` 与传输无关，21 条断言） |
 | raw TCP 帧（T2/T3/T4/D42） | `pwsh tools/server_test/e2e_tcp.ps1 -Render <64\|86> [-Variant legacy]` | `--server=tcp`：握手帧（`id` = 协议版本、`data` = token）→ `info`；版本不符 / 首帧非握手 / 错 token 的 `error` 帧；`script` → `out`+`result`+`end`；`control` 的 health / version / cancel / 未知 / shutdown；**执行期的 control**（Lua 死循环 + 引擎空转）；**`--remote` 客户端**（跑脚本 / `--json` 信封 / 语法错误 / health / version / 另一个进程的 `--cancel`）；**`open_file` 读向**（远程 open 应答、read/tell/seek/lines 字节与位置语义、等回包超时 → `nil,"timeout"` 且脚本继续）。41 条断言，legacy 同样必须真过 |
 | JSON 信封（T1/D50） | `pwsh tools/server_test/e2e_json.ps1 -Render <64\|86> [-Variant legacy]` | 本地模式 `--json` / `--out=<path>`：那一行 JSON 独占 stdout、字段齐全、`result` / `pid` / `detached` / `images` 口径、`--json` 与 `--server` 互斥（退出码 2）、退出码口径不变；那一行必须**纯 ASCII**（CP936 → UTF-8 或逐字节降级）。`-Variant legacy` **必须真过**（这段就是用来暴露 GBK 的） |
+| agent 技能包（T6） | `pwsh tools/agent/check_skill.ps1 -Render <64\|86>` | `tools/agent/autodbg-skill/` 是 CLI 口径下的**唯一对外契约文档**：检查 `SKILL.md` 的 frontmatter（`name` / `description`）并把每个 `.md` 里的 ` ```lua ` 片段交给产物做语法检查（只解析不执行）。14 条断言 / 36 个 Lua 片段 |
 | Win9x 实机 | `pwsh tools/w9x_test/w9x.ps1 -Action check\|run\|record` | 需要 VMware 的 Win98 guest 与凭据（`tools/w9x_test/config.local.ps1`，已 gitignore）；**没有 VM / 凭据时 SKIP（exit 0）**。矩阵与剩余项见 `plan_p7_win9x.md` |
 
 - 黄金输出在本仓库 `tests/golden/w9x/`（Win98 guest 的输出），行尾与比较口径见 D15（golden 统一 LF，比较走「CRLF→LF + 去末尾空行」归一化）。
@@ -188,6 +189,7 @@ tests/golden/w9x/    Win98 guest 的黄金输出
 | `plan_p7_win9x.md` | Win9x 实机测试的剩余工作（环境、通道、矩阵、编排器） |
 | `plan_server.md` | server / MCP / GUI / client 文件 I/O 的剩余工作 |
 | `nvim/README.md` | neovim 插件的安装、配置、命令与可编程 API |
+| `tools/agent/autodbg-skill/` | **面向 agent 的技能包**（Agent Skills 格式）：`SKILL.md` 入口 + `references/`（CLI / Lua API / 地雷）+ `recipes/`（5 个场景）。CLI 口径下的唯一对外契约文档 |
 | `make.bat` | 构建定义（ninja 生成器） |
 | 各文件头部注释 | 该文件的职责、来源、与旧实现的差异（第一手依据） |
 
@@ -409,7 +411,7 @@ payload              // 单条 LZMA 流：各模块原始字节按 entry 顺序�
 ### 12.3 MCP（已删除，D41）
 
 - HTTP + JSON-RPC 分发（`lualib/mcp.lua`）、会话表（`exec_session`）、`POST /mcp` 与 `--server=http`
-  已在 T5（D41）整体删除。原 `lua_api` 的正文随后进 `tools/agent/autodbg-skill/SKILL.md`（T6）。
+  已在 T5（D41）整体删除。原 `lua_api` 的正文已搬进 `tools/agent/autodbg-skill/references/lua-api.md`（T6）。
 - S12 的教训（每个对外接口都要有门禁断言）在帧命令面上继续适用：`control` / `read_req` 等
   每一条都有 `e2e_tcp.ps1` 的断言。
 
