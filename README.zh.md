@@ -24,9 +24,9 @@
 - **🪶 每个架构只有一个文件**  
   `.out/AutoDbg_86.exe` 覆盖 Win95 → Win11 32 位 × {Lua 5.5, LuaJIT} × {modern, legacy}；`.out/AutoDbg_64.exe` 覆盖 x64。模块以 LZMA 单流内嵌、内存映射加载——无需安装、不写临时文件。
 - **🌐 远程执行 / 编辑器内执行 / AI 就绪**  
-  `--server` 把同一个二进制变成 HTTP 服务（`POST /run` 直接执行**请求体里的 Lua 源码**并把输出随响应返回）；**neovim 插件**一键跑当前 buffer 并把结果显示在 scratch buffer；`POST /mcp` 提供 **MCP** 端点给 AI 代理用。
+  `--server=tcp` 把同一个二进制变成 **raw TCP 帧服务端**，`--remote=<host:port>` 就是它的客户端——脚本在目标机上跑，你可以在任何地方驱动。`--json` 返回一行机器可读信封，而且**任何**一次客户端调用都能 `--cancel` / `--kill` / `--detach` 一个正在跑的脚本。
 - **🖱️ GUI 自动化**  
-  `gui` 表（键鼠注入、窗口与控件枚举、PNG 截图）让脚本——或 AI——能在目标停下时直接操作它的界面。
+  `gui` 表（键鼠注入、窗口与控件枚举、PNG 截图）让脚本——或 AI——直接操作目标的界面。
 
 ---
 
@@ -35,15 +35,15 @@
 ```text
 AutoDbg_<arch>.exe        零 CRT 启动器 → payload (LZMA 单流) → 手工映射模块 → autodbg_run()
 ├─ src/core/              调试引擎（C++，禁 Lua）：会话、断点、内存、上下文、栈回溯、GUI 原语
-├─ src/scripting/lua/     唯一感知 lua_State 的层：29 个契约全局 + gui 表 + read_file/write_file
-│                         + server / exec / MCP 会话 / 输出捕获
-├─ src/common/            allocator、containers、dynapi、cmdline、net(winsock)、http、json、png、base64
+├─ src/scripting/lua/     唯一感知 lua_State 的层：29 个契约全局 + gui 表 + open_file
+│                         + tcp_server / client（raw TCP、--remote）/ exec_guard / 输出捕获
+├─ src/common/            allocator、containers、dynapi、cmdline、net(winsock)、frame、json、png、selftest
 └─ src/sys/               零 CRT 运行时：影子头、导入表 .def、MASM、LZMA、打包/映射、启动器
 ```
 
 - **核心引擎**（`src/core`）——Win32 调试主循环、软/硬件断点、内存与 PE 解析、线程上下文、栈回溯、PEB 反反调试。零脚本依赖。
-- **Lua 中间层**（`src/scripting/lua`）——用**同一套全局命名**同时绑定 Lua 5.5 与 LuaJIT；HTTP server、持久 MCP 会话与 `gui` 表也在这一层。
-- **客户端**——命令行（`AutoDbg_<arch>.exe script.lua`）、neovim 插件（`nvim/`，独立仓库）、`curl`、MCP 客户端。
+- **Lua 中间层**（`src/scripting/lua`）——用**同一套全局命名**同时绑定 Lua 5.5 与 LuaJIT；raw TCP 帧服务端、`--remote` 客户端与 `gui` 表也在这一层。
+- **客户端**——命令行（`AutoDbg_<arch>.exe script.lua`）、同一个二进制的服务端/客户端形态（`--server=tcp` / `--remote=`）、neovim 插件（`nvim/`，独立仓库）。
 
 ---
 
@@ -52,10 +52,10 @@ AutoDbg_<arch>.exe        零 CRT 启动器 → payload (LZMA 单流) → 手工
 - **断点**：INT3 软件断点、硬件断点 (DRx)，支持一次性断点与批量设置。
 - **深度系统感知**：PE 解析（节/导入/导出）、x86 与 x64 栈回溯（`StackWalk64` + `RUNTIME_FUNCTION` 兜底，全部动态取符号 → legacy 导入表保持干净）。
 - **反反调试**：PEB `BeingDebugged` / `NtGlobalFlag` 修补，modern 变体内置 **ScyllaHide** 集成（legacy 变体用 `/DNO_SCYLLA_HIDE` 编掉）。
-- **server 模式**：无状态 `POST /run`（源码从内存加载执行，**不落盘**）、`/cancel`（100 ms 粒度）、`/shutdown`、`/health`、`--server-token`（默认 loopback 免 token）。
-- **GUI 自动化**：`gui.position/move/click/write/press`、`gui.windows/find/activate/rect/children`、`gui.text/set_text/post/send`、`gui.screenshot`（PNG）。
-- **客户端文件 I/O**：`read_file`/`write_file` 读写的是**客户端**那台机器的磁盘；server 挂起协程、由客户端完成效果后恢复，二进制数据在远程会话里照样安全。
-- **MCP**：`POST /mcp` + `Mcp-Session-Id` 会话，12 个工具（`lua_eval`、给 AI 用的 `lua_api` 速查、`dbg_status`、GUI 原语）。
+- **server 模式（raw TCP 帧）**：一次调用 = 一段脚本，源码从内存加载执行、**不落盘**；握手帧带协议版本与 token；`--cancel`（硬）/ `--kill` / `--detach`（软）作用于「当前正在跑的那次执行」。
+- **GUI 自动化**：`gui.position/move/click/write/press`、`gui.windows/find/activate/rect/children`、`gui.text/set_text/post/send`、`gui.screenshot`（PNG），以及 `gui.pick()`（在目标机上按鼠标位置反查 pid）。
+- **客户端文件 I/O**：`open_file()` 返回 io 风格的文件对象；远程模式下字节就在**客户端**的磁盘上（帧里传原始字节）。`f:read()` 在调试回调里会阻塞等回包，超时返回 `nil, "timeout"` 而不是把会话搞崩。
+- **机器可读结果**：`--json` / `--out=<path>` 输出一行纯 ASCII JSON 信封——`ok`、`exit`、`canceled`、`detached`、`pid`、`stdout`、`stderr`、`images`、`result`（脚本的 `return` 值）。
 - **编辑器集成**：neovim 插件提供 `:AutoDbgRun`（buffer / 选区）、`:AutoDbgCancel`、`:AutoDbgHealth`，错误行进 quickfix。
 - **老系统支持**：x86 子系统版本改写为 4.0，所有 Win9x 风险符号走动态 API 层，静态导入门禁（`tools/api_check`）保证 legacy 导入表里没有 XP+ 符号。
 
@@ -68,6 +68,7 @@ AutoDbg_<arch>.exe        零 CRT 启动器 → payload (LZMA 单流) → 手工
 ```bat
 .out\AutoDbg_64.exe script.lua
 .out\AutoDbg_86.exe --flavor=luajit script.lua      :: 用 LuaJIT 而不是 Lua 5.5
+.out\AutoDbg_64.exe --json script.lua               :: stdout 只有一行 ASCII JSON
 .out\AutoDbg_64.exe --help                          :: 列出全部启动器选项
 .out\AutoDbg_64.exe --version                       :: 版本（git tag/commit）+ abi + 架构
 ```
@@ -82,7 +83,7 @@ Run({
             rva = FindFuncRva("kernel32.dll", "CreateFileW"),
             callback = function(info)
                 local ctx = GetContext(info.tid)          -- x86 与 x64 同名（Cax…Cip / R8…）
-                print(string.format("CreateFileW 命中, ip=0x%X", ctx.Cip))
+                print(string.format("CreateFileW 命中, ip=0x%X", ctx.Cip.val))
             end
         })
     end
@@ -91,116 +92,52 @@ Run({
 
 脚本首行也可以指定解释器：`--!lua` / `--!luajit`。
 
-### 远程执行（server 模式）
+### 远程执行（raw TCP）
 
 ```bat
-.out\AutoDbg_64.exe --server                       :: 127.0.0.1:8642，loopback 免 token
+:: 目标机上
+.out\AutoDbg_64.exe --server=tcp --server-port=8642 --server-no-echo
+
+:: 任意一台机器上
+.out\AutoDbg_64.exe --remote=127.0.0.1:8642 --json script.lua
+.out\AutoDbg_64.exe --remote=127.0.0.1:8642 --health      :: 忙不忙？
+.out\AutoDbg_64.exe --remote=127.0.0.1:8642 --cancel      :: 打断正在跑的脚本
+.out\AutoDbg_64.exe --remote=127.0.0.1:8642 --detach      :: 只结束当前 Attach，目标继续活着
 ```
 
-```bash
-curl -sS --data-binary @- -H 'Content-Type: text/x-lua' \
-     -H 'X-AutoDbg-Filename: buffer.lua' \
-     'http://127.0.0.1:8642/run?format=text' <<'LUA'
-print("hello from", _VERSION)
-LUA
-```
+客户端就是同一个二进制：握手（协议版本 + token）→ 把脚本用帧发过去 → 打印它的输出 → 用脚本的退出码退出。`open_file` 打开的文件在**客户端**那台机器上读写。loopback 免 token；非 loopback 监听必须给 token（`--server-token=auto` 会在启动横幅里打印）。
+
+> HTTP 传输（`--server=http`、`POST /run`、`/health`、MCP）已经删除：现在对外契约就是 CLI + 这些帧（`plan_cli.md` 的 D41/D42）。
 
 ### 在 neovim 里
 
 ```lua
-{ dir = "~/src/AutoDbg.nvim", config = function() require("autodbg").setup({ url = "http://127.0.0.1:8642" }) end }
+{ dir = "~/src/AutoDbg.nvim", config = function() require("autodbg").setup({}) end }
 ```
 
 然后 `:AutoDbgRun`（或 `:'<,'>AutoDbgRun`）。详见 [`nvim/README.md`](./nvim/README.md)。
 
-### 给 AI 代理（MCP）
+> 插件（独立仓库）正在从已删除的 HTTP 传输迁到 raw TCP 客户端；在此之前**本地模式**（机器上有 exe 时跑 `:AutoDbgRun`）照旧可用。
 
-`--server` 还会在同一个端口上开户 **MCP** 端点——把任何 MCP 客户端指向 `http://127.0.0.1:8642/mcp`：
+### 给 AI 代理
+
+代理通过 CLI 驱动 AutoDbg，拿回结构化结果：
 
 ```bat
-.out\AutoDbg_64.exe --server                         :: loopback，免 token（D21）
-.out\AutoDbg_64.exe --server --server-token=auto     :: 启动横幅里打印 token
-.out\AutoDbg_64.exe --server --server-addr=0.0.0.0:8642 --server-token=auto   :: 局域网：强制 token
+.out\AutoDbg_64.exe --json step1.lua                :: stdout 只有一行 ASCII JSON
+.out\AutoDbg_64.exe --out=result.json step1.lua     :: 同一份信封写文件
 ```
-
-传输是 MCP `2024-11-05` 的 **streamable HTTP** 子集：`POST /mcp` 携带一条（或一批）JSON-RPC 消息，
-会话用 `Mcp-Session-Id` 头表达（`initialize` 时由服务器返回，之后每次请求带上）；带
-`Accept: text/event-stream` 时回一个 chunked 的 `event: message` 单帧。方法：`initialize`、`ping`、
-`tools/list`、`tools/call`、通知。
-
-```bash
-curl -sS -X POST http://127.0.0.1:8642/mcp -H 'Content-Type: application/json' \
-  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05"}}'
-```
-
-12 个工具：`lua_eval`（一次调用 = 一次 Lua 执行）、`lua_api`（绑定速查，**让模型先调它**）、
-`dbg_status`、`gui_screenshot`、`gui_windows`、`gui_find`、`gui_click`、`gui_type`、`gui_press`、
-`gui_text`、`gui_set_text`、`gui_post`。因为 `Run`/`Attach` 会阻塞到目标退出或脚本 `Detach()`，
-整套调试场景要写在**一次 `lua_eval` 里**（`Run{ callback = function() ... end }`），而不是拆成
-多次交互式调用。
-
-#### MCP 客户端配置
-
-**Claude Code**
-
-```bash
-claude mcp add --transport http autodbg http://127.0.0.1:8642/mcp
-# 非 loopback / 显式 token：
-claude mcp add --transport http autodbg http://127.0.0.1:8642/mcp \
-       --header 'X-AutoDbg-Token: <token>'
-```
-
-**Cursor**（`~/.cursor/mcp.json`）
 
 ```json
-{
-  "mcpServers": {
-    "autodbg": {
-      "url": "http://127.0.0.1:8642/mcp",
-      "headers": { "X-AutoDbg-Token": "<token>" }
-    }
-  }
-}
+{"ok":true,"exit":0,"canceled":false,"detached":false,"pid":0,
+ "stdout":"...","stderr":"","images":[],"result":{"found":3}}
 ```
 
-**VS Code**（`.vscode/mcp.json`；注意键是 `servers` 且要写 `"type": "http"`）
+`result` 是脚本的 `return` 值，`images` 是它写过盘的文件，`pid` 是被调试进程（没附加时为 0）。
 
-```json
-{
-  "servers": {
-    "autodbg": {
-      "type": "http",
-      "url": "http://127.0.0.1:8642/mcp",
-      "headers": { "X-AutoDbg-Token": "<token>" }
-    }
-  }
-}
-```
+[`tools/agent/autodbg-skill/`](./tools/agent/autodbg-skill/) 是给 agent 的**契约文档**（Agent Skills 格式）：CLI 选项、`--json` 信封、每个 Lua 全局、5 个场景 recipe、以及最费时间的坑。让 agent 加载它即可（pi：`{ "skills": ["<repo>/tools/agent/autodbg-skill"] }`）。
 
-loopback 下把 `headers` 整段删掉即可（那里不校验 token）。服务器同时接受 `X-AutoDbg-Token: <token>`
-与标准的 `Authorization: Bearer <token>`，所以只支持 `Authorization` 头的客户端直接就能用。
-
-**只会 stdio 的客户端**（Claude Desktop、较旧的编辑器扩展）需要一个桥接，比如
-[`mcp-remote`](https://www.npmjs.com/package/mcp-remote)：
-
-```json
-{
-  "mcpServers": {
-    "autodbg": {
-      "command": "npx",
-      "args": ["-y", "mcp-remote", "http://127.0.0.1:8642/mcp"]
-    }
-  }
-}
-```
-
-**其它任意 MCP 客户端**——URL `http://<host>:8642/mcp`，HTTP 传输。要求：JSON-RPC 走 `POST`、
-把 `initialize` 返回的 `Mcp-Session-Id` 带回去、每个请求带 `Content-Length`（chunked 请求体
-返回 501）、body 不超 `--server-max-body`（默认 8 MB）。
-
-**有意不实现**的能力（客户端如果会探测，请按不支持配置）：`GET /mcp`（常驻 SSE 流 → `405`）、
-`DELETE /mcp`（显式关闭会话——空闲会话 30 min 回收，同时最多 8 个）、resources/prompts（未知
-方法 → `-32601`）、progress 通知。
+因为 `Run`/`Attach` 会阻塞到目标退出或脚本 `Detach()`，整套调试场景要写在**一段脚本里**（`Run{ callback = function() ... end }`），而不是拆成多次交互式调用。
 
 ---
 
@@ -209,17 +146,20 @@ loopback 下把 `headers` 整段删掉即可（那里不校验 token）。服务
 ### 已完成
 
 - [x] Win32 核心引擎：软/硬件断点、内存与 PE 解析、线程上下文、x64/x86 栈回溯。
-- [x] 同一份交付物同时支持 Lua 5.5 与 LuaJIT；29 个稳定全局名 + `Var` 元表。
-- [x] 单文件打包：2 个 exe 取代 6 个旧产物，模块内嵌 + 内存映射 + 变体回退。
-- [x] Win9x 静态导入门禁全绿（`tools/api_check`）；x86 子系统版本改写为 4.0。
-- [x] server 模式（HTTP 子集）、取消/超时、nvim 客户端（本地/远程自动选、脚本头标记、按架构的 LuaLS 补全、LuaSnip 片段）、GUI 自动化、MCP、客户端文件 I/O。
+- [x] 一个交付物同时支持 **Lua 5.5 与 LuaJIT**；29 个稳定全局名 + `Var` 元表。
+- [x] 单文件打包：2 个 exe 取代 6 个，内嵌模块、内存映射、变体回退。
+- [x] Win9x 静态导入门禁通过（`tools/api_check`）；x86 子系统版本改写为 4.0。
+- [x] CLI 契约：`--json` / `--out` 信封、raw TCP 服务端 + `--remote` 客户端、`--cancel` / `--kill` / `--detach`、`open_file` 读写（阻塞 RPC）、`gui.pick()`、agent 技能包。
+- [x] HTTP / MCP / effects 删除（D41/D43/D44）—— 只剩 CLI + 帧。
 
 ### 待完成
 
-- [ ] Win9x 实机验收（测试矩阵、编码、dynapi 降级路径）——见 `plan_p7_win9x.md`。
-- [ ] 增量流式（脚本执行中推 SSE 帧）、`GET /screenshot`、nvim 的纯 `vim.loop` 传输——见 `plan_server.md`。
-- [ ] PageGuard 内存断点、内存快照 / Scatter-Gather 批量读。
-- [ ] Python (`cffi`) 中间件、Linux `ptrace` HAL、Capstone/Unicorn 集成、`BsonDecode`。
+- [ ] Win9x 实机验证（矩阵、编码、dynapi 降级路径）—— 见 `plan_p7_win9x.md`。
+- [ ] neovim 插件：迁到 raw TCP 客户端并恢复 smoke 门禁。
+- [ ] `Attach`/`Run` 回调里的阻塞 `f:read()`：补「超时 → 回调返回 → 断点继续」的端到端用例。
+- [ ] 引擎 `begin/pump/continue` + `--repl`（T7，可选）—— 不用回调也能「看着目标跑」。
+- [ ] PageGuard 内存断点、内存快照 / 分散聚合读取。
+- [ ] Python (`cffi`) 中间层、Linux `ptrace` HAL、Capstone/Unicorn 集成、`BsonDecode`。
 
 ---
 
@@ -227,16 +167,18 @@ loopback 下把 `headers` 整段删掉即可（那里不校验 token）。服务
 
 | 文件 | 内容 |
 | --- | --- |
-| `AGENTS.md` | 构建、门禁、硬约束、风格、架构、打包 ABI、已定决策 |
-| `PITFALLS.md` | 已经踩过的坑（现象 → 根因 → 现在的做法） |
+| `AGENTS.md` | 构建、门禁、硬约束、代码风格、架构、打包 ABI、已定决策 |
+| `PITFALLS.md` | 已踩过的坑（现象 → 根因 → 现在的做法） |
+| `plan_cli.md` | 已拍板的 CLI + raw TCP 路线（D41–D50）与任务清单 |
 | `plan_p7_win9x.md` | Win9x 实机测试的剩余工作 |
-| `plan_server.md` | server / MCP / GUI / 客户端文件 I/O 的剩余工作 |
-| `nvim/README.md` | neovim 插件的安装、命令与配置 |
+| `plan_server.md` | 历史上的 server/MCP 记录（传输与文件 I/O 的方向已被 `plan_cli.md` 取代） |
+| `tools/agent/autodbg-skill/` | 面向 agent 的契约文档（技能包） |
+| `nvim/README.md` | neovim 插件的安装、配置与命令 |
 
 ---
 
 ## 🤝 贡献与许可
 
-本项目目前处于积极开发阶段。非常欢迎提交 Issue、PR 或参与架构讨论！
+项目仍在活跃开发中，欢迎 issue、PR 与架构讨论。
 
-本项目基于 MIT 许可证开源。详情请参阅 `LICENSE` 文件。
+以 MIT 许可证发布，详见 `LICENSE`。
