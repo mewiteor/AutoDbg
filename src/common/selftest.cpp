@@ -4,7 +4,8 @@
  * 来源：新写。
  * 与旧实现的差异：无（新文件）。
  * 覆盖：json_writer（转义/嵌套/数字/深度溢出/T1 的全转义出口）、rand（hex 形状与两次不相等）、
- *   帧头编解码（T2：定长头 / json 长度反推 / raw 长度前缀 / 全部拒绝路径）、PNG/BMP 编码。
+ *   帧头编解码（T2：定长头 / json 长度反推 / raw 长度前缀 / 全部拒绝路径）、PNG/BMP 编码、
+ *   `decide_console_action`（T7.1 补上 plan.md §1.1 第 1 条欠着的三条：67 → 70）。
  * ❗T5（D41/D44）删除了 HTTP 与 base64 两段：它们跟着 http.* / ase64.* 一起消失。
  * 说明：断言用 `strcmp`/`memcmp` 逐字节比较（跨架构/跨编译器稳定）；
  *   期望值都是**手写的字面量**，不要在这里用被测代码生成期望值（否则等于没测）。
@@ -12,6 +13,7 @@
 #include "selftest.hpp"
 
 #include "frame.hpp"   /* T2：帧头编解码（plan_cli.md §2.1） */
+#include "../scripting/lua/console_input.hpp" /* T7.1：`decide_console_action`（纯判定、只依赖 windows.h） */
 #include "json_writer.hpp"
 #include "png_writer.hpp"
 #include "rand.hpp"
@@ -440,6 +442,40 @@ void test_frame(test_ctx *t)
     }
 }
 
+/* ------------------------------ 控制台输入判定（plan.md §1.1 第 1 条 / T7.1） ------------------------------
+ * `decide_console_action` 是宿主层的**纯判定**（不做 I/O、不碰 Lua），所以可以按记录列表直接断言。
+ * 期望值是手写字面量：0 = 继续等、1 = 分离并终止、2 = 分离但保留目标。
+ * 口径（与 `console_input.hpp` 的注释一致）：只有 `KEY_EVENT` 的 **key-up** 且虚拟键码 = 'Q' 才算；
+ * Shift / CapsLock 只影响 `uChar`，不影响 `wVirtualKeyCode`（所以 q / Q 都能退出）。 */
+void test_console_action(test_ctx *t)
+{
+    INPUT_RECORD rec;
+    rec.EventType = KEY_EVENT;
+    KEY_EVENT_RECORD &key = rec.Event.KeyEvent;
+
+    key.bKeyDown          = FALSE; /* 'Q' 抬起才算 */
+    key.wVirtualKeyCode   = 'Q';
+    key.dwControlKeyState = SHIFT_PRESSED;
+    check_int(t, "console.shift-q-keep-alive", decide_console_action(&rec, 1, true), 2, "SHIFT_PRESSED + can_detach_without_term");
+
+    /* 「非 Shift」与「不能避免 terminate」两个分支都得给出 1 */
+    key.dwControlKeyState = 0;
+    bool non_shift     = (decide_console_action(&rec, 1, true) == 1);
+    key.dwControlKeyState = SHIFT_PRESSED;
+    bool cannot_detach = (decide_console_action(&rec, 1, false) == 1);
+    check_bool(t, "console.q-terminates", non_shift && cannot_detach, "非 Shift 或不能避免 terminate -> 1");
+
+    /* 无匹配输入记录 -> 0：按下（不是抬起）、其它键、空记录 */
+    key.bKeyDown          = TRUE;
+    bool keydown_only = (decide_console_action(&rec, 1, true) == 0);
+    key.bKeyDown          = FALSE;
+    key.wVirtualKeyCode   = 'A';
+    bool other_key = (decide_console_action(&rec, 1, true) == 0);
+    key.wVirtualKeyCode   = 'Q';
+    bool empty_records = (decide_console_action(&rec, 0, true) == 0);
+    check_bool(t, "console.no-matching-record", keydown_only && other_key && empty_records, "无匹配记录 -> 0");
+}
+
 /* ------------------------------ PNG / BMP（截图编码，S4） ------------------------------ */
 void test_image(test_ctx *t)
 {
@@ -519,6 +555,7 @@ int run_selftests(selftest_report_fn report, void *ctx)
     test_json(&t);
     test_rand(&t);
     test_frame(&t);
+    test_console_action(&t);
     test_image(&t);
 
     {

@@ -1,10 +1,21 @@
 ﻿/* =============================================================================
  * src/core/debug_loop.cpp —— 调试事件主循环（P3.B 模块 9，逐字从 bindings.cpp 迁入）
  *
- * 内容：`run`（WaitForDebugEvent 主循环 + 事件分发 + 全部回调调用）、`run_shutdown`、
- *       以及 ScyllaHide 的条件引入（98 构建用空实现）。
+ * 内容（T7.1，plan_t7.md §2.1）：状态机 `begin` / `pump` / `cont` / `end`（一次 wait + 派发 +
+ *       可选 continue）、`run`（= `begin` + `while` + `pump(autocont = true)` + `end` 的封装，
+ *       语义与逐字节输出不变）、`run_shutdown`，以及 ScyllaHide 的条件引入（98 构建用空实现）。
  * 跨模块改动（仅这些）：
  *   · `run` 去掉 `static`（`lua_Run` / `lua_Attach` 调用）；
+ *   · T7.1：`run` 只是封装，不是重写 —— 原循环里留在栈上的跨迭代状态搬成**会话成员**
+ *     （`m_first_bp` / `m_push_fb` / `m_reset_bpx` / `m_reset_hw_bp` / `m_first_create_process` /
+ *     `m_debug_active_process_stop`）：手工映射的模块禁止 `thread_local` 与函数内非平凡构造的
+ *     static（§11.5、PITFALLS M10），搬漏一个就是跨 pump 状态丢失。
+ *     `pump` 的 `autocont = false` ⇒ ❗不调 `ContinueDebugEvent`（事件停在未应答状态，由调用方
+ *     显式 `cont(pid, tid, code)`）；`pump(0, false)` 即 `pump_now()`。
+ *     旧循环的两处 `break`（detach 之后、`ContinueDebugEvent` 失败）改成置 `cont()` 标志 —— 对
+ *     `run()` 完全等价（while 出口相同），`pump` 自己不回传「停不停」。
+ *     返回值口径：`begin` 0 = 就绪 / -1 = 内部错误（收尾已跑）/ -2 = 附加失败（1:1：打印后直接
+ *     结束、**不跑收尾**，由 `run` 映射回 0）；`pump` = 调试事件码（0 = 没等到事件）或 -1；`end` = 0。
  *   · `run_shutdown` 是 `run` 的私有成员（P6.4：它要用会话自身的状态）；
  *   · ScyllaHide 条件块从 bindings.cpp 整体搬来（98 构建的 `NO_SCYLLA_HIDE` 空实现）；
  *   · `lua_on_*` 适配器 / `LuaDebugAdapter` / `pcall` 仍留绑定层（宿主适配）。
@@ -103,11 +114,16 @@ void DebuggerSession::run_shutdown(const core::RunParams *params)
         scylla_hide_on_stop();
 }
 
-/* 返回 0 = 正常结束；-1 = 引擎内部错误（*err 指向静态字符串）。
+/* begin：Attach / CreateProcess + 跨 pump 的会话状态（不循环）。
+ * 返回值：0 = 就绪（可进 pump 循环）；-2 = 附加失败（1:1 保留旧行为：打印后直接结束、**不跑收尾**，
+ * 由 `run` 映射回 0）；-1 = 引擎内部错误（`*err` 已置，收尾已跑）。
  * ❗ 错误**不用长跳**表达：旧实现在此直接 lua_error（会跨 C++ 帧 longjmp，见 D18），
  * 现改为正常返回，由绑定层在 run 返回后 lua_error（Lua 可见行为一致）。 */
-int DebuggerSession::run(const core::RunParams *params, const core::DebugCallbacks *cb, const char **err)
+int DebuggerSession::begin(const core::RunParams *params, const core::DebugCallbacks *cb, const char **err)
 {
+    m_params = params;   /* pump / end 从这里取调用方对象（与 begin 的调用期同寿命） */
+    m_cb     = cb;
+
     if (params->use_scylla_hide)
         scylla_hide_setup();
 
@@ -116,7 +132,7 @@ int DebuggerSession::run(const core::RunParams *params, const core::DebugCallbac
         if (!DebugActiveProcess(params->pid))
         {
             E("DebugActiveProcess");
-            return 0; /* 1:1：旧实现就是直接返回（不报 Lua 错误，脚本继续） */
+            return -2; /* 1:1：旧实现就是直接返回（不报 Lua 错误、不跑收尾）→ run 映射回 0 */
         }
         LjDebugSetProcessKillOnExit(FALSE);
         proc().dwProcessId = params->pid;
@@ -176,588 +192,644 @@ int DebuggerSession::run(const core::RunParams *params, const core::DebugCallbac
         if (!r)
             E("CreateProcess");
     }
-    cont()               = true;
-    term()               = true;
-    to_detach()          = false;
-    BOOL   FirstBPX      = TRUE;
-    BOOL   pushfbpx      = FALSE;
-    bool   first_create_process = false; /* 旧 `dbgfilehandle` 实际只当「首个 CREATE_PROCESS」标志用 */
+    /* 跨 pump 的循环状态（会话成员）——每次 begin 重新置初值（原来这些是 run 的栈局部） */
+    cont()                 = true;
+    term()                 = true;
+    to_detach()            = false;
+    m_first_bp             = true;  /* 原 `FirstBPX` */
+    m_push_fb              = false; /* 原 `pushfbpx`（pushf 特殊情况） */
+    m_first_create_process = false; /* 旧 `dbgfilehandle` 实际只当「首个 CREATE_PROCESS」标志用 */
 
-    struct
-    {
-        LPCTSTR modname;
-        DWORD   rva;
-        size_t  ea;
-    } reset_bpx = {NULL, 0, 0}; /* ❗D32 修复：必须显式初始化 —— 否则 `reset_bpx.modname` 是栈垃圾，
-                                 * 会让「首个单步事件」误入下面的 re-arm 分支：① 硬件断点的首个命中会被
-                                 * 静默丢掉；② 还会拿垃圾指针去调 `enable_breakpoint()`（debug 构建下先撞 assert）。
-                                 * 这就是「武装后的首次访问必定漏掉」的根因（垃圾值随栈内容变化 → 早先还表现为不稳定）。 */
+    /* ❗D32 修复：必须显式初始化（留在构造函数或 begin）—— 否则 `m_reset_bpx.modname` 是垃圾，
+     * 会让「首个单步事件」误入下面的 re-arm 分支：① 硬件断点的首个命中会被静默丢掉；
+     * ② 还会拿垃圾指针去调 `enable_breakpoint()`（debug 构建下先撞 assert）。
+     * 这就是「武装后的首次访问必定漏掉」的根因（栈上时垃圾值随栈内容变化 → 早先还表现为不稳定）；
+     * 搬成成员后必须**每次 begin 重新清**，否则上一轮 run 的待 re-arm 状态会漏到下一轮。 */
+    m_reset_bpx.modname = NULL;
+    m_reset_bpx.rva     = 0;
+    m_reset_bpx.ea      = 0;
+    m_reset_hw_bp       = 0; /* 原 `reset_hwbpx`：DR0-3 的位掩码 */
 
-    int reset_hwbpx = 0;
-
+    /* `DebugActiveProcessStop` 在 begin 里解析一次（原来每次 run 在栈上解析）：取不到 → D47 的降级
+     * （只能 terminate；`on_wait_timeout` 拿到的 can_detach_without_term = false，`end` 的返回值也据此上报） */
     HMODULE hKernel32 = GetModuleHandleA("kernel32.dll");
-    typedef BOOL(__stdcall * DebugActiveProcessStopT)(DWORD dwProcessId);
-    DebugActiveProcessStopT DebugActiveProcessStop_ = (DebugActiveProcessStopT)GetProcAddress(hKernel32, "DebugActiveProcessStop");
+    m_debug_active_process_stop = (DebugActiveProcessStopFn)GetProcAddress(hKernel32, "DebugActiveProcessStop");
 
-    while (cont())
+    return 0;
+}
+
+/* pump：一次 `WaitForDebugEvent` + 派发（T7.1）。返回调试事件码（0 = 没等到事件）；
+ * -1 = 引擎内部错误（`*err` 已置，且收尾已在这条路径里跑过）。`autocont = false` ⇒ ❗不调
+ * `ContinueDebugEvent`：事件停在未应答状态，由调用方显式 `cont(pid, tid, code)`。 */
+int DebuggerSession::pump(DWORD timeout_ms, bool autocont, const char **err)
+{
+    const RunParams      *params = m_params;   /* begin 存下的调用方对象（别名保留旧调用点写法） */
+    const DebugCallbacks *cb     = m_cb;
+
+    DEBUG_EVENT DBGEvent;
+    DWORD       DBGCode  = DBG_CONTINUE;
+    bool        detached = false;
+    if (!WaitForDebugEvent(&DBGEvent, timeout_ms))
     {
-        DEBUG_EVENT DBGEvent;
-        DWORD       DBGCode  = DBG_CONTINUE;
-        bool        detached = false;
-        if (!WaitForDebugEvent(&DBGEvent, 100))
+        if (to_detach())
         {
-            if (to_detach())
+            term() = false;
+            detach_process(cb);
+            detached = true;
+        }
+        else if (cb->on_wait_timeout)
+        {
+            /* 引擎只执行结论；「能不能分离而不终止」由引擎告知（DebugActiveProcessStop 可用性）。
+             * ❗pump 的空闲路径照旧问宿主 —— 那是执行期唯一的 control poll 点（D32 / S13） */
+            switch (cb->on_wait_timeout(cb->context, !!m_debug_active_process_stop))
             {
+            case core::WAIT_TIMEOUT_DETACH_KEEP_ALIVE: /* 2 */
                 term() = false;
+                /* fallthrough：1:1 保留旧实现的 case 2 → case 1 */
+            case core::WAIT_TIMEOUT_DETACH_AND_TERMINATE: /* 1 */
                 detach_process(cb);
                 detached = true;
             }
-            else if (cb->on_wait_timeout)
+        }
+        if (detached)
+        {
+            if (m_debug_active_process_stop)
+                m_debug_active_process_stop(proc().dwProcessId);
+            m_cont = false; /* 旧的 `break`：run 的 while 出口（pump 不回传「停不停」，只置标志） */
+        }
+        return 0;           /* 旧的 `continue` = 回到 while 顶 → pump 的「0 = 没等到事件」 */
+    }
+    if (cb->on_any_debug_event)
+    {
+        core::DebugEvent ev;
+        ev.pid  = DBGEvent.dwProcessId;
+        ev.tid  = DBGEvent.dwThreadId;
+        ev.code = DBGEvent.dwDebugEventCode;
+        cb->on_any_debug_event(cb->context, ev);
+    }
+    if (params->use_scylla_hide)
+        scylla_hide_on_debug();
+    switch (DBGEvent.dwDebugEventCode)
+    {
+    case EXCEPTION_DEBUG_EVENT:
+        if (cb->on_exception)
+        {
+            core::ExceptionEvent ev;
+            ev.pid  = DBGEvent.dwProcessId;
+            ev.tid  = DBGEvent.dwThreadId;
+            ev.code = DBGEvent.u.Exception.ExceptionRecord.ExceptionCode;
+            ev.addr = (size_t)DBGEvent.u.Exception.ExceptionRecord.ExceptionAddress;
+            cb->on_exception(cb->context, ev);
+        }
+        DBGCode = DBG_EXCEPTION_NOT_HANDLED;
+        switch (DBGEvent.u.Exception.ExceptionRecord.ExceptionCode)
+        {
+        case EXCEPTION_BREAKPOINT: // 遇到断点。
+            if (cb->on_breakpoint)
             {
-                /* 引擎只执行结论；「能不能分离而不终止」由引擎告知（DebugActiveProcessStop 可用性） */
-                switch (cb->on_wait_timeout(cb->context, !!DebugActiveProcessStop_))
+                core::BreakpointEvent ev;
+                ev.pid  = DBGEvent.dwProcessId;
+                ev.tid  = DBGEvent.dwThreadId;
+                ev.addr = (size_t)DBGEvent.u.Exception.ExceptionRecord.ExceptionAddress;
+                cb->on_breakpoint(cb->context, ev);
+            }
+            if (params->use_scylla_hide)
+                scylla_hide_on_breakpoint();
+            if (m_first_bp)
+            {
+                DBGCode = DBG_CONTINUE;
+                if (cb->on_first_breakpoint)
                 {
-                case core::WAIT_TIMEOUT_DETACH_KEEP_ALIVE: /* 2 */
-                    term() = false;
-                    /* fallthrough：1:1 保留旧实现的 case 2 → case 1 */
-                case core::WAIT_TIMEOUT_DETACH_AND_TERMINATE: /* 1 */
-                    detach_process(cb);
-                    detached = true;
+                    core::FirstBreakpointEvent ev;
+                    ev.pid = DBGEvent.dwProcessId;
+                    ev.tid = DBGEvent.dwThreadId;
+                    cb->on_first_breakpoint(cb->context, ev);
+                }
+                m_first_bp = false;
+            }
+            else
+            {
+                size_t         ea     = (size_t)DBGEvent.u.Exception.ExceptionRecord.ExceptionAddress;
+                PEInfo *peinfo = get_peinfo_by_ea(ea);
+                if (peinfo)
+                {
+                    LPTSTR                  modname = peinfo->Path + peinfo->name_offset;
+                    DWORD                   rva     = (DWORD)(ea - peinfo->base);
+                    BreakpointInfo *tmp = breakpoints().head();
+                    while (tmp)
+                    {
+                        BreakpointInfo *bp_next = tmp->next; /* 先留 next（remove 会置空） */
+                        if (!tmp->activate)
+                        {
+                            tmp = bp_next;
+                            continue;
+                        }
+                        if (rva != tmp->rva || _tcsicmp(modname, tmp->modname))
+                        {
+                            tmp = bp_next;
+                            continue;
+                        }
+                        if (!tmp->has_orignal_byte)
+                        {
+                            /* 旧实现在这里直接 lua_pushstring + lua_error（长跳、跳过清理）。
+                             * 现改为「走完清理尾部 + 返回错误码」，由绑定层在 run 返回后
+                             * lua_error —— Lua 可见行为一致，但不再长跳穿 C++ 帧（D18）。*/
+                            run_shutdown(params);
+                            *err = "tmp->has_orignal_byte is zero!";
+                            return -1;
+                        }
+                        disable_breakpoint(ea, modname, rva);
+                        DBGCode         = DBG_CONTINUE;
+                        HANDLE  hThread = get_thread_by_tid(DBGEvent.dwThreadId);
+                        CONTEXT context;
+                        context.ContextFlags = CONTEXT_CONTROL;
+                        GetThreadContext(hThread, &context);
+                        if (!tmp->is_single)
+                            context.EFlags |= 0x100;
+#if defined(_WIN64)
+                        context.Rip--;
+#else
+                        context.Eip--;
+#endif
+                        SetThreadContext(hThread, &context);
+                        callback_ref_t bp_callback = tmp->callback;
+                        bool           to_unref_cbk = false;
+                        if (tmp->is_single)
+                        {
+                            /* P6.2：摘除 + 释放一次完成（旧写法 `*pp = (*pp)->next; free_(tmp);`） */
+                            breakpoints().remove_and_free(tmp);
+                            to_unref_cbk = true;
+                        }
+                        else
+                        {
+                            BYTE original_byte;
+                            if (read(ea, &original_byte, 1))
+                            {
+                                if (original_byte == 0x9C)
+                                    m_push_fb = true;
+
+                                // 保存重置断点信息
+                                m_reset_bpx.modname = modname;
+                                m_reset_bpx.rva     = rva;
+                                m_reset_bpx.ea      = ea;
+                            }
+                        }
+                        if (bp_callback.valid)
+                        {
+                            core::BreakpointCallbackEvent ev;
+                            ev.callback    = bp_callback;
+                            ev.pid         = DBGEvent.dwProcessId;
+                            ev.tid         = DBGEvent.dwThreadId;
+                            ev.ea          = ea;
+                            ev.rva         = rva;
+                            ev.modname     = modname;
+                            ev.single_shot = to_unref_cbk;
+                            cb->on_breakpoint_callback(cb->context, ev);
+                        }
+                        tmp = bp_next; /* 处理完一个节点后前进（旧实现靠 `activate` 被置 0 来落地下一轮） */
+                    }
                 }
             }
-            if (detached)
+            break;
+        case EXCEPTION_SINGLE_STEP: // 跟踪陷阱或其他单指令机制指示已执行一个指令。
+            if (cb->on_single_step)
             {
-                if (DebugActiveProcessStop_)
-                    DebugActiveProcessStop_(proc().dwProcessId);
+                core::StepEvent ev;
+                ev.pid  = DBGEvent.dwProcessId;
+                ev.tid  = DBGEvent.dwThreadId;
+                ev.addr = (size_t)DBGEvent.u.Exception.ExceptionRecord.ExceptionAddress;
+                cb->on_single_step(cb->context, ev);
+            }
+            if (m_reset_bpx.modname || m_reset_hw_bp > 0)
+            {
+                DBGCode = DBG_CONTINUE;
+                if (m_push_fb)
+                {
+                    m_push_fb = false;
+                    // 处理pushf指令特殊情况
+                    HANDLE hThread = get_thread_by_tid(DBGEvent.dwThreadId);
+                    if (hThread)
+                    {
+                        CONTEXT context;
+                        context.ContextFlags = CONTEXT_CONTROL;
+                        if (GetThreadContext(hThread, &context))
+                        {
+#if defined(_WIN64)
+                            size_t csp = context.Rsp;
+#else
+                            size_t csp = context.Esp;
+#endif
+                            size_t data;
+                            if (read(csp, &data, sizeof data))
+                            {
+                                data &= ~0x100;
+                                write(csp, &data, sizeof data, false);
+                            }
+                        }
+                    }
+                }
+
+                if (m_reset_bpx.modname)
+                {
+                    // 验证当前地址不是重置断点地址
+                    size_t current_ea = (size_t)DBGEvent.u.Exception.ExceptionRecord.ExceptionAddress;
+
+                    assert(m_reset_bpx.ea != current_ea);
+                    // 重新启用断点
+                    enable_breakpoint(m_reset_bpx.ea, m_reset_bpx.modname, m_reset_bpx.rva);
+
+                    // 清理m_reset_bpx
+                    m_reset_bpx.modname = NULL;
+                    m_reset_bpx.rva     = 0;
+                    m_reset_bpx.ea      = 0;
+                }
+
+                if (m_reset_hw_bp > 0)
+                {
+                    for (int i = 0; i < 4; i++)
+                    {
+                        if ((1 << i) & m_reset_hw_bp)
+                            enable_hardware_breakpoint(i);
+                    }
+                    m_reset_hw_bp = 0;
+                }
+            }
+            else
+            {
+                HANDLE hThread = get_thread_by_tid(DBGEvent.dwThreadId);
+                if (hThread)
+                {
+                    CONTEXT context;
+                    context.ContextFlags = CONTEXT_CONTROL | CONTEXT_DEBUG_REGISTERS;
+                    if (GetThreadContext(hThread, &context))
+                    {
+                        for (int i = 0; i < 4; i++)
+                        {
+                            if ((&context.Dr0)[i] == (ULONG_PTR)DBGEvent.u.Exception.ExceptionRecord.ExceptionAddress || ((BYTE)context.Dr6 & (1 << i)))
+                            {
+                                if (!hw_breakpoints()[i].activate)
+                                    DBGCode = DBG_EXCEPTION_NOT_HANDLED;
+                                else
+                                {
+                                    DBGCode = DBG_CONTINUE;
+                                    {
+                                        context.EFlags |= 0x100;
+                                        SetThreadContext(hThread, &context);
+                                    }
+                                    callback_ref_t hw_callback = hw_breakpoints()[i].callback;
+                                    if (hw_callback.valid)
+                                    {
+                                        core::HwBreakpointCallbackEvent ev;
+                                        ev.callback  = hw_callback;
+                                        ev.ea        = (size_t)DBGEvent.u.Exception.ExceptionRecord.ExceptionAddress;
+                                        ev.pid       = DBGEvent.dwProcessId;
+                                        ev.tid       = DBGEvent.dwThreadId;
+                                        cb->on_hw_breakpoint_callback(cb->context, ev);
+                                    }
+                                    m_reset_hw_bp |= 1 << i;
+                                    disable_hardware_breakpoint(i);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            break;
+        default:
+            if (cb->on_user_exception)
+            {
+                core::UserExceptionEvent ev;
+                ev.pid          = DBGEvent.dwProcessId;
+                ev.tid          = DBGEvent.dwThreadId;
+                ev.first_chance = !!DBGEvent.u.Exception.dwFirstChance;
+                ev.record       = &DBGEvent.u.Exception.ExceptionRecord;
+                cb->on_user_exception(cb->context, ev);
+            }
+            DBGCode = DBG_EXCEPTION_NOT_HANDLED;
+            break;
+        }
+        break;
+    case CREATE_THREAD_DEBUG_EVENT:
+        if (cb->on_create_thread)
+        {
+            core::ThreadEvent ev;
+            ev.pid  = DBGEvent.dwProcessId;
+            ev.tid  = DBGEvent.dwThreadId;
+            ev.addr = (size_t)DBGEvent.u.CreateThread.lpStartAddress;
+            cb->on_create_thread(cb->context, ev);
+        }
+        {
+            /* P6.2：直接由链表分配（`OwnedIntrusiveList::create_front`）——与旧代码
+             * `AllocX + next = head + head = info` 完全等价，只是把所有权交给链表。 */
+            ThreadInfo *info       = threads().create_front();
+            info->dwThreadId        = DBGEvent.dwThreadId;
+            info->hThread           = DBGEvent.u.CreateThread.hThread;
+            info->ProcessId         = DBGEvent.dwProcessId;
+            info->lpStartAddress    = (size_t)DBGEvent.u.CreateThread.lpStartAddress;
+            break;
+        }
+    case CREATE_PROCESS_DEBUG_EVENT:
+        if (!m_first_create_process)
+        {
+            m_first_create_process = true;
+            /* P6.1：映像文件句柄归调试器所有（MSDN）——旧代码只把它存进 `dbgfilehandle` 当标志、
+             * **从未关闭** → 现在用完立即关（RAII 到本作用域末）；行为变更（修复句柄泄漏）。 */
+            unique_handle image_file(DBGEvent.u.CreateProcessInfo.hFile);
+            if (params->pid && params->pid == DBGEvent.dwProcessId)
+            {
+                proc().hProcess   = DBGEvent.u.CreateProcessInfo.hProcess;
+                proc().hThread    = DBGEvent.u.CreateProcessInfo.hThread;
+                proc().dwThreadId = DBGEvent.dwThreadId;
+            }
+        }
+        {
+            TCHAR image_name[MAX_FILEPATH];
+#ifdef _UNICODE
+            DWORD image_name_len =
+                GetMappedFileNameW(DBGEvent.u.CreateProcessInfo.hProcess, DBGEvent.u.CreateProcessInfo.lpBaseOfImage, image_name, _countof(image_name));
+#else
+            DWORD image_name_len = LjGetMappedFileNameA(DBGEvent.dwProcessId, DBGEvent.u.CreateProcessInfo.lpBaseOfImage, image_name, _countof(image_name));
+#endif
+            LPCTSTR translated_name = TranslateNativeName(image_name);
+            image_name_len -= (DWORD)(translated_name - image_name);
+            /* P6.2：变长节点由链表一次分配（`sizeof(PEInfo) + n*sizeof(TCHAR)`，与旧
+             * `alloc_(info_size)` 同一算法）；`create_front` 返回的节点**已整块清零**（含 next 已接好）。 */
+            PEInfo *info = peinfos().create_front(image_name_len * sizeof(TCHAR));
+            info->dwProcessId   = DBGEvent.dwProcessId;
+            info->base          = (size_t)DBGEvent.u.CreateProcessInfo.lpBaseOfImage;
+            info->start_address = (size_t)DBGEvent.u.CreateProcessInfo.lpStartAddress;
+            info->name_offset   = PathFindFileName(translated_name) - translated_name;
+            /* ❗按 TCHAR 的**宽**度拷：legacy（ANSI）变体里 TCHAR 是 1 字节，用 `__movsw`
+             * 会按 2 字节一个单元拷 `image_name_len` 个 → 越界写掉半个缓冲（分配只有
+             * `image_name_len * sizeof(TCHAR)` 字节）→ 堆损坏，表现为随机 AV。 */
+#ifdef _UNICODE
+            __movsw((LPWORD)info->Path, (const WORD *)translated_name, image_name_len);
+#else
+            __movsb((PBYTE)info->Path, (const BYTE *)translated_name, image_name_len);
+#endif
+            info->Path[image_name_len] = 0;
+            if (!calc_crc32(info->Path, &info->crc32))
+                cont() = false;
+            update_breakpoints(info);
+            if (cb->on_create_process)
+            {
+                core::ProcessEvent ev;
+                ev.pid  = DBGEvent.dwProcessId;
+                ev.tid  = DBGEvent.dwThreadId;
+                ev.addr = (size_t)DBGEvent.u.CreateProcessInfo.lpStartAddress;
+                ev.base = (size_t)DBGEvent.u.CreateProcessInfo.lpBaseOfImage;
+                ev.path = info->Path;
+                cb->on_create_process(cb->context, ev);
+            }
+        }
+        if (params->use_scylla_hide)
+            scylla_hide_on_create_process(DBGEvent.dwProcessId, DBGEvent.u.CreateProcessInfo.lpStartAddress);
+        {
+            ThreadInfo *info       = threads().create_front();
+            info->dwThreadId        = DBGEvent.dwThreadId;
+            info->hThread           = DBGEvent.u.CreateProcessInfo.hThread;
+            info->ProcessId         = DBGEvent.dwProcessId;
+        }
+        break;
+    case EXIT_THREAD_DEBUG_EVENT:
+        if (cb->on_exit_thread)
+        {
+            core::ExitEvent ev;
+            ev.pid  = DBGEvent.dwProcessId;
+            ev.tid  = DBGEvent.dwThreadId;
+            ev.code = DBGEvent.u.ExitThread.dwExitCode;
+            cb->on_exit_thread(cb->context, ev);
+        }
+        {
+            /* P6.2：按 tid 找节点 → 关句柄（P6.1 的修复，D29）→ 摘除并释放 */
+            for (ThreadInfo *tmp = threads().head(); tmp; tmp = tmp->next)
+            {
+                if (tmp->dwThreadId != DBGEvent.dwThreadId)
+                    continue;
+                if (tmp->hThread)
+                    CloseHandle(tmp->hThread);
+                threads().remove_and_free(tmp);
                 break;
             }
-            continue;
+            break;
         }
-        if (cb->on_any_debug_event)
+    case EXIT_PROCESS_DEBUG_EVENT:
+        if (cb->on_exit_process)
+        {
+            core::ExitEvent ev;
+            ev.pid  = DBGEvent.dwProcessId;
+            ev.tid  = DBGEvent.dwThreadId;
+            ev.code = DBGEvent.u.ExitProcess.dwExitCode;
+            cb->on_exit_process(cb->context, ev);
+        }
+        {
+            if (DBGEvent.dwProcessId == proc().dwProcessId)
+                cont() = false;
+            DBGCode            = DBG_CONTINUE;
+            for (PEInfo *tmp = peinfos().head(); tmp; )
+            {
+                PEInfo *next = tmp->next; /* 先留 next（remove 会把它置空） */
+                if (tmp->dwProcessId == DBGEvent.dwProcessId)
+                {
+                    del_breakpoints_by_modname_without_update_memory(cb, tmp->Path + tmp->name_offset);
+                    peinfos().remove_and_free(tmp);
+                }
+                tmp = next;
+            }
+            break;
+        }
+    case LOAD_DLL_DEBUG_EVENT:
+    {
+        /* P6.1：本事件带的 `hFile` 归调试器所有、用完就该关（旧实现从不关 → 每加载一个 DLL 泄漏一个句柄）。
+         * RAII 到本 case 结束；日志文案里仍打印原表达式以保持文本一致。 */
+        unique_handle load_dll_file(DBGEvent.u.LoadDll.hFile);
+        TCHAR         image_name[MAX_FILEPATH];
+#if !defined(_UNICODE)
+        DWORD image_name_len = LjGetMappedFileNameA(proc().dwProcessId, DBGEvent.u.LoadDll.lpBaseOfDll, image_name, _countof(image_name));
+        if (!image_name_len)
+            E("LjGetMappedFileNameA(0x%zX)", DBGEvent.u.LoadDll.lpBaseOfDll);
+#elif defined(_WIN64)
+        DWORD image_name_len = GetFinalPathNameByHandleW(DBGEvent.u.LoadDll.hFile, image_name, _countof(image_name), VOLUME_NAME_NT);
+        if (!image_name_len)
+            E("GetFinalPathNameByHandleW(0x%zX)", DBGEvent.u.LoadDll.lpBaseOfDll);
+#else
+        DWORD image_name_len = GetMappedFileNameW(proc().hProcess, DBGEvent.u.LoadDll.lpBaseOfDll, image_name, _countof(image_name));
+        if (!image_name_len)
+            E("GetMappedFileNameW(0x%zX)", DBGEvent.u.LoadDll.lpBaseOfDll);
+#endif
+        PEInfo *info = NULL;
+        if (image_name_len)
+        {
+            LPCTSTR translated_name = TranslateNativeName(image_name);
+            image_name_len -= (DWORD)(translated_name - image_name);
+            /* P6.2：变长节点由链表一次分配（与旧 `alloc_(sizeof(PEInfo) + n*sizeof(TCHAR))` 同算法） */
+            info         = peinfos().create_front(image_name_len * sizeof(TCHAR));
+            info->base        = (size_t)DBGEvent.u.LoadDll.lpBaseOfDll;
+            info->name_offset = PathFindFileName(translated_name) - translated_name;
+            /* ❗同 CREATE_PROCESS 那处：legacy（ANSI）的 TCHAR 是 1 字节，`__movsw` 会
+             * 按 2 字节拷 → 溢出分配的 `image_name_len` 字节 → 堆损坏（随机 AV）。 */
+#ifdef _UNICODE
+            __movsw((LPWORD)info->Path, (const WORD *)translated_name, image_name_len);
+#else
+            __movsb((PBYTE)info->Path, (const BYTE *)translated_name, image_name_len);
+#endif
+            info->Path[image_name_len] = 0;
+            if (!calc_crc32(info->Path, &info->crc32))
+                cont() = false;
+            update_breakpoints(info);
+        }
+        if (cb->on_load_dll)
+        {
+            core::DllEvent ev;
+            ev.pid  = DBGEvent.dwProcessId;
+            ev.tid  = DBGEvent.dwThreadId;
+            ev.base = (size_t)DBGEvent.u.LoadDll.lpBaseOfDll;
+            ev.path = info ? info->Path : NULL;
+            cb->on_load_dll(cb->context, ev);
+        }
+        if (params->use_scylla_hide)
+            scylla_hide_on_create_dll(DBGEvent.u.LoadDll.lpBaseOfDll);
+        break;
+    }
+    case UNLOAD_DLL_DEBUG_EVENT:
+        if (cb->on_unload_dll)
+        {
+            core::DllEvent ev;
+            ev.pid  = DBGEvent.dwProcessId;
+            ev.tid  = DBGEvent.dwThreadId;
+            ev.base = (size_t)DBGEvent.u.UnloadDll.lpBaseOfDll;
+            ev.path = NULL;
+            cb->on_unload_dll(cb->context, ev);
+        }
+        {
+            for (PEInfo *tmp = peinfos().head(); tmp; )
+            {
+                PEInfo *next = tmp->next;
+                if (tmp->base == (size_t)DBGEvent.u.UnloadDll.lpBaseOfDll)
+                {
+                    del_breakpoints_by_modname_without_update_memory(cb, tmp->Path + tmp->name_offset);
+                    peinfos().remove_and_free(tmp);
+                }
+                tmp = next;
+            }
+            break;
+        }
+    case OUTPUT_DEBUG_STRING_EVENT:
+    {
+        // ODS 事件的 ContinueDebugEvent 状态**必须是 DBG_CONTINUE**（MSDN）。
+        // 旧代码用 DBG_EXCEPTION_NOT_HANDLED → 实测（本机 Win11 + 六产物）会导致
+        // 同一个 ODS 事件被重投递，回调/回显各触发两次（缺陷 D11，已修）。
+        DBGCode              = DBG_CONTINUE;
+        DWORD       ods_size = DBGEvent.u.DebugString.nDebugStringLength;
+        bool        ods_uni  = DBGEvent.u.DebugString.fUnicode != 0;
+        const void *ods_data = NULL;
+        void       *p        = NULL;
+        if (DBGEvent.u.DebugString.lpDebugStringData && DBGEvent.u.DebugString.nDebugStringLength)
+        {
+            p = alloc_(DBGEvent.u.DebugString.nDebugStringLength);
+            if (read((size_t)DBGEvent.u.DebugString.lpDebugStringData, p, DBGEvent.u.DebugString.nDebugStringLength))
+                ods_data = p;
+        }
+        /* 控制台回显（不属于 Lua，留在 core）：与旧实现同序 —— 先回显、后回调
+         * ❗`nDebugStringLength` **含**结尾的 NUL（MSDN："including the terminating null"）
+         *   ⇒ 直接抳长度会把 0x00 一起写进输出（`--json` 的信封里表现为 `stdout` 里
+         *   混进 `\u0000`，那一行也不再是合法 JSON 的单行文本）。这里去掉结尾的 NUL，
+         *   并把同一份长度交给 Lua 回调（否则脚本里的 `ev.str` 带上 `\0` 又会污染 stdout）。 */
+        if (ods_data)
+        {
+            if (!ods_uni)
+            {
+                if (ods_size > 0 && ((const char *)ods_data)[ods_size - 1] == '\0')
+                    ods_size--;
+                PrintN((LPCSTR)ods_data, ods_size);
+            }
+#ifdef _UNICODE
+            else
+            {
+                if (ods_size >= sizeof(WCHAR) && ((const WCHAR *)ods_data)[ods_size / sizeof(WCHAR) - 1] == L'\0')
+                    ods_size -= sizeof(WCHAR);
+                PrintN((LPCWSTR)ods_data, ods_size / sizeof(WCHAR));
+            }
+#endif
+        }
+        /* 旧行为：只要登记了回调就**总是**调用（读取失败时表里没有 str 字段） */
+        if (cb->on_output_debug_string)
+        {
+            core::OutputDebugStringEvent ev;
+            ev.pid     = DBGEvent.dwProcessId;
+            ev.tid     = DBGEvent.dwThreadId;
+            ev.data    = ods_data;
+            ev.size    = ods_size;
+            ev.unicode = ods_uni;
+            cb->on_output_debug_string(cb->context, ev);
+        }
+        if (p)
+            free_(p);
+        break;
+    }
+    case RIP_EVENT:
+        if (cb->on_rip)
         {
             core::DebugEvent ev;
             ev.pid  = DBGEvent.dwProcessId;
             ev.tid  = DBGEvent.dwThreadId;
             ev.code = DBGEvent.dwDebugEventCode;
-            cb->on_any_debug_event(cb->context, ev);
+            cb->on_rip(cb->context, ev);
         }
-        if (params->use_scylla_hide)
-            scylla_hide_on_debug();
-        switch (DBGEvent.dwDebugEventCode)
-        {
-        case EXCEPTION_DEBUG_EVENT:
-            if (cb->on_exception)
-            {
-                core::ExceptionEvent ev;
-                ev.pid  = DBGEvent.dwProcessId;
-                ev.tid  = DBGEvent.dwThreadId;
-                ev.code = DBGEvent.u.Exception.ExceptionRecord.ExceptionCode;
-                ev.addr = (size_t)DBGEvent.u.Exception.ExceptionRecord.ExceptionAddress;
-                cb->on_exception(cb->context, ev);
-            }
-            DBGCode = DBG_EXCEPTION_NOT_HANDLED;
-            switch (DBGEvent.u.Exception.ExceptionRecord.ExceptionCode)
-            {
-            case EXCEPTION_BREAKPOINT: // 遇到断点。
-                if (cb->on_breakpoint)
-                {
-                    core::BreakpointEvent ev;
-                    ev.pid  = DBGEvent.dwProcessId;
-                    ev.tid  = DBGEvent.dwThreadId;
-                    ev.addr = (size_t)DBGEvent.u.Exception.ExceptionRecord.ExceptionAddress;
-                    cb->on_breakpoint(cb->context, ev);
-                }
-                if (params->use_scylla_hide)
-                    scylla_hide_on_breakpoint();
-                if (FirstBPX)
-                {
-                    DBGCode = DBG_CONTINUE;
-                    if (cb->on_first_breakpoint)
-                    {
-                        core::FirstBreakpointEvent ev;
-                        ev.pid = DBGEvent.dwProcessId;
-                        ev.tid = DBGEvent.dwThreadId;
-                        cb->on_first_breakpoint(cb->context, ev);
-                    }
-                    FirstBPX = FALSE;
-                }
-                else
-                {
-                    size_t         ea     = (size_t)DBGEvent.u.Exception.ExceptionRecord.ExceptionAddress;
-                    PEInfo *peinfo = get_peinfo_by_ea(ea);
-                    if (peinfo)
-                    {
-                        LPTSTR                  modname = peinfo->Path + peinfo->name_offset;
-                        DWORD                   rva     = (DWORD)(ea - peinfo->base);
-                        BreakpointInfo *tmp = breakpoints().head();
-                        while (tmp)
-                        {
-                            BreakpointInfo *bp_next = tmp->next; /* 先留 next（remove 会置空） */
-                            if (!tmp->activate)
-                            {
-                                tmp = bp_next;
-                                continue;
-                            }
-                            if (rva != tmp->rva || _tcsicmp(modname, tmp->modname))
-                            {
-                                tmp = bp_next;
-                                continue;
-                            }
-                            if (!tmp->has_orignal_byte)
-                            {
-                                /* 旧实现在这里直接 lua_pushstring + lua_error（长跳、跳过清理）。
-                                 * 现改为「走完清理尾部 + 返回错误码」，由绑定层在 run 返回后
-                                 * lua_error —— Lua 可见行为一致，但不再长跳穿 C++ 帧（D18）。*/
-                                run_shutdown(params);
-                                *err = "tmp->has_orignal_byte is zero!";
-                                return -1;
-                            }
-                            disable_breakpoint(ea, modname, rva);
-                            DBGCode         = DBG_CONTINUE;
-                            HANDLE  hThread = get_thread_by_tid(DBGEvent.dwThreadId);
-                            CONTEXT context;
-                            context.ContextFlags = CONTEXT_CONTROL;
-                            GetThreadContext(hThread, &context);
-                            if (!tmp->is_single)
-                                context.EFlags |= 0x100;
-#if defined(_WIN64)
-                            context.Rip--;
-#else
-                            context.Eip--;
-#endif
-                            SetThreadContext(hThread, &context);
-                            callback_ref_t bp_callback = tmp->callback;
-                            bool           to_unref_cbk = false;
-                            if (tmp->is_single)
-                            {
-                                /* P6.2：摘除 + 释放一次完成（旧写法 `*pp = (*pp)->next; free_(tmp);`） */
-                                breakpoints().remove_and_free(tmp);
-                                to_unref_cbk = true;
-                            }
-                            else
-                            {
-                                BYTE original_byte;
-                                if (read(ea, &original_byte, 1))
-                                {
-                                    if (original_byte == 0x9C)
-                                        pushfbpx = TRUE;
+        break;
+    }
 
-                                    // 保存重置断点信息
-                                    reset_bpx.modname = modname;
-                                    reset_bpx.rva     = rva;
-                                    reset_bpx.ea      = ea;
-                                }
-                            }
-                            if (bp_callback.valid)
-                            {
-                                core::BreakpointCallbackEvent ev;
-                                ev.callback    = bp_callback;
-                                ev.pid         = DBGEvent.dwProcessId;
-                                ev.tid         = DBGEvent.dwThreadId;
-                                ev.ea          = ea;
-                                ev.rva         = rva;
-                                ev.modname     = modname;
-                                ev.single_shot = to_unref_cbk;
-                                cb->on_breakpoint_callback(cb->context, ev);
-                            }
-                            tmp = bp_next; /* 处理完一个节点后前进（旧实现靠 `activate` 被置 0 来落地下一轮） */
-                        }
-                    }
-                }
-                break;
-            case EXCEPTION_SINGLE_STEP: // 跟踪陷阱或其他单指令机制指示已执行一个指令。
-                if (cb->on_single_step)
-                {
-                    core::StepEvent ev;
-                    ev.pid  = DBGEvent.dwProcessId;
-                    ev.tid  = DBGEvent.dwThreadId;
-                    ev.addr = (size_t)DBGEvent.u.Exception.ExceptionRecord.ExceptionAddress;
-                    cb->on_single_step(cb->context, ev);
-                }
-                if (reset_bpx.modname || reset_hwbpx > 0)
-                {
-                    DBGCode = DBG_CONTINUE;
-                    if (pushfbpx)
-                    {
-                        pushfbpx = FALSE;
-                        // 处理pushf指令特殊情况
-                        HANDLE hThread = get_thread_by_tid(DBGEvent.dwThreadId);
-                        if (hThread)
-                        {
-                            CONTEXT context;
-                            context.ContextFlags = CONTEXT_CONTROL;
-                            if (GetThreadContext(hThread, &context))
-                            {
-#if defined(_WIN64)
-                                size_t csp = context.Rsp;
-#else
-                                size_t csp = context.Esp;
-#endif
-                                size_t data;
-                                if (read(csp, &data, sizeof data))
-                                {
-                                    data &= ~0x100;
-                                    write(csp, &data, sizeof data, false);
-                                }
-                            }
-                        }
-                    }
-
-                    if (reset_bpx.modname)
-                    {
-                        // 验证当前地址不是重置断点地址
-                        size_t current_ea = (size_t)DBGEvent.u.Exception.ExceptionRecord.ExceptionAddress;
-
-                        assert(reset_bpx.ea != current_ea);
-                        // 重新启用断点
-                        enable_breakpoint(reset_bpx.ea, reset_bpx.modname, reset_bpx.rva);
-
-                        // 清理reset_bpx
-                        reset_bpx.modname = NULL;
-                        reset_bpx.rva     = 0;
-                        reset_bpx.ea      = 0;
-                    }
-
-                    if (reset_hwbpx > 0)
-                    {
-                        for (int i = 0; i < 4; i++)
-                        {
-                            if ((1 << i) & reset_hwbpx)
-                                enable_hardware_breakpoint(i);
-                        }
-                        reset_hwbpx = 0;
-                    }
-                }
-                else
-                {
-                    HANDLE hThread = get_thread_by_tid(DBGEvent.dwThreadId);
-                    if (hThread)
-                    {
-                        CONTEXT context;
-                        context.ContextFlags = CONTEXT_CONTROL | CONTEXT_DEBUG_REGISTERS;
-                        if (GetThreadContext(hThread, &context))
-                        {
-                            for (int i = 0; i < 4; i++)
-                            {
-                                if ((&context.Dr0)[i] == (ULONG_PTR)DBGEvent.u.Exception.ExceptionRecord.ExceptionAddress || ((BYTE)context.Dr6 & (1 << i)))
-                                {
-                                    if (!hw_breakpoints()[i].activate)
-                                        DBGCode = DBG_EXCEPTION_NOT_HANDLED;
-                                    else
-                                    {
-                                        DBGCode = DBG_CONTINUE;
-                                        {
-                                            context.EFlags |= 0x100;
-                                            SetThreadContext(hThread, &context);
-                                        }
-                                        callback_ref_t hw_callback = hw_breakpoints()[i].callback;
-                                        if (hw_callback.valid)
-                                        {
-                                            core::HwBreakpointCallbackEvent ev;
-                                            ev.callback  = hw_callback;
-                                            ev.ea        = (size_t)DBGEvent.u.Exception.ExceptionRecord.ExceptionAddress;
-                                            ev.pid       = DBGEvent.dwProcessId;
-                                            ev.tid       = DBGEvent.dwThreadId;
-                                            cb->on_hw_breakpoint_callback(cb->context, ev);
-                                        }
-                                        reset_hwbpx |= 1 << i;
-                                        disable_hardware_breakpoint(i);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                break;
-            default:
-                if (cb->on_user_exception)
-                {
-                    core::UserExceptionEvent ev;
-                    ev.pid          = DBGEvent.dwProcessId;
-                    ev.tid          = DBGEvent.dwThreadId;
-                    ev.first_chance = !!DBGEvent.u.Exception.dwFirstChance;
-                    ev.record       = &DBGEvent.u.Exception.ExceptionRecord;
-                    cb->on_user_exception(cb->context, ev);
-                }
-                DBGCode = DBG_EXCEPTION_NOT_HANDLED;
-                break;
-            }
-            break;
-        case CREATE_THREAD_DEBUG_EVENT:
-            if (cb->on_create_thread)
-            {
-                core::ThreadEvent ev;
-                ev.pid  = DBGEvent.dwProcessId;
-                ev.tid  = DBGEvent.dwThreadId;
-                ev.addr = (size_t)DBGEvent.u.CreateThread.lpStartAddress;
-                cb->on_create_thread(cb->context, ev);
-            }
-            {
-                /* P6.2：直接由链表分配（`OwnedIntrusiveList::create_front`）——与旧代码
-                 * `AllocX + next = head + head = info` 完全等价，只是把所有权交给链表。 */
-                ThreadInfo *info       = threads().create_front();
-                info->dwThreadId        = DBGEvent.dwThreadId;
-                info->hThread           = DBGEvent.u.CreateThread.hThread;
-                info->ProcessId         = DBGEvent.dwProcessId;
-                info->lpStartAddress    = (size_t)DBGEvent.u.CreateThread.lpStartAddress;
-                break;
-            }
-        case CREATE_PROCESS_DEBUG_EVENT:
-            if (!first_create_process)
-            {
-                first_create_process = true;
-                /* P6.1：映像文件句柄归调试器所有（MSDN）——旧代码只把它存进 `dbgfilehandle` 当标志、
-                 * **从未关闭** → 现在用完立即关（RAII 到本作用域末）；行为变更（修复句柄泄漏）。 */
-                unique_handle image_file(DBGEvent.u.CreateProcessInfo.hFile);
-                if (params->pid && params->pid == DBGEvent.dwProcessId)
-                {
-                    proc().hProcess   = DBGEvent.u.CreateProcessInfo.hProcess;
-                    proc().hThread    = DBGEvent.u.CreateProcessInfo.hThread;
-                    proc().dwThreadId = DBGEvent.dwThreadId;
-                }
-            }
-            {
-                TCHAR image_name[MAX_FILEPATH];
-#ifdef _UNICODE
-                DWORD image_name_len =
-                    GetMappedFileNameW(DBGEvent.u.CreateProcessInfo.hProcess, DBGEvent.u.CreateProcessInfo.lpBaseOfImage, image_name, _countof(image_name));
-#else
-                DWORD image_name_len = LjGetMappedFileNameA(DBGEvent.dwProcessId, DBGEvent.u.CreateProcessInfo.lpBaseOfImage, image_name, _countof(image_name));
-#endif
-                LPCTSTR translated_name = TranslateNativeName(image_name);
-                image_name_len -= (DWORD)(translated_name - image_name);
-                /* P6.2：变长节点由链表一次分配（`sizeof(PEInfo) + n*sizeof(TCHAR)`，与旧
-                 * `alloc_(info_size)` 同一算法）；`create_front` 返回的节点**已整块清零**（含 next 已接好）。 */
-                PEInfo *info = peinfos().create_front(image_name_len * sizeof(TCHAR));
-                info->dwProcessId   = DBGEvent.dwProcessId;
-                info->base          = (size_t)DBGEvent.u.CreateProcessInfo.lpBaseOfImage;
-                info->start_address = (size_t)DBGEvent.u.CreateProcessInfo.lpStartAddress;
-                info->name_offset   = PathFindFileName(translated_name) - translated_name;
-                /* ❗按 TCHAR 的**宽**度拷：legacy（ANSI）变体里 TCHAR 是 1 字节，用 `__movsw`
-                 * 会按 2 字节一个单元拷 `image_name_len` 个 → 越界写掉半个缓冲（分配只有
-                 * `image_name_len * sizeof(TCHAR)` 字节）→ 堆损坏，表现为随机 AV。 */
-#ifdef _UNICODE
-                __movsw((LPWORD)info->Path, (const WORD *)translated_name, image_name_len);
-#else
-                __movsb((PBYTE)info->Path, (const BYTE *)translated_name, image_name_len);
-#endif
-                info->Path[image_name_len] = 0;
-                if (!calc_crc32(info->Path, &info->crc32))
-                    cont() = false;
-                update_breakpoints(info);
-                if (cb->on_create_process)
-                {
-                    core::ProcessEvent ev;
-                    ev.pid  = DBGEvent.dwProcessId;
-                    ev.tid  = DBGEvent.dwThreadId;
-                    ev.addr = (size_t)DBGEvent.u.CreateProcessInfo.lpStartAddress;
-                    ev.base = (size_t)DBGEvent.u.CreateProcessInfo.lpBaseOfImage;
-                    ev.path = info->Path;
-                    cb->on_create_process(cb->context, ev);
-                }
-            }
-            if (params->use_scylla_hide)
-                scylla_hide_on_create_process(DBGEvent.dwProcessId, DBGEvent.u.CreateProcessInfo.lpStartAddress);
-            {
-                ThreadInfo *info       = threads().create_front();
-                info->dwThreadId        = DBGEvent.dwThreadId;
-                info->hThread           = DBGEvent.u.CreateProcessInfo.hThread;
-                info->ProcessId         = DBGEvent.dwProcessId;
-            }
-            break;
-        case EXIT_THREAD_DEBUG_EVENT:
-            if (cb->on_exit_thread)
-            {
-                core::ExitEvent ev;
-                ev.pid  = DBGEvent.dwProcessId;
-                ev.tid  = DBGEvent.dwThreadId;
-                ev.code = DBGEvent.u.ExitThread.dwExitCode;
-                cb->on_exit_thread(cb->context, ev);
-            }
-            {
-                /* P6.2：按 tid 找节点 → 关句柄（P6.1 的修复，D29）→ 摘除并释放 */
-                for (ThreadInfo *tmp = threads().head(); tmp; tmp = tmp->next)
-                {
-                    if (tmp->dwThreadId != DBGEvent.dwThreadId)
-                        continue;
-                    if (tmp->hThread)
-                        CloseHandle(tmp->hThread);
-                    threads().remove_and_free(tmp);
-                    break;
-                }
-                break;
-            }
-        case EXIT_PROCESS_DEBUG_EVENT:
-            if (cb->on_exit_process)
-            {
-                core::ExitEvent ev;
-                ev.pid  = DBGEvent.dwProcessId;
-                ev.tid  = DBGEvent.dwThreadId;
-                ev.code = DBGEvent.u.ExitProcess.dwExitCode;
-                cb->on_exit_process(cb->context, ev);
-            }
-            {
-                if (DBGEvent.dwProcessId == proc().dwProcessId)
-                    cont() = false;
-                DBGCode            = DBG_CONTINUE;
-                for (PEInfo *tmp = peinfos().head(); tmp; )
-                {
-                    PEInfo *next = tmp->next; /* 先留 next（remove 会把它置空） */
-                    if (tmp->dwProcessId == DBGEvent.dwProcessId)
-                    {
-                        del_breakpoints_by_modname_without_update_memory(cb, tmp->Path + tmp->name_offset);
-                        peinfos().remove_and_free(tmp);
-                    }
-                    tmp = next;
-                }
-                break;
-            }
-        case LOAD_DLL_DEBUG_EVENT:
-        {
-            /* P6.1：本事件带的 `hFile` 归调试器所有、用完就该关（旧实现从不关 → 每加载一个 DLL 泄漏一个句柄）。
-             * RAII 到本 case 结束；日志文案里仍打印原表达式以保持文本一致。 */
-            unique_handle load_dll_file(DBGEvent.u.LoadDll.hFile);
-            TCHAR         image_name[MAX_FILEPATH];
-#if !defined(_UNICODE)
-            DWORD image_name_len = LjGetMappedFileNameA(proc().dwProcessId, DBGEvent.u.LoadDll.lpBaseOfDll, image_name, _countof(image_name));
-            if (!image_name_len)
-                E("LjGetMappedFileNameA(0x%zX)", DBGEvent.u.LoadDll.lpBaseOfDll);
-#elif defined(_WIN64)
-            DWORD image_name_len = GetFinalPathNameByHandleW(DBGEvent.u.LoadDll.hFile, image_name, _countof(image_name), VOLUME_NAME_NT);
-            if (!image_name_len)
-                E("GetFinalPathNameByHandleW(0x%zX)", DBGEvent.u.LoadDll.hFile);
-#else
-            DWORD image_name_len = GetMappedFileNameW(proc().hProcess, DBGEvent.u.LoadDll.lpBaseOfDll, image_name, _countof(image_name));
-            if (!image_name_len)
-                E("GetMappedFileNameW(0x%zX)", DBGEvent.u.LoadDll.lpBaseOfDll);
-#endif
-            PEInfo *info = NULL;
-            if (image_name_len)
-            {
-                LPCTSTR translated_name = TranslateNativeName(image_name);
-                image_name_len -= (DWORD)(translated_name - image_name);
-                /* P6.2：变长节点由链表一次分配（与旧 `alloc_(sizeof(PEInfo) + n*sizeof(TCHAR))` 同算法） */
-                info         = peinfos().create_front(image_name_len * sizeof(TCHAR));
-                info->base        = (size_t)DBGEvent.u.LoadDll.lpBaseOfDll;
-                info->name_offset = PathFindFileName(translated_name) - translated_name;
-                /* ❗同 CREATE_PROCESS 那处：legacy（ANSI）的 TCHAR 是 1 字节，`__movsw` 会
-                 * 按 2 字节拷 → 溢出分配的 `image_name_len` 字节 → 堆损坏（随机 AV）。 */
-#ifdef _UNICODE
-                __movsw((LPWORD)info->Path, (const WORD *)translated_name, image_name_len);
-#else
-                __movsb((PBYTE)info->Path, (const BYTE *)translated_name, image_name_len);
-#endif
-                info->Path[image_name_len] = 0;
-                if (!calc_crc32(info->Path, &info->crc32))
-                    cont() = false;
-                update_breakpoints(info);
-            }
-            if (cb->on_load_dll)
-            {
-                core::DllEvent ev;
-                ev.pid  = DBGEvent.dwProcessId;
-                ev.tid  = DBGEvent.dwThreadId;
-                ev.base = (size_t)DBGEvent.u.LoadDll.lpBaseOfDll;
-                ev.path = info ? info->Path : NULL;
-                cb->on_load_dll(cb->context, ev);
-            }
-            if (params->use_scylla_hide)
-                scylla_hide_on_create_dll(DBGEvent.u.LoadDll.lpBaseOfDll);
-            break;
-        }
-        case UNLOAD_DLL_DEBUG_EVENT:
-            if (cb->on_unload_dll)
-            {
-                core::DllEvent ev;
-                ev.pid  = DBGEvent.dwProcessId;
-                ev.tid  = DBGEvent.dwThreadId;
-                ev.base = (size_t)DBGEvent.u.UnloadDll.lpBaseOfDll;
-                ev.path = NULL;
-                cb->on_unload_dll(cb->context, ev);
-            }
-            {
-                for (PEInfo *tmp = peinfos().head(); tmp; )
-                {
-                    PEInfo *next = tmp->next;
-                    if (tmp->base == (size_t)DBGEvent.u.UnloadDll.lpBaseOfDll)
-                    {
-                        del_breakpoints_by_modname_without_update_memory(cb, tmp->Path + tmp->name_offset);
-                        peinfos().remove_and_free(tmp);
-                    }
-                    tmp = next;
-                }
-                break;
-            }
-        case OUTPUT_DEBUG_STRING_EVENT:
-        {
-            // ODS 事件的 ContinueDebugEvent 状态**必须是 DBG_CONTINUE**（MSDN）。
-            // 旧代码用 DBG_EXCEPTION_NOT_HANDLED → 实测（本机 Win11 + 六产物）会导致
-            // 同一个 ODS 事件被重投递，回调/回显各触发两次（缺陷 D11，已修）。
-            DBGCode              = DBG_CONTINUE;
-            DWORD       ods_size = DBGEvent.u.DebugString.nDebugStringLength;
-            bool        ods_uni  = DBGEvent.u.DebugString.fUnicode != 0;
-            const void *ods_data = NULL;
-            void       *p        = NULL;
-            if (DBGEvent.u.DebugString.lpDebugStringData && DBGEvent.u.DebugString.nDebugStringLength)
-            {
-                p = alloc_(DBGEvent.u.DebugString.nDebugStringLength);
-                if (read((size_t)DBGEvent.u.DebugString.lpDebugStringData, p, DBGEvent.u.DebugString.nDebugStringLength))
-                    ods_data = p;
-            }
-            /* 控制台回显（不属于 Lua，留在 core）：与旧实现同序 —— 先回显、后回调
-             * ❗`nDebugStringLength` **含**结尾的 NUL（MSDN："including the terminating null"）
-             *   ⇒ 直接抳长度会把 0x00 一起写进输出（`--json` 的信封里表现为 `stdout` 里
-             *   混进 `\u0000`，那一行也不再是合法 JSON 的单行文本）。这里去掉结尾的 NUL，
-             *   并把同一份长度交给 Lua 回调（否则脚本里的 `ev.str` 带上 `\0` 又会污染 stdout）。 */
-            if (ods_data)
-            {
-                if (!ods_uni)
-                {
-                    if (ods_size > 0 && ((const char *)ods_data)[ods_size - 1] == '\0')
-                        ods_size--;
-                    PrintN((LPCSTR)ods_data, ods_size);
-                }
-#ifdef _UNICODE
-                else
-                {
-                    if (ods_size >= sizeof(WCHAR) && ((const WCHAR *)ods_data)[ods_size / sizeof(WCHAR) - 1] == L'\0')
-                        ods_size -= sizeof(WCHAR);
-                    PrintN((LPCWSTR)ods_data, ods_size / sizeof(WCHAR));
-                }
-#endif
-            }
-            /* 旧行为：只要登记了回调就**总是**调用（读取失败时表里没有 str 字段） */
-            if (cb->on_output_debug_string)
-            {
-                core::OutputDebugStringEvent ev;
-                ev.pid     = DBGEvent.dwProcessId;
-                ev.tid     = DBGEvent.dwThreadId;
-                ev.data    = ods_data;
-                ev.size    = ods_size;
-                ev.unicode = ods_uni;
-                cb->on_output_debug_string(cb->context, ev);
-            }
-            if (p)
-                free_(p);
-            break;
-        }
-        case RIP_EVENT:
-            if (cb->on_rip)
-            {
-                core::DebugEvent ev;
-                ev.pid  = DBGEvent.dwProcessId;
-                ev.tid  = DBGEvent.dwThreadId;
-                ev.code = DBGEvent.dwDebugEventCode;
-                cb->on_rip(cb->context, ev);
-            }
-            break;
-        }
-        if (!ContinueDebugEvent(DBGEvent.dwProcessId, DBGEvent.dwThreadId, DBGCode))
+    /* `autocont = false` ⇒ ❗不 continue：事件停在未应答状态（`DBG_EVENT_UNHANDLED` 就是为此存在），
+     * 由调用方显式 `cont(pid, tid, code)`。 */
+    if (autocont)
+    {
+        if (!cont(DBGEvent.dwProcessId, DBGEvent.dwThreadId, DBGCode))
         {
             E("ContinueDebugEvent");
-            break;
+            m_cont = false; /* 旧的 `break` */
         }
     }
-    run_shutdown(params);
+    return (int)DBGEvent.dwDebugEventCode;
+}
+
+/* cont：ContinueDebugEvent（T7.1）—— `code` 显式（含「原样交给程序」）。 */
+bool DebuggerSession::cont(DWORD pid, DWORD tid, DWORD code)
+{
+    return ContinueDebugEvent(pid, tid, code) != 0;
+}
+
+/* end：收尾（原 `run` 的尾部）。`end` 不自己 detach：detach 只发生在 pump 的空闲路径
+ * （1:1 保留旧行为 —— `to_detach()` 只在没等到事件时被执行），所以这里只有 `run_shutdown`。
+ * D47 的降级（Win95/98 没有 DebugActiveProcessStop → 只能 terminate）由返回值与 `term()` 上报。 */
+int DebuggerSession::end(const char **err)
+{
+    (void)err; /* 目前不产生错误；与 begin / pump 保持同一签名 */
+    run_shutdown(m_params);
     return 0;
+}
+
+/* pump_now() = pump(0, false)：REPL 与回调里唯一能用的形态（不阻塞、不 continue） */
+int DebuggerSession::pump_now(const char **err)
+{
+    return pump(0, false, err);
+}
+
+/* run（`lua_Run` / `lua_Attach` 仍调它）= begin + while + pump(autocont = true) + end 的封装。
+ * 返回 0 = 正常结束；-1 = 引擎内部错误（*err 指向静态字符串）。
+ * ❗ 错误**不用长跳**表达（D18）：内部错误正常返回，由绑定层在 run 返回后 lua_error。 */
+int DebuggerSession::run(const core::RunParams *params, const core::DebugCallbacks *cb, const char **err)
+{
+    int r = begin(params, cb, err);
+    if (r == -2)
+        return 0; /* 1:1：附加失败时旧实现直接返回 0（不跑收尾） */
+    if (r != 0)
+        return r;
+
+    while (cont())
+    {
+        r = pump(100, true, err);
+        if (r < 0)
+            return r; /* pump 的内部错误路径已自行跑过收尾（1:1） */
+    }
+    return end(err);
 }

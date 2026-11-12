@@ -18,6 +18,12 @@
  *   模块之间按 Q9 用「内部头 + session 成员」直接访问（即下面的过程态访问器），
  *   只有绑定层看到公有接口，P6.4 再统一收窄。
  *
+ * ✅ T7.1（plan_t7.md §2.1）：调试主循环拆成状态机 `begin` / `pump` / `cont` / `end`，`run` 是它的
+ *   封装（可观察行为逐字节不变）。跨 pump 的循环状态（`m_first_bp` / `m_push_fb` / `m_reset_bpx` /
+ *   `m_reset_hw_bp` / `m_first_create_process` / `m_debug_active_process_stop`，加上 `begin` 存下的
+ *   `m_params` / `m_cb`）**必须是会话成员** —— 手工映射的模块禁止 `thread_local` 与函数内非平凡
+ *   构造的 static（§11.5、PITFALLS M10），留在栈上就是跨 pump 状态丢失。
+ *
  * 链表字段目前仍是**裸指针 + 首成员 next**（与旧实现 1:1）；P6.2 换成
  *   `common::IntrusiveList<T>`（容器已实现并有单测）。
  * ========================================================================== */
@@ -54,7 +60,7 @@ public:
     using HwBpArray = HardwareBreakpointInfo[4];
     HwBpArray &hw_breakpoints() noexcept { return m_hw_breakpoints; } /* 原 autodbg::core::current_session().hw_breakpoints()[4] */
 
-    bool &cont() noexcept { return m_cont; }           /* 原 autodbg::core::current_session().cont() */
+    bool &cont() noexcept { return m_cont; }           /* 原 autodbg::core::current_session().cont() —— ❗与下面的 `cont(pid, tid, code)` 是重载：无参 = 循环标志 */
     bool &term() noexcept { return m_term; }           /* 原 autodbg::core::current_session().term() */
     bool &to_detach() noexcept { return m_to_detach; } /* 原 autodbg::core::current_session().to_detach() */
     /* ------------------------- 引擎 API（P3.A.5 / P3.B 迁入） -------------------------
@@ -113,6 +119,16 @@ public:
 
     /* --- 调试主循环（debug_loop.cpp） --- */
     int run(const RunParams *params, const DebugCallbacks *cb, const char **err);
+
+    /* T7.1（plan_t7.md §2.1）：`run` 就是下面四件套的封装（begin + while + pump(autocont = true) + end）。
+     * 返回值口径（与 run 一致）：0 = 正常；-1 = 引擎内部错误（`*err` 已置，那条路径已自行跑收尾）；
+     * `begin` 另用 -2 上报「附加失败但 1:1 不跑收尾」。`pump` 返回调试事件码（0 = 没等到事件）。
+     * ❗`begin` 存的是调用方的 `params` / `cb` 指针 —— 调用方必须保证它们活过整个状态机。 */
+    int  begin(const RunParams *params, const DebugCallbacks *cb, const char **err);
+    int  pump(DWORD timeout_ms, bool autocont, const char **err);   /* autocont = false ⇒ ❗不 continue */
+    int  pump_now(const char **err);                                /* pump(0, false) */
+    bool cont(DWORD pid, DWORD tid, DWORD code);                    /* ContinueDebugEvent（code 显式） */
+    int  end(const char **err);
 private:
     /* `run` 的收尾（P6.4：随 run 一起进会话，使用会话自身的状态） */
     void run_shutdown(const RunParams *params);
@@ -125,6 +141,30 @@ private:
     bool                   m_cont{};
     bool                   m_term{};
     bool                   m_to_detach{};
+
+    /* -------------- T7.1：跨 pump 的循环状态（原 `run` 的栈局部）--------------
+     * 这些是「原来在 while 的栈帧里、pump 之间必须保留」的东西（§11.5 / PITFALLS M10）。 */
+    const RunParams      *m_params{};   /* begin 存下的调用方对象（与调用期同寿命） */
+    const DebugCallbacks *m_cb{};
+    bool m_first_bp{};                  /* 原 `FirstBPX`：首个 EXCEPTION_BREAKPOINT 走 DBG_CONTINUE */
+    bool m_push_fb{};                   /* 原 `pushfbpx`：pushf 特殊情况（EFlags 被置了就要清） */
+    int  m_reset_hw_bp{};               /* 原 `reset_hwbpx`：DR0-3 的位掩码（单步后 re-arm） */
+    bool m_first_create_process{};      /* 原 `first_create_process`（旧 `dbgfilehandle` 的实际语义） */
+
+    /* 原 `reset_bpx {modname, rva, ea}`：待 re-arm 的软件断点（`modname == NULL` = 没有）。
+     * ❗D32：显式初始化必须在构造函数或 `begin`（「武装后首次访问必定漏掉」不能复发）。 */
+    struct ResetBpx
+    {
+        LPCTSTR modname;
+        DWORD   rva;
+        size_t  ea;
+    };
+    ResetBpx m_reset_bpx{};
+
+    /* `DebugActiveProcessStop`（NT4+，Win95/98 没有）：在 `begin` 里解析一次；取不到 → D47 的
+     * 降级（只能 terminate）。这里按 C 名字保留（与 `bindings.cpp` 的 `lua_detach` 同一口径）。 */
+    typedef BOOL(WINAPI *DebugActiveProcessStopFn)(DWORD dwProcessId);
+    DebugActiveProcessStopFn m_debug_active_process_stop{};
 };
 
 /* ---------------- 当前会话（P3.B 模块 11 引入；P6.4 后范围收窄） ----------------
