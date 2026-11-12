@@ -24,6 +24,8 @@
 #   ⑧ 未知 control 命令 → ack{applied:false, reason:"unknown-cmd"}
 #   ⑨ 显式 token：错 token → error{unauthorized}；对 token → info
 #   ⑩ control shutdown → ack + 进程退出码 0
+#   ⑪ **执行期的 control**（D32 的两个 poll 点）：Lua 死循环里 cancel、
+#      引擎空转（Run 一个闲置目标）里 cancel / kill / detach —— 都不需要等脚本跑完
 # =============================================================================
 [CmdletBinding()]
 param(
@@ -93,7 +95,8 @@ function Recv-Exact($s, [byte[]]$Buf)
     $rd = 0
     while ($rd -lt $Buf.Length)
     {
-        $n = $s.Read($Buf, $rd, $Buf.Length - $rd)
+        try { $n = $s.Read($Buf, $rd, $Buf.Length - $rd) }
+        catch { return $false }   # 读超时/断开：当作「拿不到帧」，让断言报 FAIL 而不是把脚本炸掉
         if ($n -le 0) { return $false }
         $rd += $n
     }
@@ -283,6 +286,83 @@ With-Server @() {
 }
 
 # --------------------------------------- ⑨ 显式 token：错的被拒、对的通过（D21）
+# 读到指定类型的帧为止（其它帧收下但不动）；超时 / 对端关闭 → $null
+# `$OutFrames` 收集 type == 4 的正文，方便顺带断言 stdout。
+function Recv-Until($s, [int]$Type, [int]$TimeoutMs = 8000, [scriptblock]$OnFrame)
+{
+    $deadline = [datetime]::UtcNow.AddMilliseconds($TimeoutMs)
+    while ([datetime]::UtcNow -lt $deadline)
+    {
+        $f = Recv-Frame $s
+        if ($null -eq $f) { return $null }
+        if ($OnFrame) { & $OnFrame $f }
+        if ($f.type -eq $Type) { return $f }
+    }
+    return $null
+}
+
+# ------------------------------------------ ⑩ 执行期的 control（D32 两个 poll 点）
+# ❗这一段就是 D32 的门禁：脚本正在跳（或引擎正在空转）时，control 帧必须能立刻被读到。
+$RunLongSrc = @'
+-- 引擎会一直阻塞在 WaitForDebugEvent（目标闲置）→ on_wait_timeout 的 100 ms poll
+-- ❗命令用 Lua 长括号：here-string 里的路径是字面的，写成 'C:\Windows\…' 会被 Lua 当成非法转义
+Run({ cmdline = [[C:\Windows\System32\cmd.exe]] .. ' /c ping -n 5 127.0.0.1' })
+'@
+$BusySrc = 'while true do end'   # 纯 Lua 死循环 → 只能靠 lua_sethook 的计数钩子
+
+With-Server @() {
+    param($c)
+    $s = $c.GetStream()
+    Send-Frame $s 10 0 1 '' $null
+    $null = Recv-Frame $s
+
+    Send-Frame $s 11 0 0 '' ([System.Text.Encoding]::UTF8.GetBytes($BusySrc))
+    Start-Sleep -Milliseconds 400                     # 让脚本真的跑起来（进死循环）
+    Send-Frame $s 12 0 0 '' $null                     # cancel
+    $ack = Recv-Until $s 8 8000
+    $aj = if ($ack) { $ack.json | ConvertFrom-Json } else { $null }
+    Check 'cancel.lua-loop-ack' ($ack -and $aj.applied -eq $true -and $aj.reason -eq 'cancel-requested') "json=$($ack.json)"
+    $res = Recv-Until $s 5 8000
+    $rj = if ($res) { $res.json | ConvertFrom-Json } else { $null }
+    Check 'cancel.lua-loop-result' ($rj -and $rj.ok -eq $false -and $rj.canceled -eq $true) "json=$($res.json)"
+    $null = Recv-Until $s 14 3000                       # end
+
+    Send-Frame $s 11 0 0 '' ([System.Text.Encoding]::UTF8.GetBytes($RunLongSrc))
+    Start-Sleep -Milliseconds 600                     # 此时引擎已阻塞在 WaitForDebugEvent
+    Send-Frame $s 12 0 0 '' $null                     # cancel
+    $ack = Recv-Until $s 8 8000
+    $aj = if ($ack) { $ack.json | ConvertFrom-Json } else { $null }
+    Check 'cancel.engine-wait-ack' ($ack -and $aj.applied -eq $true) "json=$($ack.json)"
+    $res = Recv-Until $s 5 8000
+    $rj = if ($res) { $res.json | ConvertFrom-Json } else { $null }
+    Check 'cancel.engine-wait-result' ($rj -and $rj.canceled -eq $true) "json=$($res.json)"
+    $null = Recv-Until $s 14 3000
+
+    # kill（软动作，D46）：只结束当前 Run，脚本继续 -> result.ok = true
+    Send-Frame $s 11 0 0 '' ([System.Text.Encoding]::UTF8.GetBytes($RunLongSrc))
+    Start-Sleep -Milliseconds 600
+    Send-Frame $s 12 1 0 '' $null                     # kill
+    $ack = Recv-Until $s 8 8000
+    $aj = if ($ack) { $ack.json | ConvertFrom-Json } else { $null }
+    Check 'kill.engine-wait-ack' ($ack -and $aj.applied -eq $true -and $aj.reason -eq 'requested') "json=$($ack.json)"
+    $res = Recv-Until $s 5 8000
+    $rj = if ($res) { $res.json | ConvertFrom-Json } else { $null }
+    Check 'kill.engine-wait-result' ($rj -and $rj.ok -eq $true) "json=$($res.json)"
+    $null = Recv-Until $s 14 3000
+
+    # detach（软动作，D47）：同上，但目标是**保留**（DebugActiveProcessStop）
+    Send-Frame $s 11 0 0 '' ([System.Text.Encoding]::UTF8.GetBytes($RunLongSrc))
+    Start-Sleep -Milliseconds 600
+    Send-Frame $s 12 2 0 '' $null                     # detach
+    $ack = Recv-Until $s 8 8000
+    $aj = if ($ack) { $ack.json | ConvertFrom-Json } else { $null }
+    Check 'detach.engine-wait-ack' ($ack -and $aj.applied -eq $true -and $aj.reason -eq 'requested') "json=$($ack.json)"
+    $res = Recv-Until $s 5 8000
+    $rj = if ($res) { $res.json | ConvertFrom-Json } else { $null }
+    Check 'detach.engine-wait-result' ($rj -and $rj.ok -eq $true) "json=$($res.json)"
+    $null = Recv-Until $s 14 3000
+}
+
 $tok = 'deadbeefcafe1234'
 With-Server @("--server-token=$tok") {
     param($c)

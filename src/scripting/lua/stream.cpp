@@ -27,7 +27,20 @@ long long         g_sock    = -1;
 unsigned          g_timeout = 8000;
 bool              g_active  = false;
 int               g_framing = stream_framing_chunked;
-stream_transport  g_tp      = {nullptr, nullptr, nullptr};
+stream_transport  g_tp      = {nullptr, nullptr, nullptr, nullptr};
+
+/* 执行期 poll 的重组缓冲（D32）：只应付 `control` / `end` 这种小帧。
+ * ❗脚本线程是唯一 writer/reader，不需要锁；`stream_begin_ex` / `stream_begin` 时清零。
+ * 布局 = 4 字节长度前缀 + 8 字节帧头 + json（≤ k_ctrl_max）。 */
+enum
+{
+    k_ctrl_max    = 4096,
+    k_poll_buf_sz = 4 + 8 + k_ctrl_max,
+};
+unsigned char     g_poll_buf[k_poll_buf_sz];
+size_t            g_poll_have = 0;
+stream_control_fn g_ctrl_fn   = nullptr;
+void             *g_ctrl_ctx  = nullptr;
 
 /* 默认传输（winsock）：winsock 句柄用 `void*` 承载（`long long` → 指针，x86/x64 都够） */
 bool sock_send(void *ctx, const void *data, size_t len)
@@ -44,6 +57,14 @@ int sock_recv(void *ctx, void *buf, size_t cap)
     if (g_sock < 0)
         return -1;
     return autodbg::common::net_recv(g_sock, buf, cap, (int)g_timeout);
+}
+
+int sock_recv_nowait(void *ctx, void *buf, size_t cap)
+{
+    (void)ctx;
+    if (g_sock < 0)
+        return -1;
+    return autodbg::common::net_recv(g_sock, buf, cap, 0);   /* 0 ms = 只查一下，不阻塞 */
 }
 
 bool tp_send(const void *data, size_t len)
@@ -127,8 +148,10 @@ bool stream_begin(long long sock, unsigned send_timeout_ms)
     g_framing = stream_framing_chunked;
     g_tp.send = sock_send;
     g_tp.recv = sock_recv;
+    g_tp.recv_nowait = sock_recv_nowait;
     g_tp.ctx  = nullptr;
     g_active  = false;
+    g_poll_have = 0;
 
     static const char k_head[] = "HTTP/1.1 200 OK\r\n"
                                  "Content-Type: application/x-autodbg-stream\r\n"
@@ -156,6 +179,7 @@ bool stream_begin_ex(const stream_transport &tp, int framing, unsigned send_time
     g_timeout = (send_timeout_ms > 0) ? send_timeout_ms : 8000;
     g_framing = framing;
     g_tp      = tp;
+    g_poll_have = 0;                /* 新的连接：重组缓冲从头算 */
     g_active  = true;               /* 分帧层自己起头（raw 没有握手串要发） */
     return true;
 }
@@ -166,7 +190,11 @@ void stream_end()
     g_sock    = -1;
     g_tp.send = nullptr;
     g_tp.recv = nullptr;
+    g_tp.recv_nowait = nullptr;
     g_tp.ctx  = nullptr;
+    g_poll_have = 0;
+    g_ctrl_fn   = nullptr;
+    g_ctrl_ctx  = nullptr;
 }
 
 bool stream_active()
@@ -280,5 +308,92 @@ bool stream_finish()
         return true;   /* raw 分帧没有终止块（帧自带长度） */
     static const char k_last[] = "0\r\n\r\n";
     return tp_send(k_last, sizeof k_last - 1);
+}
+
+void stream_set_control_handler(stream_control_fn fn, void *ctx)
+{
+    g_ctrl_fn  = fn;
+    g_ctrl_ctx = ctx;
+}
+
+int stream_poll_frame(unsigned *out_type, unsigned *out_flags, char *json, size_t json_cap)
+{
+    if (!g_active || g_tp.recv_nowait == nullptr)
+        return 0;   /* 没有执行连接 / 传输不支持非阻塞读：安静地当作「没收到」 */
+
+    /* ① 尽快把已有字节收进重组缓冲（最多补到满） */
+    for (;;)
+    {
+        if (g_poll_have >= sizeof g_poll_buf)
+            break;
+        int r = g_tp.recv_nowait(g_tp.ctx, g_poll_buf + g_poll_have, sizeof g_poll_buf - g_poll_have);
+        if (r > 0)
+        {
+            g_poll_have += (size_t)r;
+            continue;
+        }
+        if (r == 0)
+            return -1;   /* 对端关闭 */
+        if (r == -2)
+            break;       /* 现在没数据 */
+        return -1;
+    }
+
+    /* ② 够一帧了吗（raw 分帧：4 字节长度前缀 + payload） */
+    if (g_poll_have < 4)
+        return 0;
+    size_t payload = 0;
+    if (!common::frame_prefix_decode(g_poll_buf, 4, &payload))
+        return -2;
+    if (payload > (size_t)k_ctrl_max)
+        return -2;   /* 执行期收到大帧（比如一次新 script）= 协议错误，连接作废 */
+    size_t total = 4 + payload;
+    if (g_poll_have < total)
+        return 0;    /* 还没收完 */
+
+    common::frame_header fh;
+    if (!common::frame_header_decode(g_poll_buf + 4, 8, &fh))
+        return -2;
+    size_t json_len = 0;
+    if (!common::frame_json_len(payload, fh.data_len, &json_len))
+        return -2;
+
+    /* ③ 交出去（data 段忽略：control 的负载全在 flags 里） */
+    if (out_type != nullptr)
+        *out_type = fh.type;
+    if (out_flags != nullptr)
+        *out_flags = fh.flags;
+    if (json != nullptr && json_cap > 1)
+    {
+        size_t n = (json_len < json_cap - 1) ? json_len : json_cap - 1;
+        for (size_t i = 0; i < n; i++)
+            json[i] = (char)g_poll_buf[4 + 8 + i];
+        json[n] = '\0';
+    }
+
+    /* 把剩下的字节移到缓冲头（一次执行里控制帧很少，但别让它堆满） */
+    size_t rest = g_poll_have - total;
+    for (size_t i = 0; i < rest; i++)
+        g_poll_buf[i] = g_poll_buf[total + i];
+    g_poll_have = rest;
+    return 1;
+}
+
+void stream_poll_and_dispatch()
+{
+    if (!g_active || g_ctrl_fn == nullptr)
+        return;   /* 本地模式 / 没有执行连接：两个 poll 点必须接近零开销 */
+
+    unsigned type  = 0;
+    unsigned flags = 0;
+    char     json[64];
+    int      r     = stream_poll_frame(&type, &flags, json, sizeof json);
+    if (r != 1)
+        return;   /* 0 = 没帧；-1/-2 = 连接坏了（交给下一轮 guard 处理） */
+    if (type == stream_frame_control)
+        g_ctrl_fn(g_ctrl_ctx, flags, flags);   /* 命令就在 flags（见 stream_control_cmd） */
+    else if (type == stream_frame_end)
+        stream_end();                          /* 客户端主动收尾：后续写入全局失活 */
+    /* 其它类型在执行期属于协议错误，忽略（不把执行打断） */
 }
 } /* namespace autodbg::host */

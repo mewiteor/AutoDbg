@@ -88,15 +88,20 @@ enum stream_control_cmd
 /* 传输钩子（单连接、串行）。
  *   send：写满为止；false = 客户端断开/超时。
  *   recv：>0 = 读到的字节数；0 = 对端关闭；-1 = 错误；-2 = 超时（调用方自己切片）。
- *         只有「执行连接」需要读；纯写场景（HTTP 响应）可以给 nullptr。 */
+ *         只有「执行连接」需要读；纯写场景（HTTP 响应）可以给 nullptr。
+ *   recv_nowait：**非阻塞**读：>0 字节数 / 0 对端关闭 / -1 错误 / **-2 = 现在没数据**。
+ *         执行期间的两个 poll 点（`on_wait_timeout` 的 100 ms、`lua_sethook` 的计数钩子）
+ *         用它——那两个点绝不能阻塞，否者调试目标会跟着卡。可给 nullptr（= 不支持，poll 返回 0）。 */
 typedef bool (*stream_send_fn)(void *ctx, const void *data, size_t len);
 typedef int (*stream_recv_fn)(void *ctx, void *buf, size_t cap);
+typedef int (*stream_recv_nowait_fn)(void *ctx, void *buf, size_t cap);
 
 struct stream_transport
 {
-    stream_send_fn send;
-    stream_recv_fn recv;
-    void          *ctx;
+    stream_send_fn       send;
+    stream_recv_fn       recv;
+    stream_recv_nowait_fn recv_nowait;
+    void                *ctx;
 };
 
 /* 开始一条流：现行调用点（HTTP + chunked over winsock）。返回 false = 发响应头失败。 */
@@ -136,6 +141,24 @@ long stream_read_frame(unsigned char *hdr,
 
 /* chunked 终止块 `0\r\n\r\n`（raw 分帧下不发；随 D41 的 HTTP 删除一起消失） */
 bool stream_finish();
+
+/* ---------------- 执行期间的 control（D32/D45：两个 poll 点用这套） ---------------- */
+
+/* 控制帧处理器（由服务端实现：cancel → guard_request_cancel；kill/detach → 软动作……）。
+ * ❗它跑在**脚本线程**上（`on_wait_timeout` / `lua_sethook` 的调用栈里），所以里面**不得**
+ *   做阻塞等待，也不得重入执行。 */
+typedef void (*stream_control_fn)(void *ctx, unsigned cmd, unsigned flags);
+void stream_set_control_handler(stream_control_fn fn, void *ctx);
+
+/* 非阻塞收一帧：执行期的两个 poll 点调它。
+ * 返回：0 = 没收到完整帧（继续干活）；1 = 取到一帧（`*out_type` / `*out_flags` 有效，
+ *       json 段拷进 `json` 并 NUL 结尾）；-1 = 传输错误/断线；-2 = 帧非法/超过 `k_ctrl_max`。
+ * ❗只有脚本线程调（唯一 reader）；内部有 4 KB 重组缓冲，只应付 `control` / `end` 这种小帧。 */
+int stream_poll_frame(unsigned *out_type, unsigned *out_flags, char *json, size_t json_cap);
+
+/* poll 一帧：若是 `control` 就交给 handler（不是 control 就忽略）。
+ * 执行期两个点的**唯一**入口——`bindings.cpp` 与 `exec_guard.cpp` 都调它。 */
+void stream_poll_and_dispatch();
 } /* namespace autodbg::host */
 
 #endif /* AUTODBG_SCRIPTING_LUA_STREAM_HPP */

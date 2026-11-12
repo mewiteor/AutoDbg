@@ -100,7 +100,7 @@ make.bat i <dir>         :: 指定输出目录（默认 .out）
 | 导入表门禁 | `uv --directory tools/api_check run scan_dir.py` | 扫 `.out` 下全部产物，按产物自动选口径（`AutoDbgLegacy_*` 与启动器 → `w95`、其余 x86 → `wxp`、x64 → `w7`），有目标系统不可用的导入就打印并返回 1。单文件用法：`uv --directory tools/api_check run main.py <exe\|dll> <w95\|w98\|w982\|wxp>`（x64 免第二个参数） |
 | 纯函数自测 | `.out\AutoDbg_<arch>.exe --selftest` | 覆盖 `http` / `json_writer` / `base64` / `png_writer` / `dbl2str` / **帧编解码** 等纯计算层（基线 70 → T1/D50 转义口径 +11 = 81 → **T2 帧编解码 +20 = 101**）；`feat/cli-tcp` 上 `http` / `base64` 段随 D41 / D44 删除，要补 `decide_console_action` 的断言 |
 | server 端到端 | `pwsh tools/server_test/e2e.ps1 -Render <64\|86> [-Variant legacy]`，另有 `e2e_gui.ps1` / `e2e_mcp.ps1` / `e2e_io.ps1` / `nvim_smoke.ps1` | 起 server → 断言 → 停；不需要 VM，也不改产品行为。`feat/cli-tcp`（D41）上 `e2e_mcp.ps1` 删除 |
-| raw TCP 帧（T2/D42） | `pwsh tools/server_test/e2e_tcp.ps1 -Render <64\|86> [-Variant legacy]` | `--server=tcp`：握手帧（`id` = 协议版本、`data` = token）→ `info`；版本不符 / 首帧非握手 / 错 token 的 `error` 帧；`script` → `out`+`result`+`end`（含语法错误透传 `exit`）；`control` 的 health / version / cancel / 未知 / shutdown；18 条断言，legacy 同样必须真过 |
+| raw TCP 帧（T2/D42） | `pwsh tools/server_test/e2e_tcp.ps1 -Render <64\|86> [-Variant legacy]` | `--server=tcp`：握手帧（`id` = 协议版本、`data` = token）→ `info`；版本不符 / 首帧非握手 / 错 token 的 `error` 帧；`script` → `out`+`result`+`end`（含语法错误透传 `exit`）；`control` 的 health / version / cancel / 未知 / shutdown；**执行期的 control**（Lua 死循环里的 cancel、引擎空转时的 cancel / kill / detach）—— 26 条断言，legacy 同样必须真过 |
 | JSON 信封（T1/D50） | `pwsh tools/server_test/e2e_json.ps1 -Render <64\|86> [-Variant legacy]` | 本地模式 `--json` / `--out=<path>`：那一行 JSON 独占 stdout、字段齐全、`result` / `pid` / `detached` / `images` 口径、`--json` 与 `--server` 互斥（退出码 2）、退出码口径不变；那一行必须**纯 ASCII**（CP936 → UTF-8 或逐字节降级）。`-Variant legacy` **必须真过**（这段就是用来暴露 GBK 的） |
 | Win9x 实机 | `pwsh tools/w9x_test/w9x.ps1 -Action check\|run\|record` | 需要 VMware 的 Win98 guest 与凭据（`tools/w9x_test/config.local.ps1`，已 gitignore）；**没有 VM / 凭据时 SKIP（exit 0）**。矩阵与剩余项见 `plan_p7_win9x.md` |
 
@@ -380,12 +380,12 @@ payload              // 单条 LZMA 流：各模块原始字节按 entry 顺序�
 > `src/scripting/lua/tcp_server.cpp`；`--server` / `--server=http` 仍是现行 HTTP（待删）。
 > 已实现：监听 + 串行 accept、握手帧（`id` = 协议版本、`data` = token、其余字段留 json 给执行侧）、
 > `script` → `out`/`result`/`end`、`control`（health/version → `info`；cancel → guard + `ack`；
-> shutdown → `ack` + 停机；kill/detach 目前回 `ack{applied:false,reason:"not-implemented"}`）。
-> **尚未实现**：执行期间的 control 读取（`on_wait_timeout` 的 100 ms + `lua_sethook` 的计数钩子）——
-> 现在执行是同步的，控制帧会排到执行结束之后才被读到。
+> kill/detach → 软动作 + `ack`；shutdown → `ack` + 停机）、**执行期的两个 poll 点**
+> （`on_wait_timeout` 的 100 ms + `lua_sethook` 的计数钩子 → `stream_poll_and_dispatch`），
+> 所以 `--cancel` / `--kill` / `--detach` 在脚本跑着的时候就能生效。
 
 - 归属：server 跑在**模块（DLL）里**（需要 `lua_State` 与引擎会话），启动器只解析选项；`--server` 时允许不给脚本。
-- 选项（全部 `--server-*` 前缀）：`--server[=http]`、`--server-addr=<ip:port>`（默认 `127.0.0.1:8642`）、`--server-port=`、`--server-token=<hex|auto|none>`、`--server-max-body=`、`--server-queue=`、`--server-timeout=`、`--server-log=<path>`、`--server-no-echo`。
+- 选项（全部 `--server-*` 前缀）：`--server[=http|tcp]`（`tcp` = T2 的 raw 帧，`http` 待删）、`--server-addr=<ip:port>`（默认 `127.0.0.1:8642`）、`--server-port=`、`--server-token=<hex|auto|none>`、`--server-max-body=`、`--server-queue=`、`--server-timeout=`、`--server-log=<path>`、`--server-no-echo`。
 - 端点：`GET /health` / `/version` / `/`（说明）、`POST /run`（body = Lua 源码，**不落盘**）、`POST /cancel`、`POST /shutdown`、`POST /effects?token=`（client 文件 I/O 的恢复）、`POST /mcp`。
 - 绑 `0.0.0.0` 时启动横幅会**列出本机网卡地址**（地址 + 网卡描述，UTF-8），方便 client 直接拄一条去配
   `--!autodbg url=…`：地址来自 `iphlpapi!GetAdaptersInfo`（**必须动态载入**，Win95 没有；取不到就退

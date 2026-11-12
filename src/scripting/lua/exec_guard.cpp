@@ -15,6 +15,8 @@
  * ========================================================================== */
 #include "exec_guard.hpp"
 
+#include "stream.hpp" /* D32：执行期的 control poll（`guard_poll_control` 的落点） */
+
 #include <lua.hpp>
 
 namespace autodbg::host
@@ -28,6 +30,7 @@ volatile LONG g_cancel_seq = 0; /* `/cancel` 计数（每次 /cancel +1） */
 volatile LONG g_seq        = 0; /* 本次执行的基线（begin 时快照） */
 volatile LONG g_stop       = 0; /* 0 = 无；1 = cancel；2 = timeout */
 volatile LONG g_detached   = 0; /* T1（D50）：1 = 目标存活（真 detach） */
+volatile LONG g_soft       = 0; /* D46：杀/分离的软动作（0 = 无；见 guard_soft_action） */
 volatile DWORD g_deadline  = 0; /* 截止 tick；0 = 不限 */
 
 /* 有符号比较：正确处理 GetTickCount 回绕 */
@@ -41,6 +44,7 @@ void guard_exec_begin(unsigned timeout_sec)
 {
     InterlockedExchange(&g_seq, InterlockedCompareExchange(&g_cancel_seq, 0, 0));
     InterlockedExchange(&g_stop, 0);
+    InterlockedExchange(&g_soft, 0);       /* D46：新一次执行从无软动作开始 */
     InterlockedExchange(&g_detached, 0);   /* T1（D50） */
 
     if (timeout_sec != 0)
@@ -112,6 +116,23 @@ int guard_detached()
     return (int)InterlockedCompareExchange(&g_detached, 0, 0);
 }
 
+void guard_request_soft(int action)
+{
+    InterlockedExchange(&g_soft, (LONG)action);
+}
+
+int guard_take_soft()
+{
+    return (int)InterlockedExchange(&g_soft, 0);   /* 原子「取并清」：只会作用一次 */
+}
+
+void guard_poll_control()
+{
+    /* 实现在 stream.cpp（那里才有帧协议）。这里只是一个便于调用点统一的薄封装，
+     * 也让 `exec_guard.cpp` 不必知道 stream 的存在。 */
+    autodbg::host::stream_poll_and_dispatch();
+}
+
 const char *guard_stop_message()
 {
     switch (guard_stop_reason())
@@ -125,6 +146,9 @@ const char *guard_stop_message()
 void guard_lua_hook(lua_State *L, lua_Debug *ar)
 {
     (void)ar;
+    /* D32 的第②个 poll 点：纯 Lua 死循环里只有这里能插话（不经过引擎）。
+     * 先收控制帧（可能置 cancel / 软动作），再看要不要长跳。 */
+    guard_poll_control();
     if (!guard_should_stop())
         return;
     /* 用 pushstring + lua_error（不用 luaL_error：避免格式串语义差异） */

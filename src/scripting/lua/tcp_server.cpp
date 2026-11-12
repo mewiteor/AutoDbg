@@ -77,6 +77,15 @@ int conn_recv(void *ctx, void *buf, size_t cap)
     return autodbg::common::net_recv(g_conn, buf, cap, k_recv_timeout_ms);
 }
 
+/* D32：执行期间的两个 poll 点用这个——**绝对不能阻塞**（0 ms 只查一下）。 */
+int conn_recv_nowait(void *ctx, void *buf, size_t cap)
+{
+    (void)ctx;
+    if (g_conn < 0)
+        return -1;
+    return autodbg::common::net_recv(g_conn, buf, cap, 0);
+}
+
 const char *flavor_name(unsigned flavor)
 {
     return (flavor == 1u) ? "luajit" : "lua";
@@ -95,6 +104,13 @@ const char *arch_name()
     return "x86";
 #endif
 }
+
+/* 传给 stream 层的 control handler 的上下文（两边都在同一个线程，不需要拷贝） */
+struct host_ctx
+{
+    const autodbg_boot *boot;
+    const server_config *cfg;
+};
 
 /* 常量时间比较（token 不是秘密字符串的「长度」也不泄露）：长度一致才逐字节比 */
 bool token_matches(const server_config &cfg, const char *got, size_t got_len)
@@ -184,6 +200,62 @@ void send_info(const autodbg_boot *boot, const server_config &cfg, bool with_ver
     send_json_frame(autodbg::host::stream_frame_info, 0, 0, w);
 }
 
+/* 控制命令的实际动作（帧循环与执行期的 poll 共用同一份，避免两套语义）。
+ * ❗它可能跑在**执行栈里**（`on_wait_timeout` / `lua_sethook` → stream_poll_and_dispatch）：
+ *   里面只能设状态 + 发帧，不能阻塞等待、不能重入执行。 */
+void control_dispatch(const autodbg_boot *boot, const server_config &cfg, unsigned cmd)
+{
+    using namespace autodbg::host;
+
+    switch (cmd)
+    {
+    case stream_control_health:
+        send_info(boot, cfg, /*with_version=*/false);
+        break;
+    case stream_control_version:
+        send_info(boot, cfg, /*with_version=*/true);
+        break;
+    case stream_control_cancel:
+    {
+        bool active = guard_exec_active();
+        if (active)
+            guard_request_cancel();
+        send_ack(cmd, active, active ? "cancel-requested" : "no-execution", 0);
+        break;
+    }
+    case stream_control_kill:
+    case stream_control_detach:
+    {
+        /* 软动作（D46）：只对「当前正在跑的 Attach/Run」生效 —— 引擎阻塞时由
+         * `lua_on_wait_timeout` 取走并降为 action 1 / 2。脚本没在引擎里阻塞时，
+         * 它什么也不会做（下一次 Attach 不会继承）。 */
+        bool active = guard_exec_active();
+        if (active)
+            guard_request_soft((cmd == stream_control_kill) ? guard_soft_kill : guard_soft_detach);
+        send_ack(cmd, active, active ? "requested" : "no-execution", 0);
+        break;
+    }
+    case stream_control_shutdown:
+        /* 执行中也能停：本次执行跑完后退出循环（不在这里强制打断脚本）。 */
+        InterlockedExchange(&g_shutdown, 1);
+        send_ack(cmd, true, "shutdown", 0);
+        break;
+    default:
+        send_ack(cmd, false, "unknown-cmd", 0);
+        break;
+    }
+}
+
+/* 执行期 poll 的处理函数（脚本线程调用） */
+void on_stream_control(void *ctx, unsigned cmd, unsigned flags)
+{
+    (void)flags;
+    const host_ctx *h = (const host_ctx *)ctx;
+    if (h == nullptr)
+        return;
+    control_dispatch(h->boot, *h->cfg, cmd);
+}
+
 /* 执行一个 `script` 帧：一次性执行（建状态 → 跑 → 全释放），stdout 走 `out` 帧。
  * 顺序与 HTTP 的流式分支一致：output_begin → guard_exec_begin → exec → output_end。 */
 void run_script_frame(const server_config &cfg, const void *src, size_t len)
@@ -241,9 +313,14 @@ bool serve_connection(const autodbg_boot *boot, const server_config &cfg, long l
 
     g_conn = sock;
     stream_transport tp;
-    tp.send = conn_send;
-    tp.recv = conn_recv;
-    tp.ctx  = nullptr;
+    tp.send        = conn_send;
+    tp.recv        = conn_recv;
+    tp.recv_nowait = conn_recv_nowait;   /* D32：执行期两个 poll 点用 */
+    tp.ctx         = nullptr;
+
+    host_ctx hc;
+    hc.boot = boot;
+    hc.cfg  = &cfg;
 
     bool keep_host = true;
     if (!stream_begin_ex(tp, stream_framing_raw, (unsigned)k_send_timeout_ms))
@@ -252,6 +329,8 @@ bool serve_connection(const autodbg_boot *boot, const server_config &cfg, long l
         g_conn = -1;
         return true;
     }
+    /* 执行期收到 control 帧的入口（脚本线程调；见 stream_poll_and_dispatch） */
+    stream_set_control_handler(on_stream_control, &hc);
 
     /* 帧缓冲：一帧的 json + data。上限取配置的 max_body（同一份数值即 max_frame）。 */
     size_t        cap = cfg.max_body;
@@ -350,36 +429,10 @@ bool serve_connection(const autodbg_boot *boot, const server_config &cfg, long l
         }
         if (type == stream_frame_control)
         {
-            switch (flags)
+            control_dispatch(boot, cfg, flags);
+            if (flags == stream_control_shutdown)
             {
-            case stream_control_health:
-                send_info(boot, cfg, /*with_version=*/false);
-                break;
-            case stream_control_version:
-                send_info(boot, cfg, /*with_version=*/true);
-                break;
-            case stream_control_cancel:
-            {
-                bool active = guard_exec_active();
-                if (active)
-                    guard_request_cancel();
-                send_ack(flags, active, active ? "cancel-requested" : "no-execution", 0);
-                break;
-            }
-            case stream_control_kill:
-                /* T4：接到 on_wait_timeout（D46 的软动作）；现在如实回「做不到」 */
-                send_ack(flags, false, "not-implemented", 0);
-                break;
-            case stream_control_detach:
-                send_ack(flags, false, "not-implemented", 0);
-                break;
-            case stream_control_shutdown:
-                send_ack(flags, true, "shutdown", 0);
                 keep_host = false;
-                InterlockedExchange(&g_shutdown, 1);
-                break;
-            default:
-                send_ack(flags, false, "unknown-cmd", 0);
                 break;
             }
             continue;

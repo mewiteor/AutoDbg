@@ -206,12 +206,14 @@ D43 说「每次调用无状态」，所以**不能有隐形状态**：「记住
 1. **T1 `--json`**（与传输无关，是 `structuredContent` 的唯一替代；先做它）。
    ✅ **已完成**（分支 `feat/cli-tcp`，ABI 2 → 3；门禁 `e2e_json.ps1` 32 条，legacy 必过）。
 2. **T2 双向帧 + 握手**（`read_req` / `ack` / `info` / `end` / `control`）。这一轮先把 `stream.*` 做成传输无关的核。
-   ✅ **已落地**：`common/frame.*`（8 字节头 + json 长度反推 + raw u32 前缀，`--selftest` +20 条）+
-   `stream.*`（帧类型 1–15、协议版本、传输钩子、`stream_begin_ex`、`stream_read_frame`）+
-   `--server=tcp` 的 `tcp_server.cpp`（监听 / 握手 / `script`→`out`+`result`+`end` / `control`→`ack`·`info`），
-   门禁 `tools/server_test/e2e_tcp.ps1`（18 条，64 / 86 / 86 legacy 全绿）。
-   ⏳ **剩下**：执行期间的 control 读取（两个 poll 点：`on_wait_timeout` 的 100 ms + `lua_sethook`），
-   以及 `kill` / `detach` 的软动作（接 D46、与 T4 一起）。
+   ✅ **已完成**：`common/frame.*`（8 字节头 + json 长度反推 + raw u32 前缀，`--selftest` +20 条）+
+   `stream.*`（帧类型 1–15、协议版本、传输钩子、`stream_begin_ex`、`stream_read_frame`、
+   执行期非阻塞的 `stream_poll_frame` / `stream_poll_and_dispatch`）+
+   `--server=tcp` 的 `tcp_server.cpp`（监听 / 握手 / `script`→`out`+`result`+`end` / `control`→`ack`·`info`）+
+   **执行期的两个 poll 点**（`on_wait_timeout` 的 100 ms + `lua_sethook`，`kill`/`detach` 的软动作也接了）；
+   门禁 `tools/server_test/e2e_tcp.ps1`（26 条，64 / 86 / 86 legacy 全绿）。
+   ❗还没做的：`read_req` / `read_resp`（回调里阻塞读）属于 T4；握手 json 里的 `pid` / `filename` /
+   `read_timeout` / `max_frame` 尚未消费（客户端字段齐全后才用得上）。
 3. **T3 `--remote`**（一次 ABI 变更把 `remote_*` / `pid` / `read_timeout` / `max_frame` 一起加进去，不要分两次；ABI **3 → 4**，因为 T1 已经用 3）。
 4. **T4 `open_file():read` 的阻塞语义** + buffer + stale 帧 + `cancel_notify` + `gui.pick()`；跑通「回调里阻塞读 → 超时返回 `nil,"timeout"` → 断点继续」。
 5. **T5 删除**：`http.*` / `mcp.lua` / `effects.lua` / base64 / 协程执行器 / 会话表 / `yield_blocker` / nvim 的 `http.lua` + chunked 半边。**必须排在 T2/T4 之后**，否则 `open_file` 在回调里写/读的能力会先失去。

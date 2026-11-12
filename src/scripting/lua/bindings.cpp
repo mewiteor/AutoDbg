@@ -1526,6 +1526,26 @@ static int lua_on_wait_timeout(void *ctx, bool can_detach_without_term)
      * 等于把被调试进程直接杀掉；而且它还会去 `ReadConsoleInput`，那不是远程会话该干的事。 */
     if (autodbg::host::guard_exec_active())
     {
+        /* D32 第①个 poll 点：引擎正在空转（100 ms 一跳）——只有在这里才能收到执行期的
+         * control 帧（客户端在脚本跑的同时发 cancel/kill/detach）。非阻塞，不会卡调试目标。 */
+        autodbg::host::guard_poll_control();
+
+        /* D46 的软动作（kill / detach）：不打断脚本，只结束**当前这次** Run/Attach。
+         * 取一次就清（`guard_take_soft`），避免重复作用到下一次 Attach。 */
+        int soft = autodbg::host::guard_take_soft();
+        if (soft == autodbg::host::guard_soft_kill)
+            return autodbg::core::WAIT_TIMEOUT_DETACH_AND_TERMINATE;   /* = q */
+        if (soft == autodbg::host::guard_soft_detach)
+        {
+            /* = Shift+Q：能保留目标就保留（引擎会按 DebugActiveProcessStop 的可用性降级） */
+            if (can_detach_without_term)
+            {
+                autodbg::host::guard_mark_detached(true);
+                return autodbg::core::WAIT_TIMEOUT_DETACH_KEEP_ALIVE;
+            }
+            return autodbg::core::WAIT_TIMEOUT_DETACH_AND_TERMINATE;
+        }
+
         if (!autodbg::host::guard_should_stop())
             return autodbg::core::WAIT_TIMEOUT_CONTINUE;
         /* 取消：能保留目标就保留（调试器不该因为「脚本被取消」而杀掉目标进程） */
