@@ -554,7 +554,13 @@ int client_main(const autodbg_boot *boot)
         err_buf[0] = '\0';
     }
 
-    if (!write_frame(&c, stream_frame_script, 0, 0, nullptr, 0, src, src_len))
+    /* script 帧的 json 段 = chunkname（原文，不是 JSON）：服务端据此让 Lua 报
+     * `你的文件:12: ...`，`--json` / 插件才能把错误行定位到文件。只用 basename。 */
+    const char *chunk = (boot->script_a != nullptr) ? boot->script_a : "buffer.lua";
+    for (const char *q = chunk; *q != '\0'; q++)
+        if ((*q == '\\' || *q == '/') && q[1] != '\0')
+            chunk = q + 1;
+    if (!write_frame(&c, stream_frame_script, 0, 0, chunk, strlen(chunk), src, src_len))
     {
         ErrorS("client: cannot send script frame\n");
         release(out_buf);

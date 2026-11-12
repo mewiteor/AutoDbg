@@ -80,7 +80,7 @@ stdout **只有一行**、纯 ASCII：
 | 8 | `ack` | S→C | `flags` bit0 = applied；json `{cmd, applied, reason, pid}` |
 | 9 | `info` | S→C | health / version 应答（json） |
 | 10 | `handshake` | C→S | `id` = 协议版本（当前 **1**）；`data` = token |
-| 11 | `script` | C→S | `data` = Lua 源码（不落盘） |
+| 11 | `script` | C→S | `data` = Lua 源码（不落盘）；`json` 段 = **chunkname 原文**（不是 JSON，服务端给它加 `@`，错误信息里就是 `你的文件:12: …`） |
 | 12 | `control` | C→S | `flags` = 命令：0 cancel / 1 kill / 2 detach / 3 health / 4 version / 5 shutdown |
 | 13 | `read_resp` | C→S | `flags` bit0 EOF / bit1 错误；`data` = 字节或 `{u32 pos}` |
 | 14 | `end` | 双向 | 一段脚本/连接的收尾 |

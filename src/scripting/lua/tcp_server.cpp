@@ -396,16 +396,17 @@ struct job
     long long      sock;
     unsigned char *src;      /* 拥有：worker 执行完 release */
     size_t         src_len;
+    char           chunk[128]; /* script 帧的 json 段 = chunkname（原文，不是 JSON；D28） */
     bool           used;
 };
 
 CRITICAL_SECTION g_q_lock;
 bool             g_q_lock_init = false;
 HANDLE           g_q_event     = nullptr;
-job              g_job         = {-1, nullptr, 0, false};
+job              g_job         = {-1, nullptr, 0, {0}, false};
 volatile LONG    g_busy        = 0;
 
-bool enqueue(long long sock, unsigned char *src, size_t src_len)
+bool enqueue(long long sock, unsigned char *src, size_t src_len, const char *chunk)
 {
     bool ok = false;
     EnterCriticalSection(&g_q_lock);
@@ -414,6 +415,9 @@ bool enqueue(long long sock, unsigned char *src, size_t src_len)
         g_job.sock    = sock;
         g_job.src     = src;
         g_job.src_len = src_len;
+        for (int k = 0; k < (int)sizeof g_job.chunk; k++)
+            g_job.chunk[k] = (k < 127 && chunk != nullptr) ? chunk[k] : '\0';
+        g_job.chunk[sizeof g_job.chunk - 1] = '\0';
         g_job.used    = true;
         ok            = true;
     }
@@ -473,14 +477,40 @@ void on_stream_control(void *ctx, unsigned cmd, unsigned flags)
 /* 跑一次脚本（worker 线程体） */
 /* 跑一段脚本（流已开）：out 由 output 层直发，末尾补 result + end 帧。
  * ❗`end` 只结束**这一段**脚本，连接继续可用（一个连接可以发多个 script 帧）。 */
-void run_one_script(const unsigned char *src, size_t src_len, const server_config &cfg)
+void run_one_script(const unsigned char *src, size_t src_len, const char *chunkname, const server_config &cfg)
 {
     using namespace autodbg::host;
 
     exec_request er;
     er.src       = (const char *)src;
     er.len       = src_len;
-    er.chunkname = "@buffer.lua";   /* T4 起用握手 json 里的 filename */
+    /* chunkname：脚本帧的 json 段（客户端给的文件名）。`@` 前缀让 Lua 按「文件」报位置
+     * （`你的文件:12: ...`）——不加的话错误信息会变成 `[string "x.lua"]:12`，插件就没法
+     * 把错误行塞进 quickfix 了。 */
+    char chunkbuf[132];
+    if (chunkname != nullptr && chunkname[0] != '\0')
+    {
+        chunkbuf[0] = '@';
+        size_t ci = 0;
+        while (chunkname[ci] != '\0' && ci + 2 < sizeof chunkbuf)
+        {
+            chunkbuf[ci + 1] = chunkname[ci];
+            ci++;
+        }
+        chunkbuf[ci + 1] = '\0';
+    }
+    else
+    {
+        const char *dflt = "@buffer.lua";
+        size_t      ci   = 0;
+        while (dflt[ci] != '\0' && ci + 1 < sizeof chunkbuf)
+        {
+            chunkbuf[ci] = dflt[ci];
+            ci++;
+        }
+        chunkbuf[ci] = '\0';
+    }
+    er.chunkname = chunkbuf;
     er.args      = nullptr;
     er.argc      = 0;
 
@@ -549,7 +579,7 @@ void worker_serve(const job &j, const autodbg_boot *boot, const server_config &c
     stream_set_control_handler(on_stream_control, nullptr);
 
     /* 首帧（accept 线程已经确认它是 script） */
-    run_one_script(j.src, j.src_len, cfg);
+    run_one_script(j.src, j.src_len, (j.chunk[0] != '\0') ? j.chunk : nullptr, cfg);
 
     /* 后续帧 */
     size_t         cap = (size_t)cfg.max_body + (size_t)autodbg::common::k_frame_header_size;
@@ -568,7 +598,12 @@ void worker_serve(const job &j, const autodbg_boot *boot, const server_config &c
             if (type == stream_frame_script)
             {
                 size_t dl = (size_t)n - (size_t)autodbg::common::k_frame_header_size - json_len;
-                run_one_script(buf + json_len, dl, cfg);
+                char   chunk[128];
+                size_t cn = (json_len < sizeof chunk - 1) ? json_len : sizeof chunk - 1;
+                for (size_t i = 0; i < cn; i++)
+                    chunk[i] = (char)buf[i];
+                chunk[cn] = '\0';
+                run_one_script(buf + json_len, dl, chunk, cfg);
                 continue;
             }
             if (type == stream_frame_control)
@@ -721,7 +756,12 @@ int serve_connection(long long sock, unsigned char *hdr, unsigned char *buf, siz
                 memcpy(src, buf + json_len, data_len);
             src[data_len] = '\0';
 
-            if (!enqueue(sock, src, data_len))
+            char chunk[128];
+            size_t cn = (json_len < sizeof chunk - 1) ? json_len : sizeof chunk - 1;
+            for (size_t i = 0; i < cn; i++)
+                chunk[i] = (char)buf[i];
+            chunk[cn] = '\0';
+            if (!enqueue(sock, src, data_len, chunk))
             {
                 autodbg::common::release(src);
                 fail_conn(sock, "busy");

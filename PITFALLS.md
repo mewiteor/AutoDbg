@@ -90,6 +90,8 @@
 | N10 | 换架构后补全里出现了根本取不到的字段（x86 上给 `Xmm0` 之类） | `Context` 的字段集**按架构不同**（x86 23 项 / x64 60 项），而 lua_ls 会把 library 目录**递归扫完** | 注解拆成 `addons/autodbg/library/`（公共）+ `arch/{x86,x64}/context.lua`（二选一），`lsp.lua` 注册时只挂当前架构那份，切架构先摘另一个 |
 | N11 | 插件里解帧/解包报 `attempt to call a nil value (field 'unpack')` | nvim 跑的是 **LuaJIT**，没有 5.3+ 的 `string.unpack` / 整数除法 `//` / 位运算符 | 帧头小端自己手写（`le16`/`le32` 用 `string.byte`）；插件代码里不用 5.3+ 语法（`PITFALLS` 同样适用于 snippets 与 modeline） |
 | N12 | 流式跑完后报 `E5560: nvim_create_buf must not be called in a fast event context` | `vim.uv` 的读回调（`tcp:read_start` / timer）属于 **fast event context**，里面不能调任何 nvim API（buffer/window/qflist/notify 都会报） | `stream.lua` 的 `finish()` 一律用 `vim.schedule()` 调 `on_done`；handlers 里的 nvim API（如 `on_open` 失败提示）也自己 schedule；`nvim_smoke` 的 `async.*` 用例看护这条 |
+| N13 | nvim 插件一 require 就报 `tcp.lua:306: ')' expected near '&'`（或 `attempt to call field 'pack'`） | neovim 的 Lua 是 **LuaJIT**：`string.pack`/`string.unpack` 是 5.3+，`& | << >>` **运算符本身**也是 5.3 语法（不只是「缺位运算元方法」） | 帧编解码一律用 `bit.band`/`bit.rshift` + `string.char`/`string.byte` 手写（见 `nvim/lua/autodbg/tcp.lua`）；写完先 `lua_64.exe -e "assert(loadfile(...))"` 或让 `nvim_smoke.ps1` 跑一遍 |
+| N14 | 插件发出去的握手帧 server 收到了，但回包永远读不到（整条请求超时） | `handle:read_start()` 在 `connect` **成功之前**调 —— luv 会丢掉那个回调 | `read_start` 放到 connect 的回调里（`nvim/lua/autodbg/tcp.lua` 的 `handshake`）；另外 `done` 回调一律 `vim.schedule`，否则画 buffer/塞 quickfix 会 E5560 |
 
 ## O. 输出、日志与排障手法
 
