@@ -130,7 +130,49 @@ int DebuggerSession::run(const core::RunParams *params, const core::DebugCallbac
         ZeroMem(startup_info);
         ZeroMem(proc());
         startup_info.cb = sizeof startup_info;
-        BOOL r          = CreateProcess(params->imagepath, (LPTSTR)params->cmdline, NULL, NULL, FALSE, flags, params->env, params->cwd, &startup_info, &proc());
+
+        /* T1（D50）：`--json` 下把目标的 stdout/stderr 指到**我们自己 stderr 的可继承副本**
+         * （否则目标继承我们的句柄，`cmd /c ping` 的输出会直接顶在那一行 JSON 前面）。
+         * 为什么不用匿名管道：管道必须有人持续排空，而 `--detach` 之后没人能排空 ——
+         * 关读端 → 目标写 stdout 拿到 `ERROR_BROKEN_PIPE`；不关不读 → 填满 4 KB 后阻塞。
+         * 两者都违背 D47（detach 后目标继续活着）。副本句柄没有这些副作用：本进程关掉
+         * 自己那份之后，目标持有的那份仍然有效。详见 `util.hpp` 的注释。 */
+        HANDLE child_out_dup = NULL;
+        HANDLE child_in_nul  = NULL;
+        BOOL   inherit       = FALSE;
+        if (child_stdio_capture())
+        {
+            HANDLE parent_err = GetStdHandle(STD_ERROR_HANDLE);
+            SECURITY_ATTRIBUTES sa;
+            sa.nLength              = sizeof sa;
+            sa.lpSecurityDescriptor = NULL;
+            sa.bInheritHandle       = TRUE;
+
+            if (parent_err != NULL && parent_err != INVALID_HANDLE_VALUE)
+                DuplicateHandle(GetCurrentProcess(), parent_err, GetCurrentProcess(), &child_out_dup,
+                                0, TRUE /* 可继承 */, DUPLICATE_SAME_ACCESS);
+            /* stdin 给 NUL：目标不该读掉我们的输入；输入重定向失败就不启用（宁可旧行为） */
+            child_in_nul = CreateFileA("NUL", GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, &sa,
+                                       OPEN_EXISTING, 0, NULL);
+            if (child_in_nul == INVALID_HANDLE_VALUE)
+                child_in_nul = NULL;
+
+            if (child_out_dup != NULL && child_in_nul != NULL)
+            {
+                startup_info.dwFlags    = STARTF_USESTDHANDLES;
+                startup_info.hStdInput  = child_in_nul;
+                startup_info.hStdOutput = child_out_dup;
+                startup_info.hStdError  = child_out_dup;
+                inherit                 = TRUE;
+            }
+        }
+
+        BOOL r          = CreateProcess(params->imagepath, (LPTSTR)params->cmdline, NULL, NULL, inherit, flags, params->env, params->cwd, &startup_info, &proc());
+        /* 父进程立刻放掉自己那份副本：目标已经拿到自己的句柄，留着只会让它晚一点收到 EOF */
+        if (child_out_dup != NULL)
+            CloseHandle(child_out_dup);
+        if (child_in_nul != NULL)
+            CloseHandle(child_in_nul);
         if (!r)
             E("CreateProcess");
     }
@@ -491,7 +533,14 @@ int DebuggerSession::run(const core::RunParams *params, const core::DebugCallbac
                 info->base          = (size_t)DBGEvent.u.CreateProcessInfo.lpBaseOfImage;
                 info->start_address = (size_t)DBGEvent.u.CreateProcessInfo.lpStartAddress;
                 info->name_offset   = PathFindFileName(translated_name) - translated_name;
+                /* ❗按 TCHAR 的**宽**度拷：legacy（ANSI）变体里 TCHAR 是 1 字节，用 `__movsw`
+                 * 会按 2 字节一个单元拷 `image_name_len` 个 → 越界写掉半个缓冲（分配只有
+                 * `image_name_len * sizeof(TCHAR)` 字节）→ 堆损坏，表现为随机 AV。 */
+#ifdef _UNICODE
                 __movsw((LPWORD)info->Path, (const WORD *)translated_name, image_name_len);
+#else
+                __movsb((PBYTE)info->Path, (const BYTE *)translated_name, image_name_len);
+#endif
                 info->Path[image_name_len] = 0;
                 if (!calc_crc32(info->Path, &info->crc32))
                     cont() = false;
@@ -591,7 +640,13 @@ int DebuggerSession::run(const core::RunParams *params, const core::DebugCallbac
                 info         = peinfos().create_front(image_name_len * sizeof(TCHAR));
                 info->base        = (size_t)DBGEvent.u.LoadDll.lpBaseOfDll;
                 info->name_offset = PathFindFileName(translated_name) - translated_name;
+                /* ❗同 CREATE_PROCESS 那处：legacy（ANSI）的 TCHAR 是 1 字节，`__movsw` 会
+                 * 按 2 字节拷 → 溢出分配的 `image_name_len` 字节 → 堆损坏（随机 AV）。 */
+#ifdef _UNICODE
                 __movsw((LPWORD)info->Path, (const WORD *)translated_name, image_name_len);
+#else
+                __movsb((PBYTE)info->Path, (const BYTE *)translated_name, image_name_len);
+#endif
                 info->Path[image_name_len] = 0;
                 if (!calc_crc32(info->Path, &info->crc32))
                     cont() = false;
@@ -649,14 +704,26 @@ int DebuggerSession::run(const core::RunParams *params, const core::DebugCallbac
                 if (read((size_t)DBGEvent.u.DebugString.lpDebugStringData, p, DBGEvent.u.DebugString.nDebugStringLength))
                     ods_data = p;
             }
-            /* 控制台回显（不属于 Lua，留在 core）：与旧实现同序 —— 先回显、后回调 */
+            /* 控制台回显（不属于 Lua，留在 core）：与旧实现同序 —— 先回显、后回调
+             * ❗`nDebugStringLength` **含**结尾的 NUL（MSDN："including the terminating null"）
+             *   ⇒ 直接抳长度会把 0x00 一起写进输出（`--json` 的信封里表现为 `stdout` 里
+             *   混进 `\u0000`，那一行也不再是合法 JSON 的单行文本）。这里去掉结尾的 NUL，
+             *   并把同一份长度交给 Lua 回调（否则脚本里的 `ev.str` 带上 `\0` 又会污染 stdout）。 */
             if (ods_data)
             {
                 if (!ods_uni)
+                {
+                    if (ods_size > 0 && ((const char *)ods_data)[ods_size - 1] == '\0')
+                        ods_size--;
                     PrintN((LPCSTR)ods_data, ods_size);
+                }
 #ifdef _UNICODE
                 else
-                    PrintN((LPCWSTR)ods_data, ods_size / 2);
+                {
+                    if (ods_size >= sizeof(WCHAR) && ((const WCHAR *)ods_data)[ods_size / sizeof(WCHAR) - 1] == L'\0')
+                        ods_size -= sizeof(WCHAR);
+                    PrintN((LPCWSTR)ods_data, ods_size / sizeof(WCHAR));
+                }
 #endif
             }
             /* 旧行为：只要登记了回调就**总是**调用（读取失败时表里没有 str 字段） */

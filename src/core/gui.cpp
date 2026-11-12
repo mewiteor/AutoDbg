@@ -740,6 +740,38 @@ unsigned window_foreground_pid()
     return (unsigned)pid;
 }
 
+/* T4（D48）：鼠标选取目标：`GetCursorPos` → `WindowFromPoint` → `GetWindowThreadProcessId`。
+ * ❗必须在**目标机器**上跑（本文件在模块里，在目标机上执行）——所以 `gui.pick()`
+ *   能替掉「手抄 pid」。无交互桌面（取不到光标/窗口）→ 降级到前台窗口；
+ *   都取不到 → false（报错，不猜）。三个 API 都是 Win95 就有的 user32，不新增导入。 */
+bool window_pick(unsigned *pid, HWND *hwnd)
+{
+    if (pid == nullptr)
+        return false;
+    *pid = 0;
+    if (hwnd != nullptr)
+        *hwnd = nullptr;
+
+    HWND  target = nullptr;
+    POINT pt     = {0, 0};
+    if (GetCursorPos(&pt))
+        target = WindowFromPoint(pt);
+    if (target == nullptr)
+        target = GetForegroundWindow();
+    if (target == nullptr)
+        return false;
+
+    DWORD owner = 0;
+    GetWindowThreadProcessId(target, &owner);
+    if (owner == 0)
+        return false;
+
+    *pid = (unsigned)owner;
+    if (hwnd != nullptr)
+        *hwnd = target;
+    return true;
+}
+
 bool window_center(HWND hwnd, int *x, int *y)
 {
     RECT r;

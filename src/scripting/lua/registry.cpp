@@ -8,9 +8,10 @@
  * ========================================================================== */
 #include "registry.hpp"
 
+#include "file_io.hpp" /* T5：client_io_enabled（`_autodbg_info` 用） */
+
 #include "bindings.hpp"
 #include "bson.hpp"  /* lua_bson_encode / lua_bson_decode */
-#include "file_io.hpp"     /* S7：read_file / write_file（client 文件 I/O） */
 #include "gui_bindings.hpp" /* S4：`gui` 表（plan_server.md §7.1） */
 #include "state.hpp" /* lua_reset_dir（Q7：脚本目录工具，声明在 state.hpp） */
 #include "variant.hpp"
@@ -93,8 +94,9 @@ void register_lua_api(lua_State *L)
      * 上面 29 个契约全局名一个字不改。 */
     register_gui_api(L);
 
-    /* S7：client 文件 I/O（server 模式下走效果协议，本机模式直接读写磁盘） */
-    autodbg::host::register_file_api(L);
+    /* T4（D44）：`open_file` + 文件对象（io 风格，读写都走帧协议）；
+     * T5 之前它藏在 `register_file_api()` 里，那个函数随 read_file/write_file 一起删了。 */
+    autodbg::host::register_stream_file_api(L);
 
     /* 宿主身份（MCP 的 serverInfo.version / dbg_status 用；不污染 29 个契约名） */
     lua_register(L, "_autodbg_info", lua_autodbg_info);

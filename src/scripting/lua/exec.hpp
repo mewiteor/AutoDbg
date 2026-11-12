@@ -45,34 +45,6 @@ struct exec_result
  * `dbg` 非空时会临时挂给 `core::set_current_session()`（执行完恢复成 nullptr）。 */
 exec_result exec_on_state(lua_State *L, autodbg::core::DebuggerSession *dbg, const exec_request &req);
 
-/* ============================ 协程执行（S7：client 文件 I/O） ============================
- * `read_file`/`write_file` 需要把「文件去客户端读/写」这件事交给宿主： Lua 函数
- * `lua_yield` 一个效果表，宿主把它发给客户端，拿到结果后再 `resume`。
- * 因此一次远程执行可能是**多段**的：begin → (yield) → resume → … → 完成。
- * ❗两个 Lua 版本的 `lua_resume` 原型不同（LuaJIT: `(L, narg)`；Lua 5.5: `(L, from, narg, &nres)`）
- *   → 用 `#ifdef JIT` 分支（构建时 luajit flavor 会定义 JIT）。 */
-struct exec_run
-{
-    exec_result result;    /* 完成/失败时有效；suspended 时 `code = -2` 作为哨兵 */
-    bool        suspended; /* true = 协程停在 `lua_yield` 上 */
-    int         co_ref;    /* 未取消的协程引用（LUA_REGISTRYINDEX）；完成/失败时已 unref → -1 */
-    char       *ret;       /* 完成时：若协程返回值是字符串，拷一份出来（caller 用 release 释放） */
-    size_t      ret_len;
-};
-
-/* 启动协程执行；suspended 时协程里 yield 出来的值仍在协程栈上（宿主用 `effect_*` 读） */
-exec_run exec_begin(lua_State *L, autodbg::core::DebuggerSession *dbg, const exec_request &req);
-
-/* 把 `L` 栈顶的 `n` 个值搬到挂起的协程上（resume 的实参/返回値） */
-bool exec_push_results(lua_State *L, int co_ref, int n);
-
-/* 继续执行：
-args = 已经压在协程栈上的结果值个数（xec_push_results 压的） */
-exec_run exec_resume(lua_State *L, autodbg::core::DebuggerSession *dbg, int co_ref, int nargs);
-
-/* 丢弃一个挂起的协程（unref；会话关闭/超时回收时用） */
-void exec_drop(lua_State *L, int co_ref);
-
 /* 一次性执行：建会话 + 建状态（含烘焙库）→ 执行 → 全部释放 */
 exec_result exec_script(const exec_request &req);
 

@@ -34,6 +34,7 @@ struct ws_api
     int(WSAAPI *cleanup)(void)                                     = nullptr;
     SOCKET(WSAAPI *socket)(int, int, int)                          = nullptr;
     int(WSAAPI *bind)(SOCKET, const struct sockaddr *, int)        = nullptr;
+    int(WSAAPI *connect)(SOCKET, const struct sockaddr *, int)     = nullptr;   /* T3：客户端模式 */
     int(WSAAPI *listen)(SOCKET, int)                               = nullptr;
     SOCKET(WSAAPI *accept)(SOCKET, struct sockaddr *, int *)       = nullptr;
     int(WSAAPI *recv)(SOCKET, char *, int, int)                    = nullptr;
@@ -84,6 +85,7 @@ bool load_module(const char *dll, bool try_wsa2)
     bool ok = bind_sym(m, "WSAStartup", &a.startup) && bind_sym(m, "WSACleanup", &a.cleanup) &&
               bind_sym(m, "socket", &a.socket) && bind_sym(m, "bind", &a.bind) &&
               bind_sym(m, "listen", &a.listen) && bind_sym(m, "accept", &a.accept) &&
+              bind_sym(m, "connect", &a.connect) &&   /* T3：客户端模式（raw TCP） */
               bind_sym(m, "recv", &a.recv) && bind_sym(m, "send", &a.send) &&
               bind_sym(m, "select", &a.select) && bind_sym(m, "closesocket", &a.closesocket) &&
               bind_sym(m, "getsockname", &a.getsockname) && bind_sym(m, "setsockopt", &a.setsockopt) &&
@@ -319,9 +321,54 @@ long long net_accept(long long listener, int timeout_ms, unsigned *peer_ip)
     return (long long)c;
 }
 
-void net_close(long long sock)
+/* T3（D42）：客户端连接。用阻塞 connect：Winsock 1.1 上把超时做准需要非阻塞 connect +
+ * getsockopt(SO_ERROR)，那又得往 ws_api 里加两项、多一条失败分支；客户端连的是已知 server，
+ * 拒绝/不可达都会立即返回，不值得。*/
+long long net_connect(const char *host, unsigned port, net_status *why)
 {
-    if (!g_started || sock < 0)
+    if (why != nullptr)
+        *why = net_ok;
+    if (!g_started || host == nullptr || port == 0 || port > 65535)
+    {
+        if (why != nullptr)
+            *why = net_bad_addr;
+        return -1;
+    }
+
+    unsigned host_order = 0;
+    if (!net_parse_ipv4(host, &host_order))
+    {
+        if (why != nullptr)
+            *why = net_bad_addr;
+        return -1;
+    }
+
+    SOCKET s = g_ws.socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (s == INVALID_SOCKET)
+    {
+        if (why != nullptr)
+            *why = net_socket_failed;
+        return -1;
+    }
+
+    sockaddr_in sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sin_family      = AF_INET;
+    sa.sin_port        = swap16((unsigned short)port);
+    sa.sin_addr.s_addr = swap32(host_order);
+
+    if (g_ws.connect(s, (const struct sockaddr *)&sa, (int)sizeof sa) != 0)
+    {
+        g_ws.closesocket(s);
+        if (why != nullptr)
+            *why = net_bind_failed; /* 复用「连不上」这个状态名（见 net_status_name） */
+        return -1;
+    }
+    return (long long)s;
+}
+
+void net_close(long long sock)
+{    if (!g_started || sock < 0)
         return;
     g_ws.closesocket((SOCKET)sock);
 }

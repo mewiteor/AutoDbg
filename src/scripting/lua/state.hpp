@@ -35,6 +35,12 @@ int lua_reset_dir(lua_State *L);
 lua_State *create_state_with_libs(void);
 
 /* 建状态 → 注册 → 烘焙库 → 加载并运行 `g_wfilepath`（argv[2..] 作为脚本参数）。
- * 返回退出码（旧 `_tmain` 语义：0 = 成功，-1 = 加载/运行失败）。 */
-int run_script_file(int argc, LPTSTR argv[]);
+ * 返回退出码（旧 `_tmain` 语义：0 = 成功，-1 = 加载/运行失败）。
+ * T1（D50）的可选出参 `result_json`：只在 `--json` 模式用 —— 在 `lua_close` **之前**
+ *   把脚本的 `return` 值交给烘焙的 `jsonx.encode`（C 侧不写 parser，D28），把结果
+ *   拷进 `common::alloc` 的缓冲区交回调用方（调用方负责 release）。传 NULL → 行为与
+ *   旧实现逐字节一致。口径：1 个返回值 → 那个值；0 个 → `null`；多个 → 数组。
+ *   编不了（function / 无 `val` 的 userdata / 稀疏表 / NaN / 循环引用）→ `null`（pcall
+ *   包住，不把 Lua 错误抛出去）—— 不改 `jsonx` 本身。 */
+int run_script_file(int argc, LPTSTR argv[], const char **result_json = nullptr);
 #endif /* AUTODBG_SCRIPTING_LUA_STATE_HPP */

@@ -74,6 +74,12 @@
 
 `u16 id` 继续是**句柄号**，不是请求相关性 id：执行串行 + reader 唯一 ⇒ 同一句柄最多一个在途请求，不需要相关性表。
 
+> ❗**已落地的口径（T2，2025 年实现时定的）**：帧头保持 **8 字节不变**，`[json]` 的长度**由传输层的 payload 总长反推**：
+> `json_len = payload_len - 8 - data_len`。传输层两种分帧：chunked（`<hex>\r\n` + payload + `\r\n`，现行 HTTP）
+> 与 raw（`u32` 小端 = payload 总长，D42）。好处：现有客户端（`nvim/lua/autodbg/stream.lua` 的 8 字节解析器）
+> 不用跟着改，T5 删 HTTP 时只换分帧、不碰帧布局。实现：`src/common/frame.*`（纯函数，可被 `--selftest` 断言）
+> + `src/scripting/lua/stream.*`（帧类型/协议版本/传输钩子/读一帧）。
+
 版本必须在握手帧里（硬切之后没有别的协商手段；版本不符 → `error` 帧 + 关连接）。
 
 ### 2.2 唯一 reader
@@ -187,8 +193,8 @@ D43 说「每次调用无状态」，所以**不能有隐形状态**：「记住
 | 双向帧 + 握手 | `src/scripting/lua/stream.hpp/.cpp` | `stream.*` 从 130 行涨到约 200 行（不是净减）：`read_req` / `ack` / `info` / `end` + `control` |
 | 控制命令在两个点的 poll | `bindings.cpp` 的 `lua_on_wait_timeout` + `lua_sethook` 钩 | 100 ms 空闲轮询里加一次非阻塞 `select`；这是「引擎空转期间还能收到控制帧」的唯一途径 |
 | `f:read()` 的阻塞读 + buffer | `file_stream.cpp` | 切片 `select`（≤250 ms）、每片查 `exec_guard`、stale 帧丢弃、`cancel_notify` |
-| `--json` | `launcher.cpp`（选项 → boot）→ `main.cpp` → `output.cpp` | 契约：`{"ok","exit","canceled","detached","pid","stdout","stderr","images","result"}`；`--out=<path>` 写同一份 JSON。❗legacy 变体是 GBK 执行字符集 ⇒ 一律 UTF-8 + `\uXXXX` 转义非 ASCII |
-| `--remote` / `--pid` / `--pid=pick` | `boot.h`（ABI **2 → 3**：`remote_*`、`pid`、`read_timeout`、`max_frame`）→ `launcher.cpp` → 模块新增 `client.cpp` | 落点在模块（launcher 不链 winsock）；client 用现成的 local 文件后端 |
+| `--json` | `launcher.cpp`（选项 → boot，ABI **2 → 3**：`json_mode` / `json_out`，T1 已用）→ `main.cpp` → `output.cpp` | 契约：`{"ok","exit","canceled","detached","pid","stdout","stderr","images","result"}`；`--out=<path>` 写同一份 JSON。❗legacy 变体是 GBK 执行字符集 ⇒ 一律 UTF-8 + `\uXXXX` 转义非 ASCII（`AGENTS.md` §12.6） |
+| `--remote` / `--pid` / `--pid=pick` | `boot.h`（ABI **3 → 4**：`remote_*`、`pid`、`read_timeout`、`max_frame`；T1 已把 ABI 用到 3）→ `launcher.cpp` → 模块新增 `client.cpp` | 落点在模块（launcher 不链 winsock）；client 用现成的 local 文件后端 |
 | `--server-*` 口径 | `AGENTS.md` §12.1 | `--server-read-timeout`（默认 **5000 ms**，单次文件操作）与 `--server-timeout`（整次执行 wall-clock）分开；`--server-max-body` → `--server-max-frame`；`--server-queue` 保留（执行连接队列）；D21 的认证默认不变，token 走握手帧；前缀保留 `--server-`，client 侧新增 `--remote` |
 | `gui.pick()` | `src/core/gui.cpp` + `gui_bindings.cpp` | 新名字，不动 29 契约名 |
 | nvim（独立仓库，单独提交） | `nvim/lua/autodbg/*` | `http.lua`、`effects.lua`、chunked 半边删；`modeline.lua` 加 `pid=`；`:AutoDbgKill` / `:AutoDbgDetach` / `:AutoDbgPick` 新增；`addons/.../file_io.lua` 与 `lualib.lua`（`mcp` / `effects` 全局声明）同步；`snippets.lua` 的 `adfile` 片段重写 |
@@ -198,11 +204,48 @@ D43 说「每次调用无状态」，所以**不能有隐形状态**：「记住
 ## 5. 任务顺序
 
 1. **T1 `--json`**（与传输无关，是 `structuredContent` 的唯一替代；先做它）。
+   ✅ **已完成**（分支 `feat/cli-tcp`，ABI 2 → 3；门禁 `e2e_json.ps1` 32 条，legacy 必过）。
 2. **T2 双向帧 + 握手**（`read_req` / `ack` / `info` / `end` / `control`）。这一轮先把 `stream.*` 做成传输无关的核。
-3. **T3 `--remote`**（一次 ABI 变更把 `remote_*` / `pid` / `read_timeout` / `max_frame` 一起加进去，不要分两次）。
+   ✅ **已完成**：`common/frame.*`（8 字节头 + json 长度反推 + raw u32 前缀，`--selftest` +20 条）+
+   `stream.*`（帧类型 1–15、协议版本、传输钩子、`stream_begin_ex`、`stream_read_frame`、
+   执行期非阻塞的 `stream_poll_frame` / `stream_poll_and_dispatch`）+
+   `--server=tcp` 的 `tcp_server.cpp`（监听 / 握手 / `script`→`out`+`result`+`end` / `control`→`ack`·`info`）+
+   **执行期的两个 poll 点**（`on_wait_timeout` 的 100 ms + `lua_sethook`，`kill`/`detach` 的软动作也接了）；
+   门禁 `tools/server_test/e2e_tcp.ps1`（26 条，64 / 86 / 86 legacy 全绿）。
+   ❗还没做的：`read_req` / `read_resp`（回调里阻塞读）属于 T4；握手 json 里的 `pid` / `filename` /
+   `read_timeout` / `max_frame` 尚未消费（客户端字段齐全后才用得上）。
+3. **T3 `--remote`**（一次 ABI 变更把 `remote_*` / `pid` / `read_timeout` / `max_frame` 一起加进去，不要分两次；ABI **3 → 4**，因为 T1 已经用 3）。
+   ✅ **已完成**：`boot` 加 6 个字段（ABI 4）；launcher 解析 `--remote[=host:port]` / `--remote-token=` /
+   `--pid=` / `--read-timeout=` / `--max-frame=` / `--cancel|--kill|--detach|--health`（带 `--remote` 时
+   `--version` = 查 server 版本）；模块新增 `client.cpp`（握手 → `script`/`control` → `result` 帧的
+   `id` 当退出码，D28 不解 JSON）；服务端改成 **accept 线程 + worker**：控制连接在执行期间也接得住
+   （所以 `AutoDbg --remote h:p --cancel` 能从**另一个进程**打断正在跑的脚本），一个执行连接可发多段 `script`。
+   门禁 `e2e_tcp.ps1` 26 → 35 条。
+   ❗尚未做：握手 json 里的 `pid` / `filename` / `read_timeout` / `max_frame` 还没被服务端消费（`--pid` 也还没
+   影响 Attach）；`read_req`/`read_resp` 属 T4。
 4. **T4 `open_file():read` 的阻塞语义** + buffer + stale 帧 + `cancel_notify` + `gui.pick()`；跑通「回调里阻塞读 → 超时返回 `nil,"timeout"` → 断点继续」。
+   ✅ **已完成**：`file_stream.cpp` 的读向（r/rb + 4096 缓冲 + 逻辑 `tell` + 往返 `seek` + `lines`），
+   `stream_wait_frame`（切片 25 ms + 片间查取消 + stale 帧丢弃 + `cancel_notify`），
+   `client.cpp` 的本地文件后端（`open`/`data`/`close`/`read_req` → `read_resp`，全二进制，D28），
+   `gui.pick()`（`GetCursorPos` → `WindowFromPoint` → `GetWindowThreadProcessId`，降级前台窗口）。
+   门禁 `e2e_tcp.ps1` 35 → 41 条（含「假客户端不回 read_req」的超时用例）。
+   ⏳ **剩下**：回调里（`Attach`/`Run` 回包内）的真阻塞读只做了单元级验证（`--read-timeout` 路径已通），
+   还没盖「断点继续」那一条；`read_req` 目前只发 bytes/line/seek/tell 四种。
 5. **T5 删除**：`http.*` / `mcp.lua` / `effects.lua` / base64 / 协程执行器 / 会话表 / `yield_blocker` / nvim 的 `http.lua` + chunked 半边。**必须排在 T2/T4 之后**，否则 `open_file` 在回调里写/读的能力会先失去。
+   ✅ **已完成（本仓）**：`server.cpp`（HTTP）/ `server.hpp` / `http.*` / `base64.*` / `exec_session.*` /
+   `exec.cpp` 的协程段 / `file_io.cpp` 的效果协议（只剩 client_io 开关）/ `lualib/{mcp,effects,autodbg_api}.lua` /
+   `registry.cpp` 的 `read_file`/`write_file` 全删；配置解析搬到 `server_config.*`；
+   **`--server=http` 改为报案（退码 2），`--server` / `--server=tcp` 都是 raw TCP**；
+   `--selftest` 101 → 67（http/base64 两段随依赖一起走）；门禁脚本删 `e2e.ps1` /
+   `e2e_mcp.ps1` / `e2e_io.ps1` / `nvim_smoke.*`，`e2e_gui.ps1` 改成本地 CLI（21 条）。
+   顺手修了一个真缺陷：本地模式下脚本的 `...` 第一个参数竟然是脚本路径（命令行未对齐）。
+   ⏳ **剩下**：`nvim/`（子模块、独立仓）的 `http.lua` / `effects.lua` / chunked 半边 ——
+   随插件改到 raw TCP 客户端时在它自己的仓里删，并恢复一份 `nvim_smoke` 等价门禁。
 6. **T6 agent 文档**：`tools/agent/autodbg-skill/SKILL.md`（Agent Skills 格式）+ 三五个 recipe。在 CLI 口径下这份 markdown 是**唯一契约文档**，不是锦上添花 —— `autodbg_api.lua` 的内容搬过去，否则模型只能靠训练数据猜参数形状（就是 S12 复发）。
+   ✅ **已完成**：`tools/agent/autodbg-skill/`（`SKILL.md` + `references/{cli,lua-api,pitfalls}.md` +
+   `recipes/{run-and-break,attach-existing,scan-and-patch,gui-automation,remote-agent}.md` + `README.md`）。
+   `lua-api.md` 的正文从 `09174da:lualib/autodbg_api.lua` 用脚本按 topic 搬出来（不是手抄），
+   并按 T5 的新口径改写了 `files` 段（`read_file`/`write_file` → `open_file` 文件对象）。
 7. **T7（可选，独立立项）**引擎 `begin/pump/continue` + `--repl`。D45 之后它不再是文件读的前提，但「不靠回调、看着目标跑」仍然需要它。
 
 ---

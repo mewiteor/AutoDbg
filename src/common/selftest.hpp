@@ -10,6 +10,8 @@
  * 代价：约 3–5 KB 代码进模块（§9 风险表已登记）。
  * 约定：只测**纯函数**（http 解析/响应、json 输出、base64、rand 性质），
  *   不碰 socket、Lua、引擎——那些属于 S1+ 的 e2e（`tools/server_test/`）。
+ *   ❗「`result` 编不了（function / 无 `val` 的 userdata / 循环引用）→ null，且 `ok` 仍为 true」
+ *   只能在 e2e 的 `-Json` 段里断（本层不得 include lua.h），不能放这里。
  * ========================================================================== */
 #include <stddef.h>
 

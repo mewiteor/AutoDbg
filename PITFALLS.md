@@ -40,6 +40,7 @@
 | K9 | `1.0/0.0` 编译报 `C2124` | MSVC 把它当编译期错误 | 测试里用 `volatile double zero` 挡住常量折叠 |
 | K10 | `GetVersionExA` 报 `C4996` | 该 API 被标记废弃 | 用 `#pragma warning(push/disable/pop)` 局部包住（本项目确实需要它区分 9x） |
 | K11 | `GetProcAddress` 取到的 Win32 API 一调就 `0xC0000005`（**只在 x86**，x64 正常） | 函数指针 typedef 没写 `WINAPI`（x86 上 Win32 导出是 **stdcall**）或**参数个数与真实 API 不一致** → 栈不平衡 | typedef 一律写成 `unsigned long (WINAPI *)(真实参数表)`，参数个数与 SDK 原型**逐个一致**（不能“多传一个没用到的”）；x64 只有一种调用约定，测不出来 |
+| K12 | legacy（ANSI）变体 `Run()` 随机 `0xC0000005`（同一脚本有时能跑完，**只在 `--variant=legacy` 上出现**，modern/x64 正常） | 拷 TCHAR 路径用了 `__movsw`（`CopyMem2` 的语义）：它按 **2 字节** 一个单元拷，而 ANSI 构建的 `TCHAR` 是 1 字节，分配只有 `len * sizeof(TCHAR)` 字节 → 每拷一次就溢出半个缓冲，堆被写坏 | 按 `sizeof(TCHAR)` 选搬运指令：`#ifdef _UNICODE` → `__movsw(…, len)`，否则 `__movsb(…, len)`（`debug_loop.cpp` 的 CREATE_PROCESS / LOAD_DLL 两处）。这类 bug 在“长度恒为 0”的旧路径上不会发作，一旦上游开始返回真名字就立刻显形 |
 
 ## L. Lua / LuaJIT / lualib 烘焙
 
@@ -103,7 +104,7 @@
 | O6 | 输出 sink 一装上，别的线程的诊断也被收进当前请求的 `stdout` | `core::set_output_sink` 是**全局**的 | 非执行线程的诊断**直写 `WriteFile`**，不经 `core::Print*` |
 | O7 | 模块凭空长大几十 KB | 大结构体数组（内嵌 `http_request` ≈2 KB、带默认成员初始化）以初值形态进 `.data`（`job g_jobs[32]` → +72 KB） | 队列/表只持**指针**，请求体堆上分配 |
 
-## S. server 模式 / MCP / client 文件 I/O
+## S. server 模式 / MCP / client 文件 I/O（❗T5/D41/D44 之后：MCP、HTTP、effects、base64 均已删除，S 节里涉及它们条目仅作历史备查）
 
 > `feat/cli-tcp`（D41 / D44）落地后 **S1 / S5 / S8 / S10 / S11 作废**（它们绑在 HTTP 与效果协议上）。保留备查：这些是当时定位问题的第一手依据，删除后仍是「为什么会写成那样」的答案。S12 的教训——每个对外接口都要有门禁断言——在帧命令面上继续适用。
 
@@ -147,3 +148,10 @@
 | X3 | 逐字节比对 golden 时永远不相等 | 产物重定向输出 CRLF（msvcrt 文本模式），而 golden 是 LF | golden 统一 LF，比较走「CRLF→LF + 去末尾空行」归一化（D15） |
 | X4 | x86 产物在 Win9x 上「需要更新版本的 Windows」 | `link /subsystem:console,4.0` 被忽略（`LNK4010`，产物仍是 6.0/5.1） | 只能链接后改 PE 头：`tools/pever`（`pever` rule，仅 x86，x64 保持 6.0） |
 | X5 | 想列出网卡地址，顺手 `#include <iphlpapi.h>` / 链 `iphlpapi.lib` | Win95 没有 `iphlpapi.dll` → 静态导入 = legacy 模块映射硬失败；头文件还会拉进 `iptypes`/`winsock2` 的顺序坑 | `LoadLibraryA("iphlpapi.dll")` + `GetProcAddress("GetAdaptersInfo")`，结构体在 `net.cpp` 里**自定**（字段类型与 SDK 逐项对应，布局即一致；用不到的尾部 `time_t` 字段不写）；取不到就降级成 `gethostname`/`gethostbyname` |
+| X6 | 想把 GBK(CP936) 字节转成 UTF-8（`--json` 的转义口径），顺手用 `common::dynapi` 取 `MultiByteToWideChar` / `WideCharToMultiByte` | dynapi **不会减少导入表**：`kernel32` 已经在链接里，这两个符号本来就是**既有静态导入**（`src/core/util.cpp`，w95 白名单内）；走 dynapi 只是把已批准的导入换成动态查找 + 多一层失败分支，门禁看到的白名单条目反而更多 | `src/common/json_writer.cpp` 直接用影子头已声明的这两个符号（`scan_dir.py` 确认零新增）；新增任何 CRT/系统符号前先跑 `tools/api_check/main.py <符号>` |
+| X7 | `--json` 的 `stdout` / `stderr` 里混进 `\u0000`（那一行不再是干净的 JSON） | `nDebugStringLength`（ODS 事件）与 Lua 的 `n`（`lua_tolstring`）都是**不含** NUL 的长度，但旧代码照“含 NUL”用：`PrintN(ods_data, ods_size)` 把 0x00 一起写出；`nn = (int)n + 1` 再 `utf8_to_utf16_n` 把 NUL 当成一个宽字符（UNICODE 分支才可见） | `debug_loop.cpp` 的 ODS 回显先去掉结尾 NUL（并同步 `ev.size`，否则脚本里的 `ev.str` 会再污染一次）；`state.cpp` 两处 `utf8_to_utf16_n` 的入参**不加** `+1`。新增任何“带长度”的输出点前先确认这两个 API 的长度口径 |
+| X8 | `e2e_json.ps1` 的 `images` 一直是 `[]`、被调试进程也看不到落盘 | here-string 里写成了 `open_file([[ 'X' ]])` —— Lua 长括号内的内容是**带引号**的 `'X'`，路径就坏了（`open_file` 返回 `nil`，而脚本里是 `if f then`，静默失败） | 长括号里直接嵌值（`[[IMGPATH]]`），不要在 `[[...]]` 里再包引号；写这种“静默失败”的用例时带上 `if not f then print(...)`，否则断言只能看到下游现象 |
+| X9 | legacy 变体 `Run()` 里 CREATE_PROCESS 拿不到映像路径（`CreateToolhelp32Snapshot(TH32CS_SNAPMODULE)` 报 **299** `ERROR_PARTIAL_COPY`），接着 `calc_crc32` 拿着空路径 `CreateFile("")` 失败、回调里的 `Detach()` 不执行 | Toolhelp 快照在“刚 `CreateProcess`、目标还停在加载器初始化”的瞬间不稳定（调试中的挂起进程尤其如此）；32 位宿主枚举 WOW64 目标还需要 `TH32CS_SNAPMODULE32` | `LjGetMappedFileNameA` 改成三档回退 + 3 次重试：① Toolhelp（带 `TH32CS_SNAPMODULE32`）② `psapi!GetMappedFileNameA`（`common::dynapi` 动态解析；Win95 没这个 DLL → 正常降级）③ 自己走目标的 `PEB → Ldr → InLoadOrderModuleList`（只要 `ReadProcessMemory` + 动态 `NtQueryInformationProcess`，零新增导入）。排在同一轮里谁先成谁返回 |
+| X10 | `e2e_tcp.ps1` 里发空帧时报 `AddRange` 参数为 null | PowerShell 把**空数组**绑成「缺参」（`List.AddRange(@())` → collection 为 null） | 帧编码改用逐字节 `foreach + List.Add`；写这种自己编帧的脚本时不要用 `AddRange` 传可能为空的数组 |
+| X11 | 门禁脚本里 `Run({cmdline='C:\Windows\…'})` 一律 `exit=3`（`invalid escape sequence`） | PowerShell **here-string 是字面的**：写进去的 `C:\Windows` 到 Lua 眼里就是非法转义（双引号字符串才会被 PS 处理） | 命令行走 Lua 长括号：`[[C:\Windows\System32\cmd.exe]] .. ' /c …'`；另外 `Recv-Frame` 的 `Stream.Read` 要 `try/catch`，否则读超时会把整个脚本炸掉而不是报 FAIL |
+| X12 | legacy 变体在 Win95 上映射/加载失败，`api_check` 报 `kernel32.dll GetFileSizeEx` | `GetFileSizeEx` 是 NT4/98 才有的（Win95 没有）；写代码时习惯性用它读文件大小 | 用 `GetFileSize`（Win95 有）或 `SetFilePointer(…, FILE_END)`；新增任何 file/process API 后先跑 `uv --directory tools/api_check run scan_dir.py`（它会按产物自动选 w95/wxp/w7 口径） |

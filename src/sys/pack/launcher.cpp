@@ -10,6 +10,10 @@
  *      未知标记**报错退出**（D9），不静默降级；
  *   ② variant 回退链（F12）：先按平台探测选，`map()` 失败则换另一个变体重试，并打印原因；
  *   ③ 无参时的文件对话框（D7）：优先 `GetOpenFileNameW`（动态取，9x 无 W 版则降级 A 版）。
+ * T1（D50）：解析 `--json` / `--out=<path>` → 填进 `autodbg_boot`（ABI 3 的两个追加字段），
+ *   信封本身在模块里组装（`main.cpp`）。`--out` 单独给也算 JSON 模式；与 `--server` 互斥
+ *   （同时给 → 报错、退出码 2）；JSON 模式不弹文件对话框，启动器自己的诊断走 stderr
+ *   （stdout 必须被那一行 JSON 独占）。
  *
  * ❗启动器是 **ANSI 编译**（要能在 Win9x 上跑）：所有 API 显式带 A/W 后缀；
  *   `GetCommandLineW` / `GetOpenFileNameW` 一律走 `GetProcAddress`（9x 的 kernel32/comdlg32 没有 W 版）。
@@ -513,6 +517,63 @@ void build_addr(char *dst, unsigned cap, const char *addr, unsigned port)
     append(dst, cap, ":");
     append_u32(dst, cap, port);
 }
+
+/* T3（D42）：「host:port」拆开。`port` 缺省为 0（由调用方代以 8642）。
+ * 只有 IPv4 文本 / `localhost`（不支持 IPv6 — 与 `net_parse_ipv4` 一致）。 */
+bool split_host_port(const char *s, char *host, unsigned cap, unsigned *port)
+{
+    if (s == nullptr || host == nullptr || port == nullptr || cap == 0)
+        return false;
+    unsigned n = 0;
+    while (s[n] != '\0' && s[n] != ':')
+    {
+        if (n + 1 >= cap)
+            return false;   /* host 太长 */
+        host[n] = s[n];
+        n++;
+    }
+    host[n] = '\0';
+    if (n == 0)
+        return false;
+
+    *port = 0;
+    if (s[n] != ':')
+        return true;        /* 只有 host：端口用缺省 */
+    n++;
+    if (s[n] == '\0')
+        return false;       /* 冒号后面什么都没有 */
+    unsigned v = 0;
+    while (s[n] != '\0')
+    {
+        if (s[n] < '0' || s[n] > '9')
+            return false;
+        v = v * 10u + (unsigned)(s[n] - '0');
+        if (v > 65535u)
+            return false;
+        n++;
+    }
+    *port = v;
+    return true;
+}
+
+/* 十进制无符号解析（`--pid=` / `--read-timeout=` / `--max-frame=` 用）；失败返回 false */
+bool parse_udec(const char *s, unsigned *out)
+{
+    if (s == nullptr || out == nullptr || s[0] == '\0')
+        return false;
+    unsigned v = 0;
+    for (unsigned i = 0; s[i] != '\0'; i++)
+    {
+        if (s[i] < '0' || s[i] > '9')
+            return false;
+        unsigned d = (unsigned)(s[i] - '0');
+        if (v > (0xFFFFFFFFu - d) / 10u)
+            return false;   /* 溢出 */
+        v = v * 10u + d;
+    }
+    *out = v;
+    return true;
+}
 }
 
 /* ---- `--version` / `--help` ----
@@ -554,7 +615,9 @@ void print_usage()
     out("      --module-dir=<dir>     load module DLLs from <dir> (still memory-mapped)\n");
     out("      --quiet                do not show error message boxes\n");
     out("      --selftest             run built-in pure-function self test\n");
-    out("      --server[=http]        run as HTTP server (see below)\n");
+    out("      --json                 print one machine-readable JSON line (D50)\n");
+    out("      --out=<path>           write the same JSON to <path>; stdout stays empty\n");
+    out("      --server[=tcp]           server mode (raw tcp frames; http was removed, D41)\n");
     out("      --server-addr=<ip:port>  listen address (default 127.0.0.1:8642)\n");
     out("      --server-port=<port>     only override the port\n");
     out("      --server-token=<hex|auto|none>\n");
@@ -562,7 +625,16 @@ void print_usage()
     out("      --server-queue=<n>       queue depth (default 8)\n");
     out("      --server-timeout=<sec>   per-request timeout (0 = none)\n");
     out("      --server-log=<path>      diagnostic log file\n");
-    out("      --server-no-echo         do not echo executed output to console\n\n");
+    out("      --server-no-echo         do not echo executed output to console\n");
+    out("      (--json/--out are mutually exclusive with --server, exit code 2)\n\n");
+    out("client (raw tcp, D42):\n");
+    out("      --remote=<host:port>   run the script on a remote server (default port 8642)\n");
+    out("      --remote-token=<hex>    token for the handshake (loopback needs none)\n");
+    out("      --pid=<n>               explicit target pid sent to the server\n");
+    out("      --read-timeout=<ms>     per-file-operation timeout (default 5000)\n");
+    out("      --max-frame=<bytes>     largest frame the client accepts (default 8388608)\n");
+    out("      --cancel | --kill | --detach   control the running execution\n");
+    out("      --health | --version            query server info over the tcp connection\n\n");
     out("script head markers:\n");
     out("  --!lua / --!luajit         select interpreter (CLI --flavor wins)\n");
     out("  --!autodbg ...             editor-side marker (ignored, line is skipped)\n\n");
@@ -582,9 +654,28 @@ extern "C" int launcher_main(int argc, char **argv)
     const char *module_dir     = nullptr;
     const char *script         = nullptr;
 
+    /* T1（D50）：`--json` / `--out=<path>`（机器可读结果信封）。`--out` 单独给也算 JSON 模式。
+     * ❗与 `--server` 互斥（同时给 → 启动器报错、退出码 2）；JSON 模式下不弹文件对话框，
+     *   且启动器自己的诊断走 stderr（stdout 必须被那一行 JSON 独占）。 */
+    bool        json_mode      = false;
+    static char g_json_out[260];
+
+    /* T3（D42）：客户端模式（`--remote`）与它的控制命令。
+     * ❗`--cancel` / `--kill` / `--detach` / `--health` / `--version` 只在**带** `--remote` 时
+     *   才是「发帧给 server」；不带时 `--version` 仍是启动器自己的版本，其余报错。 */
+    const char *remote_host  = nullptr;
+    unsigned    remote_port  = 0;
+    unsigned    remote_cmd   = 0;   /* 0 = 跑脚本；1..5 见 boot.remote_cmd */
+    unsigned    client_pid   = 0;
+    unsigned    read_timeout = 0;
+    unsigned    max_frame    = 0;
+    static char g_remote_arg[160];   /* 原字符串（host:port） */
+    static char g_remote_host[128];  /* 拆出来的 host */
+
     /* S0（plan_server.md）：server / 自测模式的选项；字符串拷到静态缓冲，
      * 保证在 `autodbg_run` 调用期间有效。 */
     bool        server_mode    = false;
+    unsigned    server_mode_v  = 1;   /* 1 = http（将被 D41 删除）、2 = raw tcp（D42） */
     bool        selftest_mode  = false;
     const char *server_addr    = nullptr;
     unsigned    server_port    = 0;
@@ -653,15 +744,91 @@ extern "C" int launcher_main(int argc, char **argv)
         {
             selftest_mode = true;
         }
+        else if (str_eq(a, "--json"))
+        {
+            json_mode = true;
+        }
+        else if (str_eq(a, "--remote") || starts_with(a, "--remote="))
+        {
+            /* `--remote=h:p` 或 `--remote h:p` */
+            const char *v = (a[8] == '=') ? (a + 9) : nullptr;
+            if (v == nullptr)
+            {
+                if (i + 1 >= argc)
+                {
+                    out_err("launcher: --remote needs <host:port>\n");
+                    return 2;
+                }
+                v = argv[++i];
+            }
+            g_remote_arg[0] = '\0';
+            append(g_remote_arg, sizeof g_remote_arg, v);
+            if (!split_host_port(g_remote_arg, g_remote_host, sizeof g_remote_host, &remote_port))
+            {
+                out_err("launcher: --remote needs <host:port>\n");
+                return 2;
+            }
+            remote_host = g_remote_host;
+            if (remote_port == 0)
+                remote_port = 8642;   /* 与 server 默认端口一致 */
+        }
+        else if (starts_with(a, "--pid="))
+        {
+            if (!parse_udec(a + 6, &client_pid) || client_pid == 0)
+            {
+                out_err("launcher: --pid=<n> expects a positive number\n");
+                return 2;
+            }
+        }
+        else if (starts_with(a, "--read-timeout="))
+        {
+            if (!parse_udec(a + 15, &read_timeout))
+            {
+                out_err("launcher: --read-timeout=<ms> expects a number\n");
+                return 2;
+            }
+        }
+        else if (starts_with(a, "--max-frame="))
+        {
+            if (!parse_udec(a + 12, &max_frame))
+            {
+                out_err("launcher: --max-frame=<bytes> expects a number\n");
+                return 2;
+            }
+        }
+        else if (str_eq(a, "--cancel") || str_eq(a, "--kill") || str_eq(a, "--detach") || str_eq(a, "--health"))
+        {
+            remote_cmd = str_eq(a, "--cancel")   ? 1u
+                         : str_eq(a, "--kill")   ? 2u
+                         : str_eq(a, "--detach") ? 3u
+                                                  : 4u;
+        }
+        else if (starts_with(a, "--out="))
+        {
+            g_json_out[0] = '\0';
+            append(g_json_out, sizeof g_json_out, a + 6);
+            json_mode = true;   /* `--out` 单独给也生成信封（内容写文件、stdout 留空） */
+        }
         else if (str_eq(a, "--server") || starts_with(a, "--server="))
         {
             const char *v = (a[8] == '=') ? (a + 9) : "";
-            if (!str_ieq(v, "") && !str_ieq(v, "http"))
+            /* T5（D41/D42）：HTTP 传输已删除 —— `--server` / `--server=tcp` 都是 raw TCP 帧；
+             * `--server=http` 明确报错（不静默降级，否则旧脚本会连上一个完全不同的协议）。 */
+            if (str_ieq(v, "") || str_ieq(v, "tcp"))
             {
-                out_err("launcher: only --server=http is supported (D20)\n");
-                return 1;
+                server_mode   = true;
+                server_mode_v = 2;
             }
-            server_mode = true;
+            else if (str_ieq(v, "http"))
+            {
+                out_err("launcher: --server=http was removed (D41); use --server=tcp\n");
+                return 2;
+            }
+            else
+            {
+                out_err("launcher: --server=<tcp> only\n");
+                return 2;
+            }
         }
         else if (starts_with(a, "--server-addr="))
         {
@@ -679,6 +846,12 @@ extern "C" int launcher_main(int argc, char **argv)
         }
         else if (starts_with(a, "--server-token="))
         {
+            g_server_token[0] = '\0';
+            append(g_server_token, sizeof g_server_token, a + 15);
+        }
+        else if (starts_with(a, "--remote-token="))
+        {
+            /* T3：客户端握手用的 token；落到**同一个**字段（语义相同：握手帧里那几个 hex） */
             g_server_token[0] = '\0';
             append(g_server_token, sizeof g_server_token, a + 15);
         }
@@ -727,6 +900,31 @@ extern "C" int launcher_main(int argc, char **argv)
         /* 其余位置参数属于脚本（模块侧按 boot.cmdline_a 重新拆一次，拿到全部） */
     }
 
+    /* ---- T1（D50）：`--json` / `--out` 与 `--server` 互斥（同时给 → 报错、退出码 2）：
+     *      server 的输出口径是帧（信封走 `result` 帧），与「stdout 只有一行 JSON」不能共存。 */
+    if (json_mode && server_mode)
+    {
+        out_err("launcher: --json/--out cannot be combined with --server\n");
+        return 2;
+    }
+
+    /* ---- T3（D42）：客户端模式的校验 ----
+     * `--version` 在**不带** `--remote` 时保持老语义（打启动器版本、退出 0）；带了就变成
+     * 「向 server 查版本」的控制命令。控制命令离开 `--remote` 就是无意义的 → 报错。 */
+    if (remote_host == nullptr)
+    {
+        if (remote_cmd != 0)
+        {
+            out_err("launcher: --cancel/--kill/--detach/--health need --remote\n");
+            return 2;
+        }
+    }
+    else if (version_only)
+    {
+        version_only = false;   /* 改成查 server 版本 */
+        remote_cmd   = 5u;
+    }
+
     /* ---- `--help` / `--version`：不碰载荷、不弹对话框，直接打印退出 ---- */
     if (help_requested)
     {
@@ -744,8 +942,10 @@ extern "C" int launcher_main(int argc, char **argv)
     {
         set_script_ansi(script);
     }
-    else if (!list_only && !server_mode && !selftest_mode)
+    else if (!list_only && !server_mode && !selftest_mode && !json_mode && !(remote_host != nullptr && remote_cmd != 0))
     {
+        /* JSON 模式不弹窗：它是机器可读接口，拿不到交互桌面时应该直接报错（退出码 -1）；
+         * 客户端的控制命令（cancel/kill/detach/health/version）也不需要脚本。 */
         if (!ask_script())
             return (GetLastError() == 0) ? 0 : -1;   /* 取消 = 正常退出 */
         script = g_script_a;
@@ -840,7 +1040,11 @@ extern "C" int launcher_main(int argc, char **argv)
             out_err("launcher: cannot read module from --module-dir\n");
             return 2;
         }
-        out("launcher: module from disk (--module-dir)\n");
+        /* JSON 模式：启动器自己的诊断不能进 stdout（那一行 JSON 必须独占）→ 走 stderr */
+        if (json_mode)
+            out_err("launcher: module from disk (--module-dir)\n");
+        else
+            out("launcher: module from disk (--module-dir)\n");
     }
 
     /* ---- 映射 + 启动：modern 失败则回退 legacy（F12；`--variant` 强制时不回退） ---- */
@@ -942,7 +1146,7 @@ extern "C" int launcher_main(int argc, char **argv)
     boot.variant    = used_variant;
 
     /* ---- S0（D27）：server / 自测模式 ---- */
-    boot.server_mode = server_mode ? 1u : 0u;
+    boot.server_mode = server_mode ? server_mode_v : 0u;
     boot.selftest    = selftest_mode ? 1u : 0u;
     boot.server_addr = nullptr;
     if (server_port != 0)
@@ -961,6 +1165,24 @@ extern "C" int launcher_main(int argc, char **argv)
     boot.server_timeout_sec = server_timeout;
     boot.server_log         = (g_server_log[0] != '\0') ? g_server_log : nullptr;
     boot.server_no_echo     = server_no_echo;
+
+    /* ---- T1（D50）：JSON 信封（ABI 3）---- */
+    boot.json_mode = json_mode ? 1u : 0u;
+    boot.json_out  = (g_json_out[0] != '\0') ? g_json_out : nullptr;
+
+    /* ---- T3（D42）：客户端（ABI 4）---- */
+    boot.remote_host     = remote_host;
+    boot.remote_port     = remote_port;
+    boot.remote_cmd      = remote_cmd;
+    boot.pid             = client_pid;
+    boot.read_timeout_ms = read_timeout;
+    boot.max_frame       = max_frame;
+    if (remote_host != nullptr)
+    {
+        /* 客户端模式的 token 复用 server_token 字段（同一份语义）；未给 → D21 缺省
+         * （loopback 不校验，非 loopback 由 server 拒） */
+        boot.server_token = (g_server_token[0] != '\0') ? g_server_token : nullptr;
+    }
 
     int rc = run(&boot);
 

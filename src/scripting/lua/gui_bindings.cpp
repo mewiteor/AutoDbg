@@ -12,6 +12,8 @@
  * ========================================================================== */
 #include "gui_bindings.hpp"
 
+#include "output.hpp"   /* T1（D50）：`images` 登记表 */
+
 #include "core/gui.hpp"
 #include "core/util.hpp" /* TCHAR / alloc_ / free_ 宏 */
 
@@ -318,6 +320,8 @@ int lua_gui_screenshot_to(lua_State *L)
 
     if (written != len)
         return fail(L, "short write");
+    /* T1（D50）：写盘成功才算「本次运行写出的文件」（与 open_file 的 w/a 句柄同一口径） */
+    host::output_record_path(lua_tostring(L, 1));
     lua_pushinteger(L, (lua_Integer)len);
     return 1;
 }
@@ -825,6 +829,22 @@ int lua_gui_sleep(lua_State *L)
     return 0;
 }
 
+/* T4（D48）：gui.pick() → { pid = <n>, hwnd = <n> } 或 nil, errmsg
+ * 用来替掉「手抄 pid」：在目标机上按鼠标位置定位窗口所属进程。 */
+int lua_gui_pick(lua_State *L)
+{
+    unsigned pid = 0;
+    HWND     hwnd = nullptr;
+    if (!core::gui::window_pick(&pid, &hwnd))
+        return fail(L, "pick: cannot resolve a window under the cursor");
+
+    lua_createtable(L, 0, 2);
+    lua_pushinteger(L, (lua_Integer)pid);
+    lua_setfield(L, -2, "pid");
+    lua_pushinteger(L, (lua_Integer)(size_t)hwnd);
+    lua_setfield(L, -2, "hwnd");
+    return 1;
+}
 int lua_gui_foreground_pid(lua_State *L)
 {
     lua_pushinteger(L, (lua_Integer)core::gui::window_foreground_pid());
@@ -884,6 +904,7 @@ const gui_fn k_gui_fns[] = {
     { "click_control", lua_gui_click_control },
     { "sleep", lua_gui_sleep },
     { "foreground_pid", lua_gui_foreground_pid },
+    { "pick", lua_gui_pick },   /* T4（D48） */
     { "dpi_aware", lua_gui_dpi_aware },
     { "cursor_locked", lua_gui_cursor_locked },
 };

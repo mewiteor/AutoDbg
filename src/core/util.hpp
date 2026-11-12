@@ -61,6 +61,20 @@ void set_output_sink(output_sink_fn fn, void *ctx);
 /* 当前是否已装 sink（宿主层自测/断言用） */
 bool output_sink_active();
 
+/* ------------------- 子进程 std 句柄策略（T1 / D50） -------------------
+ * 默认（false）= 旧行为：被调试进程**继承本进程的 std 句柄**，它的 console 输出与控制台/重定向同流。
+ * 开启（true）= `run()` 里 `CreateProcess` 时用 `STARTF_USESTDHANDLES` 把目标的
+ *   stdout/stderr 指到**本进程 stderr 的可继承副本**（stdin 指 NUL）：
+ *   · stdout 因此干净 —— `--json` 的那一行 JSON 不会被目标输出顶掉（D50）；
+ *   · 不丢目标输出（仍落在 stderr 流里），也不需要有人排空；
+ *   · ❗不用匿名管道：管道必须有人持续读，而 `--detach` 之后没人能读 —— 关读端会让目标的
+ *     下一次 write 拿到 `ERROR_BROKEN_PIPE`，留着读端不读又会让它填满 4 KB 后阻塞，两者都
+ *     违背 D47「detach 后目标继续活着」；副本句柄则随目标自己活，本进程关掉自己那份即可。
+ * ❗代价：`bInheritHandles` 必须为 TRUE（Win9x 没有 `PROC_THREAD_ATTRIBUTE_HANDLE_LIST`），
+ *   所以本进程的其它**可继承**句柄也会被交给目标。只在 `--json` 下开启。 */
+void set_child_stdio_capture(bool enable);
+bool child_stdio_capture();
+
 /* 变参底层（替代旧的 PrintExA/W/VA/VW 宏 + 函数） */
 void PrintExA(DWORD o, LPCSTR fmt, ...);
 void PrintExVA(DWORD o, LPCSTR fmt, va_list ap);
