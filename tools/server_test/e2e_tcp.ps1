@@ -32,6 +32,7 @@
 #      **等回包超时 → nil,"timeout" 且脚本继续**（用一个故意不回 read_req 的假客户端）
 #   ⑭ **调试回调里的阻塞读**（T4 收尾）：`Run` 的 callback 里 `f:read`，超时后回调返回、
 #      调试会话不断（下一次 `Run` 照常）；并且**迟到的 read_resp 被丢弃**（D45 规则 3）
+#   ⑮ 绑 `0.0.0.0` 时的启动横幅**列出本机网卡地址**（client 直接挑一条去 `--remote`）
 # =============================================================================
 [CmdletBinding()]
 param(
@@ -589,6 +590,24 @@ if ($null -eq $cbRes) {
     Check 'callback.read-timeout-per-run' (([regex]::Matches($outText, 'read=nil err=timeout')).Count -ge 2) "stdout=[$outText]"
     Check 'callback.read-session-survives' ($outText -match 'hit2 read=nil' -and $outText -match 'after-both-runs' -and $result.ok -eq $true) "stdout=[$outText]"
     Check 'callback.read-stale-discarded' (-not ($outText -match 'LATE')) "stdout=[$outText]"
+}
+
+# ---------------------------- ⑮ 绑 0.0.0.0 时横幅列出本机网卡地址（T5 重写时曾漏掉）
+$banner = Start-Server @("--server-addr=0.0.0.0:$Port", '--server-token=auto')
+if ($null -eq $banner) {
+    Write-Output '[skip] net.banner（这台机器绑不了 0.0.0.0，跳过）'
+} else {
+    $banner.Close()
+    Start-Sleep -Milliseconds 200
+    $text = if (Test-Path $script:outFile) { Get-Content $script:outFile -Raw } else { '' }
+    Stop-Server
+    $script:proc = $null
+
+    Check 'net.banner-listen-any' ($text -match 'listen=0\.0\.0\.0') "banner=[$($text -replace "`r?`n", ' | ')]"
+    # 地址 + 网卡描述两列（纯 ASCII，legacy 变体也能比）；至少一条
+    $addrs = [regex]::Matches($text, '(?m)^\s+(\d{1,3}(?:\.\d{1,3}){3})\s{2,}(\S.*)$')
+    Check 'net.banner-lists-addresses' ($addrs.Count -ge 1) "count=$($addrs.Count)"
+    Check 'net.banner-token-hint' ($text -match 'token') 'banner 应提示非 loopback 需要 token'
 }
 
 Write-Output ''

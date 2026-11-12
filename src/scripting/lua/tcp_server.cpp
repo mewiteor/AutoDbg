@@ -840,6 +840,25 @@ int tcp_server_main(const autodbg_boot *boot)
            cfg.echo ? "on" : "off",
            (autodbg::common::net_module_name() != nullptr) ? autodbg::common::net_module_name() : "(none)");
 
+    /* 绑到 0.0.0.0 时把本机网卡地址列出来：client 直接用其中一条就能连（不用猜 IP）。
+     * 走 PrintS（core 的输出分流：控制台 / 重定向都能看）；取不到就安静地不列。
+     * ❗T5 重写 TCP server 时漏了这一块（HTTP 那份才有）—— 现在补回来，
+     *   并换成 `--remote=<ip>:<port>` 的说法。 */
+    {
+        unsigned any = 1;
+        if (autodbg::common::net_parse_ipv4(cfg.host, &any) && any == 0)
+        {
+            char   addrs[1024];
+            size_t n = autodbg::common::net_describe_local_addresses(addrs, sizeof addrs);
+            if (n > 0)
+            {
+                PrintS("autodbg server(tcp): 本机网卡地址（client 用 `--remote=<地址>:端口` 里的任一条）:\n");
+                PrintS(addrs);
+            }
+            PrintS("autodbg server(tcp): 提示: 非 loopback 监听需要 token，且防火墙可能要放行该端口\n");
+        }
+    }
+
     /* T4（D44）：server 模式下 open_file 指向**客户端**那台机器（帧协议），不是本机磁盘。 */
     autodbg::host::set_client_io(true);
 

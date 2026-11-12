@@ -100,7 +100,7 @@ make.bat i <dir>         :: 指定输出目录（默认 .out）
 | 导入表门禁 | `uv --directory tools/api_check run scan_dir.py` | 扫 `.out` 下全部产物，按产物自动选口径（`AutoDbgLegacy_*` 与启动器 → `w95`、其余 x86 → `wxp`、x64 → `w7`），有目标系统不可用的导入就打印并返回 1。单文件用法：`uv --directory tools/api_check run main.py <exe\|dll> <w95\|w98\|w982\|wxp>`（x64 免第二个参数） |
 | 纯函数自测 | `.out\AutoDbg_<arch>.exe --selftest` | 覆盖 `json_writer` / `png_writer` / `dbl2str` / **帧编解码** 等纯计算层（基线 70 → T1/D50 转义 +11 = 81 → T2 帧编解码 +20 = 101 → **T5 删 `http`/`base64` 两段后 = 67**）；待补：`decide_console_action` 的断言 |
 | GUI 自动化（本地） | `pwsh tools/server_test/e2e_gui.ps1 -Render <64\|86> [-Variant legacy]` | 起一个 `gui_target.ps1` 靶子窗口，用**本地 CLI** 跑 `gui.*` 脚本断言（屏幕/窗口/控件/截图/`gui.pick`）；`-AllowInput` 才跑会动真鼠标/键盘的用例。T5 之前它走 HTTP `/run`，现已改成本地（`gui.*` 与传输无关，21 条断言） |
-| raw TCP 帧（T2/T3/T4/D42） | `pwsh tools/server_test/e2e_tcp.ps1 -Render <64\|86> [-Variant legacy]` | `--server=tcp`：握手帧（`id` = 协议版本、`data` = token）→ `info`；版本不符 / 首帧非握手 / 错 token 的 `error` 帧；`script` → `out`+`result`+`end`；`control` 的 health / version / cancel / 未知 / shutdown；**执行期的 control**（Lua 死循环 + 引擎空转）；**`--remote` 客户端**（跑脚本 / `--json` 信封 / 语法错误 / health / version / 另一个进程的 `--cancel`）；**`open_file` 读向**（远程 open 应答、read/tell/seek/lines 字节与位置语义、等回包超时 → `nil,"timeout"` 且脚本继续）、**调试回调里的阻塞读**（`Run` 的 callback 里 `f:read` 超时 → 回调返回 → 下一次 `Run` 照常；迟到的 `read_resp` 被丢弃）。45 条断言，legacy 同样必须真过 |
+| raw TCP 帧（T2/T3/T4/D42） | `pwsh tools/server_test/e2e_tcp.ps1 -Render <64\|86> [-Variant legacy]` | `--server=tcp`：握手帧（`id` = 协议版本、`data` = token）→ `info`；版本不符 / 首帧非握手 / 错 token 的 `error` 帧；`script` → `out`+`result`+`end`；`control` 的 health / version / cancel / 未知 / shutdown；**执行期的 control**（Lua 死循环 + 引擎空转）；**`--remote` 客户端**（跑脚本 / `--json` 信封 / 语法错误 / health / version / 另一个进程的 `--cancel`）；**`open_file` 读向**（远程 open 应答、read/tell/seek/lines 字节与位置语义、等回包超时 → `nil,"timeout"` 且脚本继续）、**调试回调里的阻塞读**（超时后回调返回、下一次 `Run` 照常；迟到的 `read_resp` 被丢弃）；**`0.0.0.0` 横幅列出网卡地址**。48 条断言，legacy 同样必须真过 |
 | JSON 信封（T1/D50） | `pwsh tools/server_test/e2e_json.ps1 -Render <64\|86> [-Variant legacy]` | 本地模式 `--json` / `--out=<path>`：那一行 JSON 独占 stdout、字段齐全、`result` / `pid` / `detached` / `images` 口径、`--json` 与 `--server` 互斥（退出码 2）、退出码口径不变；那一行必须**纯 ASCII**（CP936 → UTF-8 或逐字节降级）。`-Variant legacy` **必须真过**（这段就是用来暴露 GBK 的） |
 | agent 技能包（T6） | `pwsh tools/agent/check_skill.ps1 -Render <64\|86>` | `tools/agent/autodbg-skill/` 是 CLI 口径下的**唯一对外契约文档**：检查 `SKILL.md` 的 frontmatter（`name` / `description`）并把每个 `.md` 里的 ` ```lua ` 片段交给产物做语法检查（只解析不执行）。14 条断言 / 36 个 Lua 片段 |
 | nvim 客户端（T5） | `pwsh tools/server_test/nvim_smoke.ps1 -Render <64\|86> [-Variant legacy]` | 起 `--server=tcp` → headless nvim 跑 `nvim_smoke.lua`：远程执行 + 结果 buffer、异步路径不出 `E5560`、语法错误 → chunkname + quickfix、`M.cancel`（控制帧）、health/version（`info`）、`open_file` 写/读回（帧上的 `open`/`data`/`close`/`read_req`）。24 条断言；**nvim 不在 PATH 时 SKIP** |
@@ -391,12 +391,12 @@ payload              // 单条 LZMA 流：各模块原始字节按 entry 顺序�
 > 所以 `--cancel` / `--kill` / `--detach` 在脚本跑着的时候就能生效。
 
 - 归属：server 跑在**模块（DLL）里**（需要 `lua_State` 与引擎会话），启动器只解析选项；`--server` 时允许不给脚本。
-- 选项（全部 `--server-*` 前缀）：`--server[=http|tcp]`（`tcp` = T2 的 raw 帧，`http` 待删）、`--server-addr=<ip:port>`（默认 `127.0.0.1:8642`）、`--server-port=`、`--server-token=<hex|auto|none>`、`--server-max-body=`、`--server-queue=`、`--server-timeout=`、`--server-log=<path>`、`--server-no-echo`。
-- 端点：`GET /health` / `/version` / `/`（说明）、`POST /run`（body = Lua 源码，**不落盘**）、`POST /cancel`、`POST /shutdown`、`POST /effects?token=`（client 文件 I/O 的恢复）、`POST /mcp`。
-- 绑 `0.0.0.0` 时启动横幅会**列出本机网卡地址**（地址 + 网卡描述，UTF-8），方便 client 直接拄一条去配
-  `--!autodbg url=…`：地址来自 `iphlpapi!GetAdaptersInfo`（**必须动态载入**，Win95 没有；取不到就退
-  `gethostname`/`gethostbyname`，再取不到就安静不列）。结构体在 `net.cpp` 里自定（不 include `iphlpapi.h`），
-  字段类型与 SDK 逐项对应。
+- 选项（全部 `--server-*` 前缀）：`--server[=tcp]`（`http` 已随 D41 删除，传了报错）、`--server-addr=<ip:port>`（默认 `127.0.0.1:8642`）、`--server-port=`、`--server-token=<hex|auto|none>`、`--server-max-body=`（= 一帧上限）、`--server-queue=`、`--server-timeout=`、`--server-log=<path>`、`--server-no-echo`。
+- 端点 → **帧**（`tools/agent/autodbg-skill/references/cli.md` 有全表）：`script` / `control`（health·version·cancel·kill·detach·shutdown）/ `out` / `result` / `end` / `read_req`。
+- 绑 `0.0.0.0` 时启动横幅会**列出本机网卡地址**（地址 + 网卡描述），方便 client 直接挑一条去配 `--remote=<地址>:<端口>`：
+  地址来自 `iphlpapi!GetAdaptersInfo`（**必须动态载入**，Win95 没有；取不到就退 `gethostname`/`gethostbyname`，
+  再取不到就安静不列）。结构体在 `net.cpp` 里自定（不 include `iphlpapi.h`），字段类型与 SDK 逐项对应。
+  门禁：`e2e_tcp.ps1` 的 `net.banner-*`（只断言 ASCII 部分，legacy 变体的中文是 GBK 字节）。
 - 认证（D21）：loopback 且未指定 token → **不校验**；非 loopback → **强制** token（`auto` 生成或显式给），`--server-token=none` 在非 loopback 上拒绝启动。
 - 并发：accept 线程 + **单个** worker 线程（脚本串行）；`/health`、`/cancel`、`/version` 在 accept 线程直答，不被长脚本饿死。
 - 取消/超时：`exec_guard` 的两条注入路径（`on_wait_timeout` 100 ms / `lua_sethook` 每 100 万条指令），server 模式下**不得**回落到 `CheckConsoleInput`（`PITFALLS.md` S2）。
