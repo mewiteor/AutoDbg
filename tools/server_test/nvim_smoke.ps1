@@ -64,14 +64,44 @@ try {
         exit 2
     }
 
+    # 第二台 server：要求 token（验插件把 token 放进握手帧、以及拒绝路径）
+    $tokPort = $Port + 1
+    $tok = 'deadbeefcafe1234'
+    $tokOut = Join-Path $TmpDir 'server_tok.out'
+    $tokErr = Join-Path $TmpDir 'server_tok.err'
+    $tokArgs = @('--server=tcp', "--server-port=$tokPort", '--server-no-echo', "--server-token=$tok")
+    if ($Variant) { $tokArgs += "--variant=$Variant" }
+    $script:tokProc = Start-Process -FilePath $Exe -ArgumentList $tokArgs -RedirectStandardOutput $tokOut `
+        -RedirectStandardError $tokErr -PassThru -NoNewWindow
+    $tokReady = $false
+    $deadline2 = (Get-Date).AddSeconds(10)
+    while ((Get-Date) -lt $deadline2) {
+        if ($script:tokProc.HasExited) { break }
+        try {
+            $tc = [System.Net.Sockets.TcpClient]::new()
+            $tc.Connect('127.0.0.1', $tokPort)
+            $tc.Close()
+            $tokReady = $true
+            break
+        }
+        catch { Start-Sleep -Milliseconds 120 }
+    }
+
     $env:AUTODBG_HOST = '127.0.0.1'
     $env:AUTODBG_PORT = "$Port"
     $env:AUTODBG_EXE = $Exe
+    if ($tokReady) {
+        $env:AUTODBG_TOKEN_PORT = "$tokPort"
+        $env:AUTODBG_TOKEN = $tok
+    }
     & $Nvim --headless -u NONE --cmd "set rtp+=$Rtp" -c "luafile $Smoke"
     $code = $LASTEXITCODE
     Write-Output "nvim exit=$code"
 }
 finally {
+    if ($script:tokProc -and -not $script:tokProc.HasExited) {
+        try { $script:tokProc.Kill() } catch { }
+    }
     if (-not $proc.HasExited) {
         # 先请它优雅停机（control shutdown），不行再杀
         try {

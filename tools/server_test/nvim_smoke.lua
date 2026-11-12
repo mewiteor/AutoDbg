@@ -191,5 +191,59 @@ else
   bad("io.content", "读不回 " .. tmp)
 end
 
+-- ------------------------------------------------ ⑧ 默认配置（sync_timeout_ms = 0）+ token
+-- ❗`vim.wait(0, ...)` 是「不等待」而不是「一直等」：默认配置曾让每条控制命令都 1 ms 后报
+--   timeout。这里用没有任何超时设置的 setup 复刻默认情况。
+set_buffer({ 'print("default-cfg")' }, "smoke_default.lua")
+ad.setup({
+  mode = "remote",
+  host = host,
+  port = port,
+  -- 故意不给 sync_timeout_ms（默认 0）
+  open = "none",
+  focus = false,
+  lsp = { enable = false },
+  snippets = { enable = false },
+})
+local dh = ad.health({ sync = true })
+check("default.health-no-timeout", dh.ok == true, "body=" .. tostring(dh.body):sub(1, 80))
+local dv = ad.version({ sync = true })
+check("default.version-no-timeout", dv.ok == true, "error=" .. tostring(dv.error))
+local dr = ad.run({ sync = true })
+check("default.run-sync", dr.ok == true and dr.exit == 0, "exit=" .. tostring(dr.exit) .. " err=" .. tostring(dr.error))
+
+-- token 转发：用一台**要求认证**的 server（PS 侧在 port+1 起的）
+local tport = tonumber(os.getenv("AUTODBG_TOKEN_PORT") or "0")
+if tport and tport > 0 then
+  ad.setup({
+    mode = "remote",
+    host = host,
+    port = tport,
+    token = os.getenv("AUTODBG_TOKEN") or "",
+    open = "none",
+    focus = false,
+    lsp = { enable = false },
+    snippets = { enable = false },
+  })
+  local tv = ad.version({ sync = true })
+  check("token.accepted", tv.ok == true, "error=" .. tostring(tv.error))
+
+  ad.setup({
+    mode = "remote",
+    host = host,
+    port = tport,
+    token = "wrong-token-0000",
+    open = "none",
+    focus = false,
+    lsp = { enable = false },
+    snippets = { enable = false },
+  })
+  local tb = ad.version({ sync = true })
+  check("token.rejected", tb.ok == false and tostring(tb.error):find("unauthorized", 1, true) ~= nil,
+    "error=" .. tostring(tb.error))
+else
+  -- 没有第二台 server（带 token）：跳过 token 用例
+  print("[skip] token.*（PS 侧没起带 token 的 server）")
+end
 print(("nvim_smoke: pass=%d fail=%d"):format(pass, fail))
 vim.cmd(fail > 0 and "cq" or "qa!")
