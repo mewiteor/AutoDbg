@@ -71,7 +71,7 @@ Run({
       is_single = true,
       callback = function(info)
         local ctx = GetContext(info.tid)
-        local p   = ctx.Rcx.val                       -- x64 第一个参数（LuaVariant.val）
+        local p   = ctx.Rcx.rawval                    -- x64 第一个参数
         local buf = ReadMemory(U64(p), U32(0x10000))
         -- 注意：是 table of bytes，转成字节串再写
         local bytes = {}

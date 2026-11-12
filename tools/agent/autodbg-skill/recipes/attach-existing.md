@@ -55,7 +55,7 @@ Attach{ pid = pid, callback = function()
     callback = function(info)
       hits = hits + 1
       local ctx = GetContext(info.tid)
-      local text = LoadStr(U64(ctx.Rdx.val))            -- x64 第二个参数（LuaVariant.val）
+      local text = LoadStr(U64(ctx.Rdx.rawval))         -- x64 第二个参数
       print("MessageBoxW text:", tostring(text))
       return true
     end,

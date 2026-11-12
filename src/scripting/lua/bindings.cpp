@@ -150,15 +150,23 @@ int lua_read_memory(lua_State *L)
     size_t addr = lv_check(L, 1, LV_UZ)->val.uz;
     size_t size = lv_check(L, 2, LV_UZ)->val.uz;
 
-    void *data = alloc_(size);
-    if (!data)
-        return -1;
+        void *data = alloc_(size);
+        if (!data)
+        {
+            lua_pushnil(L);
+            lua_pushliteral(L, "ReadMemory: out of memory");
+            return 2;
+        }
 
-    if (!S().read(addr, data, size))
-    {
-        free_(data);
-        return -1;
-    }
+        if (!S().read(addr, data, size))
+        {
+            free_(data);
+            /* ❗`lua_CFunction` 失败时不能 `return -1`（负数是**未定义行为**：调用方会把栈上的
+             * 旧值当返回值，甚至卡死）。一律 `nil, err`。 */
+            lua_pushnil(L);
+            lua_pushliteral(L, "ReadMemory: unreadable address");
+            return 2;
+        }
 
     lua_createtable(L, (int)size, 0);
     for (size_t i = 0; i < size; i++)
@@ -1922,7 +1930,11 @@ int lua_var_off(lua_State *L)
     void  *ud   = luaL_checkudata(L, 1, "Var");
     size_t base = *(size_t *)ud;
     if (!base)
-        return -1;
+    {
+        lua_pushnil(L);
+        lua_pushliteral(L, "Var: invalid address");
+        return 2;
+    }
     size_t addr;
     if (lua_type(L, 2) == LUA_TUSERDATA)
     {
@@ -2547,12 +2559,18 @@ int lua_get_context(lua_State *L)
     if (!hThread)
     {
         LOG(TEXT("not found thread: %lu"), tid);
-        return -1;
+        lua_pushnil(L);
+        lua_pushliteral(L, "GetContext: thread not found");
+        return 2;
     }
 
     CONTEXT context;
     if (!S().get_context(hThread, CONTEXT_ALL, &context))
-        return -1;
+    {
+        lua_pushnil(L);
+        lua_pushliteral(L, "GetContext: cannot get thread context");
+        return 2;
+    }
 
     /* 字段集合/名字来自 core 的字段表（宿主无关数据）；这里只负责按 kind 映射成 Lua 值。
      * ❗ 名字与旧 X-macro 逐字一致（黄金依赖它们） */
@@ -2611,13 +2629,19 @@ int lua_set_context(lua_State *L)
     if (!hThread)
     {
         LOG(TEXT("not found thread: %lu"), tid);
-        return -1;
+        lua_pushnil(L);
+        lua_pushliteral(L, "SetContext: thread not found");
+        return 2;
     }
 
     /* 读-改-写：先取基准，再只覆盖表中出现的字段（旧行为：nil = 不改） */
     CONTEXT context;
     if (!S().get_context(hThread, CONTEXT_ALL, &context))
-        return -1;
+    {
+        lua_pushnil(L);
+        lua_pushliteral(L, "SetContext: cannot get thread context");
+        return 2;
+    }
 
     size_t                 count  = 0;
     const core::ctx_field *fields = core::context_fields(&count);
@@ -2815,11 +2839,17 @@ int lua_stack_trace(lua_State *L)
     context.ContextFlags = CONTEXT_FULL;
     stContext->hThread   = S().get_thread_by_tid(tid);
     if (!stContext->hThread)
-        return -1;
+    {
+        lua_pushnil(L);
+        lua_pushliteral(L, "StackTrace: thread not found");
+        return 2;
+    }
     if (!GetThreadContext(stContext->hThread, &context))
     {
         E("GetThreadContext");
-        return -1;
+        lua_pushnil(L);
+        lua_pushliteral(L, "StackTrace: cannot get thread context");
+        return 2;
     }
 
     // 设置堆栈帧结构
@@ -2873,7 +2903,10 @@ int lua_stack_trace(lua_State *L)
 int lua_set_breakpoints(lua_State *L)
 {
     if (lua_gettop(L) != 1)
-        return -1;
+    {
+        lua_pushliteral(L, "SetBreakpoints(modules: table)");
+        return lua_error(L);
+    }
     luaL_checktype(L, 1, LUA_TTABLE);
 
     // 遍历模块表

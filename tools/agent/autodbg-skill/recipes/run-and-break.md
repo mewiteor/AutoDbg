@@ -20,12 +20,12 @@ Run({
         hits = hits + 1
 
         -- Windows x64：前四个参数在 RCX/RDX/R8/R9；x86：走栈。
-        -- ❗`GetContext` 的每个字段都是 **LuaVariant**：直接取 `.val`（`.hex` 是十六进制串）。
+        -- ❗`GetContext` 的每个字段都是 **LuaVariant**：`.rawval` 是数字、`.val` 是字符串、`.hex` 是十六进制串。
         local ctx = GetContext(info.tid)
         print(string.format("hit#%d rip=%s", hits, tostring(ctx.Cip.hex)))
 
         -- 把第一个参数当宽字符串读出来（失败返回 nil）
-        local p = U64(ctx.Rcx.val)                  -- x64；x86 用 V(ctx.Csp.val)[1]
+        local p = U64(ctx.Rcx.rawval)               -- x64；x86 用 V(ctx.Csp.rawval)[1]
         local s = LoadStr(p)
         if s then print("CreateFileW:", s) end
 
@@ -45,8 +45,8 @@ print("done, hits =", hits)
 
 - **断点必须在回调里下**：`Run` 一返回目标就结束了。
 - `rva` 不接受裸 number：`FindFuncRva(...)` / `U32("0x1234")` / `U64(...)`。
-- 参数位置按架构不同：x64 走寄存器（`ctx.Rcx/Rdx/R8/R9`，取 `.val`），x86 走栈
-  （`V(ctx.Csp.val)[1]` 起）。`Var:to` 用**单字母**（`q`/`Q`/`i`/`I`…），
+- 参数位置按架构不同：x64 走寄存器（`ctx.Rcx/Rdx/R8/R9`，**取值用 `.rawval`**），x86 走栈
+  （`V(ctx.Csp.rawval)[1]` 起）。`Var:to` 用**单字母**（`q`/`Q`/`i`/`I`…），
   `LuaVariant:to` 用**全名**（`u64`/`i32`…）——别搞反。
 - 回调里别做长耗时的事（同步跑在调试循环里）；要写大文件请用 `open_file`（见
   `recipes/remote-agent.md`）。
@@ -61,7 +61,7 @@ print("done, hits =", hits)
 local f = open_file("C:/tmp/calls.txt", "ab")
 SetBreakpoint{ modname = "kernel32.dll", rva = FindFuncRva("kernel32.dll", "CreateFileW"),
   callback = function(info)
-    local name = LoadStr(U64(GetContext(info.tid).Rcx.val))   -- x64 第一个参数
+    local name = LoadStr(U64(GetContext(info.tid).Rcx.rawval))  -- x64 第一个参数
     if f and name then f:write(name, "\n") end
     return true
   end }

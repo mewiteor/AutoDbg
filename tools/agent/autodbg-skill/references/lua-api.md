@@ -135,7 +135,9 @@ print(#bytes)
 WriteMemory(V(addr), { 0x90, 0x90, 0x90 })   -- table of bytes，写回目标
 ```
 
-- `ReadMemory(addr, size)`：`addr`/`size` 都是 **LuaVariant**（`V(x)` 或 `U32(x)`）。
+- `ReadMemory(addr, size)`：**两个参数都必填**，都是 **LuaVariant**（`V(x)` / `U32(x)` / `U64(x)`）。
+  失败返回 **`nil, err`**（不可读地址 / 越界都走这条）。
+- `addr` 也可以是**寄存器值**：`V(ctx.Ccx)` 就是「把 Ccx 里的值当地址」（见下面的 Var）。
 - 要字符串：`local s = string.char(table.unpack(bytes))`；要 hex：`inspect(bytes)` 或自己格式化。
 - 大块读取建议分片（每次 ≤ 一张页更稳）：`for i = 0, n-1, 0x1000 do ... end`。
 - 内存布局：`GetMemoryRegion()` 返回 `{ BaseAddress, AllocationBase, RegionSize, State, Protect, Type }` 列表。
@@ -143,6 +145,16 @@ WriteMemory(V(addr), { 0x90, 0x90, 0x90 })   -- table of bytes，写回目标
 ## LuaVariant 与 Var（读目标内存的两种口味）
 
 ### 1) Var：`V(addr)` —— 按「地址 + 类型字母」读
+
+❗`V(x)` 的 `x` 既可以是数字/`U32()`，也可以是 **LuaVariant**（比如 `GetContext` 取到的寄存器）——
+意义是「把它的**值当成地址**」。所以读「参数在 ECX 里、参数是 ECX 指向的 int32」就是：
+
+```lua
+local c   = GetContext(tid)
+local arg = V(c.Ccx):to("i").val      -- 读 [RCX] 处的 int32；.val 是**字符串**，.rawval 才是数字
+print("arg =", arg)                    -- "7"
+print("arg as number =", V(c.Ccx):to("i").rawval)
+```
 
 ```lua
 local v   = V(addr)              -- Var：地址 + 类型字母的读窗口
@@ -167,21 +179,22 @@ v:swrite("abc", 0x20)            -- 写字节串
 | `z` | size_t | `f` | float |
 | `d` | double | | |
 
-Var 还有只读字段：`hex` / `val` / `rawval` / `type` / `bin`。
+Var 还有只读字段：`hex`（十六进制串）/ `val`（**字符串**，打印用）/ `rawval`（数字）/ `type` / `bin`（字节表）。
 
 ### 2) LuaVariant：`U32(x)` / `I64(x)` / `F64(x)` … —— 值本身
 
 - 构造：`U8 I8 U16 I16 U32 I32 U64 I64 F32 F64`（也接受 `"0x1234"` 字符串）。
 - 方法：`:to("u32")` / `:as("i64")`（**全名**：i8/u8/i16/u16/i32/u32/i64/u64/f32/f64）。
-- 字段：`.hex` / `.val` / `.rawval` / `.type` / `.bin`；算术/比较元方法都有（`+ - * / % // ^ == < > <= >= .. #`）。
+- 字段：`.hex`（十六进制串）/ **`.val`（字符串，打印用）** / **`.rawval`（数字）** / `.type` / `.bin`；
+  算术/比较元方法都有（`+ - * / % // ^ == < > <= >= .. #`）——❗但拿 `.val` 去算会当成字符串拼接。
 - 注意：LuaJIT **没有位运算元方法**——`& | ~ << >>` 在 LuaJIT 下不可用。
 
 ## 线程上下文
 
 ```lua
 local c = GetContext(tid)     -- tid 来自 info.tid / callback 参数
-print(c.Cip.hex, c.Cax.val)   -- 通用寄存器（x86/x64 同名：Cax Cbx Ccx Cdx Csi Cdi Csp Cbp Cip）
-print(c.EFlags.val, c.Dr7.hex)
+print(c.Cip.hex, c.Cax.rawval) -- 通用寄存器（x86/x64 同名：Cax Cbx Ccx Cdx Csi Cdi Csp Cbp Cip）
+print(c.EFlags.rawval, c.Dr7.hex)
 
 c.Cax = U64(0)                -- 修改后写回
 SetContext(tid, c)
@@ -191,7 +204,7 @@ SetContext(tid, c)
   + `Cax..Cip`。
 - x64 另有 37 项：`P1Home..P6Home MxCsr R8..R15 Xmm0..Xmm15 VectorControl DebugControl
   LastBranchToRip LastBranchFromRip LastExceptionToRip LastExceptionFromRip`。
-- 取到的每个字段都是 **LuaVariant**（`.val` 是数字，`.hex` 是十六进制串）。
+- 取到的每个字段都是 **LuaVariant**：**`.val` 是字符串**（打印用）、`.rawval` 是数字、`.hex` 是十六进制串。
 
 ## 模块 / 符号 / 栈
 
@@ -316,7 +329,7 @@ Run{ cmdline = [[C:\path\target.exe]],
     SetBreakpoint{ modname = "kernel32.dll", rva = FindFuncRva("kernel32.dll", "CreateFileW"),
       callback = function(info)
         local c = GetContext(info.tid)
-        print("path =", LoadStr(c.Ccx.val))        -- x64 第 1 参数 RCX（x86 是栈）
+        print("path =", LoadStr(c.Ccx))             -- x64 第 1 参数 RCX（x86 是栈）；LoadStr 要地址
         Detach()
       end }
   end }
@@ -341,7 +354,7 @@ Run{ cmdline = "target.exe", callback = function()
   SetBreakpoint{ modname = "my.dll", rva = FindFuncRva("my.dll", "F"),
     callback = function(info)
       local c = GetContext(info.tid)
-      local n = V(c.Ccx.val):to("I")
+      local n = V(c.Ccx):to("I")
       f:write(BsonEncode{ vols = V(GetModBase("my.dll"))[0x56C5C0]:tos("d", 130 * (n + 1)) })
       Detach()
     end }
