@@ -74,6 +74,12 @@
 
 `u16 id` 继续是**句柄号**，不是请求相关性 id：执行串行 + reader 唯一 ⇒ 同一句柄最多一个在途请求，不需要相关性表。
 
+> ❗**已落地的口径（T2，2025 年实现时定的）**：帧头保持 **8 字节不变**，`[json]` 的长度**由传输层的 payload 总长反推**：
+> `json_len = payload_len - 8 - data_len`。传输层两种分帧：chunked（`<hex>\r\n` + payload + `\r\n`，现行 HTTP）
+> 与 raw（`u32` 小端 = payload 总长，D42）。好处：现有客户端（`nvim/lua/autodbg/stream.lua` 的 8 字节解析器）
+> 不用跟着改，T5 删 HTTP 时只换分帧、不碰帧布局。实现：`src/common/frame.*`（纯函数，可被 `--selftest` 断言）
+> + `src/scripting/lua/stream.*`（帧类型/协议版本/传输钩子/读一帧）。
+
 版本必须在握手帧里（硬切之后没有别的协商手段；版本不符 → `error` 帧 + 关连接）。
 
 ### 2.2 唯一 reader

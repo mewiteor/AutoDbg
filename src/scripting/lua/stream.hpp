@@ -1,55 +1,96 @@
 ﻿#ifndef AUTODBG_SCRIPTING_LUA_STREAM_HPP
 #define AUTODBG_SCRIPTING_LUA_STREAM_HPP
 /* =============================================================================
- * src/scripting/lua/stream.hpp —— 流式 `/run` 响应（帧 + chunked）
+ * src/scripting/lua/stream.hpp —— 双向帧协议的传输层（T2）
  *
- * 来源：新写（用户需求：`write_file` 一次性 + effects 往返不适合「大块数据流式写」）。
+ * 来源：从「流式 `/run` 响应（帧 + chunked）」扩成 plan_cli.md §2.1 的**双向**协议。
  *
- * 背景：server 模式的 `read_file`/`write_file` 靠 `lua_yield` 把活交给客户端，而
- *   **调试回调里不能 yield**（LuaJIT 不支持跨 C 边界，Lua 5.5 也不允许跨普通 lua_pcall），
- *   于是只能在回调里把数据攒起来——数据量大就爆内存。
+ * 分层（改之前先认清这三层，否则会改错地方）：
+ *   ① **帧头编解码**：`src/common/frame.hpp`（纯函数、可被 `--selftest` 断言）；
+ *   ② **本层**：帧类型/协议版本、传输钩子（send/recv）、payload 分帧方式、读一帧/写一帧；
+ *   ③ 传输后端：现行 = winsock + HTTP chunked（T5 随 D41 删除）；T3 起 = raw TCP 帧。
  *
- * 解法：`POST /run` 带 `X-AutoDbg-Stream: 1` 时，响应变成 `Transfer-Encoding: chunked`；
- *   每个 HTTP chunk 里套一个 8 字节帧头 + 可选 JSON 头 + 原始数据。
- *   **写这条 socket 的就是执行脚本的那条线程**（worker 在 `exec_begin` 之前就拿到了 sock），
- *   所以 `open_file()` 的 `f:write()` 既不需要 yield，也不需要额外线程/队列/临时文件：
- *   数据直接进内核发送缓冲，内存占用 = 单次 send 的那一块。
+ * 帧布局（小端，8 字节头 + 可选 json + 可选原始字节）：
+ *   u8 type | u8 flags | u16 id | u32 data_len | [json] | [data]
+ * payload 总长由**分帧层**给：chunked 用 hex 长度头、raw 用 u32 前缀 →
+ *   json_len = payload_len - 8 - data_len（见 `common/frame.hpp` 的说明）。
  *
- * 帧布局（小端）：
- *   u8  type   1=open 2=data 3=close 4=out 5=result 6=error
- *   u8  flags  out 帧：0=stdout 1=stderr；其它帧为 0
- *   u16 id     句柄号（open/data/close）；out/result/error 为 0
- *   u32 data_len
- *   [json]     仅 open/result/error（长度 = chunk 长度 - 8 - data_len）
- *   [data]     原始字节（不编码、不转义）
- *
- * 背压：`net_send_all(sock, …, send_timeout_ms)` —— 客户端读得慢就压在 socket 缓冲里，
- *   客户端死了/超时就返回失败，`f:write` 得到 `nil, err`（不会无限卡住调试目标）。
+ * 约定（D43/D45）：
+ *   · 一次调用 = 一次执行，严格串行 ⇒ 执行连接**只有一个 reader**（脚本线程）；
+ *   · `u16 id` 是**句柄号**，不是请求相关性 id；同一句柄最多一个在途请求；
+ *   · 写这条连接的就是执行脚本的那条线程 ⇒ `f:write` 不需要 yield、回调里也能用。
  * ========================================================================== */
 #include <stddef.h>
 
 namespace autodbg::host
 {
-enum stream_frame_type
+/* 协议版本：握手帧（`stream_frame_handshake`）里带；不符 → error 帧 + 关连接。
+ * T2 定版为 1；改帧类型/字段语义必须 +1（客户端与模块同版本才能通）。 */
+enum
 {
-    stream_frame_open   = 1,
-    stream_frame_data   = 2,
-    stream_frame_close  = 3,
-    stream_frame_out    = 4,
-    stream_frame_result = 5,
-    stream_frame_error  = 6,
+    k_stream_proto_version = 1,
 };
 
-/* 开始一条流：发响应头（chunked）并把 socket 记下来。返回 false = 发头失败。 */
+/* 帧类型：出向 1–9（server → client）、入向 10–14（client → server）、15 = 双向通知 */
+enum stream_frame_type
+{
+    /* ---- 出向 ---- */
+    stream_frame_open   = 1,  /* json {path, mode}；id = 句柄号 */
+    stream_frame_data   = 2,  /* 原始字节（不编码、不转义）；id = 句柄号 */
+    stream_frame_close  = 3,  /* id = 句柄号 */
+    stream_frame_out    = 4,  /* flags：0 = stdout / 1 = stderr */
+    stream_frame_result = 5,  /* json = `--json` 的同一份信封 */
+    stream_frame_error  = 6,  /* json {error} */
+    stream_frame_read_req  = 7,  /* json {id, format | bytes, whence, offset} */
+    stream_frame_ack       = 8,  /* json {applied, reason, pid}（控制命令的回执） */
+    stream_frame_info      = 9,  /* json（health / version 的应答，替代 GET /health、/version） */
+
+    /* ---- 入向 ---- */
+    stream_frame_handshake = 10,  /* json {version, pid, filename, token, read_timeout, timeout_sec, max_frame} */
+    stream_frame_script    = 11,  /* data = Lua 源码（D26：全程不落盘） */
+    stream_frame_control   = 12,  /* json {cmd：cancel | kill | detach | health | version} */
+    stream_frame_read_resp = 13,  /* data 或 json {error}；data_len == 0 且 json 为 null = EOF */
+    stream_frame_end       = 14,  /* 无 body（替代 chunked 终止块） */
+
+    /* ---- 双向 ---- */
+    stream_frame_cancel_notify = 15,  /* json {id}：被取消的请求，client 必须丢弃该轮本地 I/O */
+};
+
+/* payload 的分帧方式（帧布局本身与传输无关，只有这一层不同） */
+enum stream_framing
+{
+    stream_framing_chunked = 0,  /* HTTP chunked：`<hex>\r\n` + payload + `\r\n`（现行 server） */
+    stream_framing_raw     = 1,  /* raw TCP：`u32` 小端 = payload 总长（D42） */
+};
+
+/* 传输钩子（单连接、串行）。
+ *   send：写满为止；false = 客户端断开/超时。
+ *   recv：>0 = 读到的字节数；0 = 对端关闭；-1 = 错误；-2 = 超时（调用方自己切片）。
+ *         只有「执行连接」需要读；纯写场景（HTTP 响应）可以给 nullptr。 */
+typedef bool (*stream_send_fn)(void *ctx, const void *data, size_t len);
+typedef int (*stream_recv_fn)(void *ctx, void *buf, size_t cap);
+
+struct stream_transport
+{
+    stream_send_fn send;
+    stream_recv_fn recv;
+    void          *ctx;
+};
+
+/* 开始一条流：现行调用点（HTTP + chunked over winsock）。返回 false = 发响应头失败。 */
 bool stream_begin(long long sock, unsigned send_timeout_ms);
 
-/* 结束流状态（不发终止块；终止块用 `stream_finish`） */
+/* 同上，但传输与分帧由调用方给（T3 的 raw TCP 走这个；`recv` 必须给）。 */
+bool stream_begin_ex(const stream_transport &tp, int framing, unsigned send_timeout_ms);
+
+/* 结束流状态（不发终止块；chunked 的终止块用 `stream_finish`） */
 void stream_end();
 
 /* 当前是否有活跃的流（= 本次请求是流式请求） */
 bool stream_active();
 
-/* 写一帧。`json`/`data` 可为空。返回 false = 发送失败（客户端断开/超时）。 */
+/* 写一帧。`json` / `data` 可为空。返回 false = 发送失败（客户端断开/超时），
+ * 失败后流失效，后续写入立刻返回 false（不反复等超时）。 */
 bool stream_write_frame(unsigned type,
                         unsigned id,
                         unsigned flags,
@@ -58,7 +99,20 @@ bool stream_write_frame(unsigned type,
                         const void *data,
                         size_t      data_len);
 
-/* 发终止块 `0\r\n\r\n`（chunked 结束） */
+/* 读一帧（执行连接的唯一 reader 用它）。`hdr` 收 8 字节帧头、`buf` 收 json+data。
+ * 返回：>0 = payload 总长（`*out_json_len` 已填、`hdr` 已有内容）
+ *       0  = 对端正常关闭
+ *      -1  = 传输错误（含对端在帧中间关连接）
+ *      -2  = 超时（**不是**错误：调用方切片重试，并顺手查取消标志）
+ *      -3  = 帧非法（长度越界 / type == 0 / 超 `max_frame` / JSON 段放不下）
+ * `max_frame` = 0 时按 `common::k_frame_max_payload`。 */
+long stream_read_frame(unsigned char *hdr,
+                       void          *buf,
+                       size_t         cap,
+                       size_t        *out_json_len,
+                       unsigned       max_frame);
+
+/* chunked 终止块 `0\r\n\r\n`（raw 分帧下不发；随 D41 的 HTTP 删除一起消失） */
 bool stream_finish();
 } /* namespace autodbg::host */
 

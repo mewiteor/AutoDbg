@@ -98,7 +98,7 @@ make.bat i <dir>         :: 指定输出目录（默认 .out）
 | 链 | 入口 | 说明 |
 | --- | --- | --- |
 | 导入表门禁 | `uv --directory tools/api_check run scan_dir.py` | 扫 `.out` 下全部产物，按产物自动选口径（`AutoDbgLegacy_*` 与启动器 → `w95`、其余 x86 → `wxp`、x64 → `w7`），有目标系统不可用的导入就打印并返回 1。单文件用法：`uv --directory tools/api_check run main.py <exe\|dll> <w95\|w98\|w982\|wxp>`（x64 免第二个参数） |
-| 纯函数自测 | `.out\AutoDbg_<arch>.exe --selftest` | 覆盖 `http` / `json_writer` / `base64` / `png_writer` / `dbl2str` 等纯计算层（基线 70 条，T1/D50 给 `json_writer` 的转义口径 +11 → 当前 81 条）；`feat/cli-tcp` 上 `http` / `base64` 段随 D41 / D44 删除，要补帧编解码与 `decide_console_action` 的断言 |
+| 纯函数自测 | `.out\AutoDbg_<arch>.exe --selftest` | 覆盖 `http` / `json_writer` / `base64` / `png_writer` / `dbl2str` / **帧编解码** 等纯计算层（基线 70 → T1/D50 转义口径 +11 = 81 → **T2 帧编解码 +20 = 101**）；`feat/cli-tcp` 上 `http` / `base64` 段随 D41 / D44 删除，要补 `decide_console_action` 的断言 |
 | server 端到端 | `pwsh tools/server_test/e2e.ps1 -Render <64\|86> [-Variant legacy]`，另有 `e2e_gui.ps1` / `e2e_mcp.ps1` / `e2e_io.ps1` / `nvim_smoke.ps1` | 起 server → 断言 → 停；不需要 VM，也不改产品行为。`feat/cli-tcp`（D41）上 `e2e_mcp.ps1` 删除、新增 `e2e_tcp.ps1`（握手 + 帧 + 回调里阻塞读的超时/取消） |
 | JSON 信封（T1/D50） | `pwsh tools/server_test/e2e_json.ps1 -Render <64\|86> [-Variant legacy]` | 本地模式 `--json` / `--out=<path>`：那一行 JSON 独占 stdout、字段齐全、`result` / `pid` / `detached` / `images` 口径、`--json` 与 `--server` 互斥（退出码 2）、退出码口径不变；那一行必须**纯 ASCII**（CP936 → UTF-8 或逐字节降级）。`-Variant legacy` **必须真过**（这段就是用来暴露 GBK 的） |
 | Win9x 实机 | `pwsh tools/w9x_test/w9x.ps1 -Action check\|run\|record` | 需要 VMware 的 Win98 guest 与凭据（`tools/w9x_test/config.local.ps1`，已 gitignore）；**没有 VM / 凭据时 SKIP（exit 0）**。矩阵与剩余项见 `plan_p7_win9x.md` |

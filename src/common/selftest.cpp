@@ -5,13 +5,14 @@
  * 与旧实现的差异：无（新文件）。
  * 覆盖：HTTP 请求解析（含各种拒绝路径）、HTTP 响应生成、json_writer（转义/嵌套/数字/
  *   深度溢出、**T1（D50）的全转义出口**）、base64（向量/往返/非法输入）、rand（hex 形状与
- *   两次不相等）。
+ *   两次不相等）、**帧头编解码（T2：定长头 / json 长度反推 / raw 长度前缀 / 全部拒绝路径）**。
  * 说明：断言用 `strcmp`/`memcmp` 逐字节比较（跨架构/跨编译器稳定）；
  *   期望值都是**手写的字面量**，不要在这里用被测代码生成期望值（否则等于没测）。
  * ========================================================================== */
 #include "selftest.hpp"
 
 #include "base64.hpp"
+#include "frame.hpp"   /* T2：帧头编解码（plan_cli.md §2.1） */
 #include "http.hpp"
 #include "json_writer.hpp"
 #include "png_writer.hpp"
@@ -610,8 +611,7 @@ void test_base64(test_ctx *t)
 }
 
 /* ------------------------------ rand ------------------------------ */
-void test_rand(test_ctx *t)
-{
+void test_rand(test_ctx *t){
     char a[33];
     char b[33];
     bool oka = rand_hex(a, sizeof a, 16);
@@ -619,6 +619,80 @@ void test_rand(test_ctx *t)
     check_bool(t, "rand.hex-shape", oka && okb && strlen(a) == 32 && strlen(b) == 32, "expected 32 hex chars");
     check_bool(t, "rand.hex-changes", strcmp(a, b) != 0, "two draws were identical");
     check_bool(t, "rand.hex-rejects-small-cap", !rand_hex(a, 8, 16), "cap check");
+}
+
+/* ------------------------------ 帧头编解码（T2 / plan_cli.md §2.1） ------------------------------
+ * 期望值全是手写字面量：帧头是小端定长 8 字节（u8 type | u8 flags | u16 id | u32 data_len），
+ * 只要字节序或字段宽度变了，这里的字面量就会对不上——这正是要钉死的东西。 */
+void test_frame(test_ctx *t)
+{
+    {
+        frame_header h;
+        h.type     = 2;
+        h.flags    = 1;
+        h.id       = 0x1234;
+        h.data_len = 0x00020304;   /* 必须 ≤ k_frame_max_payload（8 MB）：0x08000000 以上会被拒 */
+
+        unsigned char buf[k_frame_header_size];
+        bool          ok = frame_header_encode(buf, sizeof buf, h);
+        const char    want[k_frame_header_size] = {(char)0x02, (char)0x01, (char)0x34, (char)0x12,
+                                                   (char)0x04, (char)0x03, (char)0x02, (char)0x00};
+        check_bool(t, "frame.hdr.encode", ok, "expected success");
+        check_bool(t, "frame.hdr.encode-little-endian", memcmp(buf, want, sizeof want) == 0, "u8|u8|u16|u32 LE");
+
+        /* 拒绝路径：缓冲不够 / type 越界 / id 越界 */
+        check_bool(t, "frame.hdr.encode-short-cap", !frame_header_encode(buf, 7, h), "cap < 8");
+        frame_header bad = h;
+        bad.type         = 0;
+        check_bool(t, "frame.hdr.encode-type-zero", !frame_header_encode(buf, sizeof buf, bad), "type == 0");
+        bad      = h;
+        bad.id   = 0x10000u;
+        check_bool(t, "frame.hdr.encode-id-overflow", !frame_header_encode(buf, sizeof buf, bad), "id > 0xFFFF");
+        bad           = h;
+        bad.data_len  = k_frame_max_payload + 1u;
+        check_bool(t, "frame.hdr.encode-data-over-max", !frame_header_encode(buf, sizeof buf, bad), "data_len > max");
+
+        /* 往返 */
+        frame_header got;
+        bool         dok = frame_header_decode(buf, sizeof buf, &got);
+
+        /* ❗注意：上面的 `buf` 可能被拒绝路径写成半成品，往返用重新编一次的结果 */
+        frame_header_encode(buf, sizeof buf, h);
+        dok = frame_header_decode(buf, sizeof buf, &got);
+        check_bool(t, "frame.hdr.decode-roundtrip",
+                   dok && got.type == 2 && got.flags == 1 && got.id == 0x1234 && got.data_len == 0x00020304, "roundtrip");
+
+        /* 拒绝路径：长度不够 / type 为 0 / data_len 超上限 */
+        check_bool(t, "frame.hdr.decode-short", !frame_header_decode(buf, 7, &got), "len < 8");
+        unsigned char zero_type[k_frame_header_size] = {0, 0, 0, 0, 0, 0, 0, 0};
+        check_bool(t, "frame.hdr.decode-type-zero", !frame_header_decode(zero_type, sizeof zero_type, &got), "type == 0");
+        unsigned char over[k_frame_header_size] = {6, 0, 0, 0, (char)0x01, (char)0x00, (char)0x00, (char)0x08};
+        check_bool(t, "frame.hdr.decode-data-over-max", !frame_header_decode(over, sizeof over, &got), "0x08000001 > max");
+    }
+
+    /* json 长度反推：payload 总长 = 8 + json + data */
+    {
+        size_t json_len = 0;
+        check_bool(t, "frame.json-len-basic", frame_json_len(8 + 3 + 5, 5, &json_len) && json_len == 3, "json = 3");
+        check_bool(t, "frame.json-len-zero-data", frame_json_len(8 + 7, 0, &json_len) && json_len == 7, "json = 7");
+        check_bool(t, "frame.json-len-too-short", !frame_json_len(8 + 4, 5, &json_len), "payload < 8 + data_len");
+        check_bool(t, "frame.json-len-over-max", !frame_json_len(k_frame_max_payload + 1u, 0, &json_len), "payload > max");
+    }
+
+    /* raw 传输层的长度前缀（u32 小端 = payload 总长） */
+    {
+        unsigned char pfx[4];
+        size_t        back = 0;
+        bool          eok  = frame_prefix_encode(pfx, sizeof pfx, 0x00001234u);
+        const char    want[4] = {(char)0x34, (char)0x12, (char)0x00, (char)0x00};   /* u32 LE */
+        check_bool(t, "frame.prefix.encode", eok && memcmp(pfx, want, sizeof want) == 0, "u32 LE");
+        check_bool(t, "frame.prefix.roundtrip", frame_prefix_decode(pfx, sizeof pfx, &back) && back == 0x00001234u, "roundtrip");
+        check_bool(t, "frame.prefix.encode-short-cap", !frame_prefix_encode(pfx, 3, 1), "cap < 4");
+        check_bool(t, "frame.prefix.encode-over-max", !frame_prefix_encode(pfx, sizeof pfx, (size_t)k_frame_max_payload + 1u), "payload > max");
+        unsigned char over[4] = {(char)0x01, (char)0x00, (char)0x00, (char)0x08};   /* 0x08000001 */
+        check_bool(t, "frame.prefix.decode-over-max", !frame_prefix_decode(over, sizeof over, &back), "prefix > max");
+        check_bool(t, "frame.prefix.decode-short", !frame_prefix_decode(pfx, 3, &back), "len < 4");
+    }
 }
 
 /* ------------------------------ PNG / BMP（截图编码，S4） ------------------------------ */
@@ -702,6 +776,7 @@ int run_selftests(selftest_report_fn report, void *ctx)
     test_json(&t);
     test_base64(&t);
     test_rand(&t);
+    test_frame(&t);
     test_image(&t);
 
     {
