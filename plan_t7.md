@@ -157,7 +157,7 @@ end(&err)                        run_shutdown（761）+ detach；D47 的降级�
 
 ## 6. 门禁
 
-**fixture（T7 与 Win9x case 34 的共同阻塞项）**：建议新增 `tests/fixtures/bin/x86_loop.c`（一个会命中断点的 x86 小程序，用项目自己的 `cc` + `ld`，零 CRT），ninja 加一条 `fixture` 边，产物落 `.out/fixtures/`。❗`scan_dir.py` 扫 `.out` 下全部产物并自动选口径 ⇒ fixture 必须满足 w95 口径，或在 `scan_dir.py` 里加排除规则（这条要拍板）。
+**fixture（T7 与 Win9x case 34 的共同阻塞项）**：建议新增 `tests/fixtures/bin/x86_loop.c`（一个会命中断点的 x86 小程序，用项目自己的 `cc` + `ld`，零 CRT；x86 产物照 D12 走 `pever` 打 4.0），ninja 加一条 `fixture` 边，产物落 `.out/fixtures/`。❗`scan_dir.py` 扫 `.out` 下全部产物（含子目录，否则 fixture 不被计数）并自动选口径 ⇒ 已拍板：fixture 走 **w95**（不排除，见 §9 第 4 条）⇒ fixture 源码里禁止 NT-only 调用。
 
 新断言（`e2e_repl.ps1` 用管道喂 stdin；`e2e_tcp.ps1` 加 `repl.*` 段）：
 
@@ -231,10 +231,14 @@ repl.state-member-parity     run() 重构后既有门禁全绿（逐字节验证
 1. `pump` 的默认 `autocont`：false（capture）还是 true（record）？我推荐 false，因为「停下来看」是 T7 的意义，但 REPL 里可以按模式翻。
 2. `hits()` 队列上限与 drop 策略（丢最旧 / 丢最新 / 计数后停）—— 我推荐 64 + 丢最旧 + `dropped` 计数，因为诚实性优先。
 3. proto 到底 bump 不 bump（§5）：如果 AI 客户端只有 nvim 一个，可以先只在 T7 里 bump；如果第三方 agent 已经在连，必须 bump。
-4. fixture 落在 `scan_dir.py` 的哪个口径（w95 还是排除）——这条决定了 fixture 能不能用 NT-only 的调用。
+4. ~~fixture 落在 `scan_dir.py` 的哪个口径（w95 还是排除）~~ —— **已拍板：w95（不排除）**。后果：fixture 源码里禁止任何 XP+ 才有的调用，实际导入共三条、全部由 `src/sys/main.c`（零 CRT 的 CRT 兼容层）引入而非由 fixture 自己产生 —— `msvcrt!_ftol`、`msvcrt!__getmainargs`、`kernel32!ExitProcess`（三条都在 `datas.bin` 的 w95 段里，前两条 `msvcrt.def` 已显式导出）。实测：`uv --directory tools/api_check run main.py .out/fixtures/x86_loop.exe w95` 无输出 = 通过。`scan_dir.py` 对 `.out/fixtures/` 下的产物自动选 w95（既有「Legacy / 启动器 → w95、其余 x86 → wxp、x64 → w7」判定不变），并且必须递归扫子目录（门禁口径 12 → 13）。fixture 的固定量是契约（T7.3 的 `pump.*` 断言直接依赖）：8 轮循环、命中 8 次、退出码 42、不打印不落盘；断点位置靠扫代码里 6 字节模式 `B8 44 42 47 50 CC`（`mov eax, 0x50474244` —— 立即数按小端存成 `44 42 47 50` —— 紧跟 `int 3`；`bp_site` 用 `#pragma optimize("", off)` 关掉优化，因为 `/O1` 下把 static 函数内联进循环会把模式复制多次，唯一性就破了），该模式在整个 exe 里必须只出现一次，命中点 = 模式命中地址 + 5（所以匹配整条指令编码，不是只匹配立即数）。
 5. ~~`ReadConsoleW` 要先查导入表~~ —— 已查（`tools/api_check/datas.bin` 按 OS 段）：`ReadConsoleW` 全 w95 可 ⇒ 不需要 dynapi。剩下的只是「先 `ReadFile`（管道可跑，门禁靠它）再回退 `ReadConsoleW`」这个顺序。
 6. session 上限与 idle 回收的数值（`hits()` 队列上限照 64 已推荐，但「几个 session」「空闲多久回收」还没数）。
 7. `session.default-parity` 这条门禁的落点：契约名走默认 session、`sess:xxx` 走 session 对象，两者必须逐字节一致（§10 第 6 条）。
+8. **T7.2 已落地但 fixture 的契约数字还不可观测**（本机探针）：无武装断点时 `on_exception` 只触发 3 次、`on_exit_process` 报的是 `0x4000001F`（不是 42）；
+   8 次命中与退出码 42 只有在每次 `int 3` 都被 `DBG_CONTINUE` 之后才成立（`m_first_bp` 只放行第一个），所以要等 T7.3 的 `pump.*` 门禁来钉。单跑 fixture（无调试器）在第一个 `int 3` 就终止，退出码 `0x80000003` ⇒ 代码路径本身没问题。
+9. `SetBreakpoint` 的 `rva` 只接受 LuaVariant（数字与普通字符串都报 "LuaVariant expected"），且 LuaVariant 算术有坑：实测 `GetModBase('x86_loop.exe') + 0x1028` 传进来的 rva 变成 `0x28`（`VirtualProtectEx` 报 487）。
+   主模块在 `GetModBase` 里的名字带扩展名（`x86_loop.exe`）。T7.3 的门禁必须用显式 variant，不能靠算术。
 8. 多 session 的 pump 口径：「事件属于别的 session」时是立刻 dispatch 还是入 queue（§10 第 5 条建议入 queue + 返回归属）。
 9. Lua sugar 的落点：`lualib/`（按文件名设全局，不能设 `Run`）还是 `dbg` 表的方法（C 注册）——我推荐 sugar 挂 `dbg` 表，lualib 只放纯 Lua 的策略函数。转义符口径（已讨论）：文件名去扩展名后，`<转义符><字母>` → 大写，其余原样；转义符选 `-`（`_` 不行，它是标识符字符，会跟「按文件名」约定打架）。只转 `name` 不转 `path`（`path` 是 chunkname，`nvim_smoke` 的 `err.error-text` 靠它）；`gen_lua_lib.lua` 要在构建期校验「结果是合法标识符」。
 
