@@ -1,7 +1,7 @@
 # =============================================================================
 # tools/server_test/e2e_tcp.ps1 —— raw TCP 帧服务端 + 客户端的端到端断言（T2/T3）
 #
-# 来源：新写（plan_cli.md §7 的 e2e_tcp.ps1；T2 = 握手/帧/control，T3 = `--remote` 客户端）。
+# 来源：新写（原 plan_cli.md §7，现合并进 plan.md；T2 = 握手/帧/control，T3 = `--remote` 客户端）。
 # 依赖：只需 PowerShell 7 + 已构建的 `.out/AutoDbg_<arch>.exe`；不需要 VM、不需要模型。
 # 用法：
 #   pwsh -File tools/server_test/e2e_tcp.ps1 [-Render 64|86] [-Variant modern|legacy]

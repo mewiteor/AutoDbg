@@ -1,7 +1,7 @@
 # =============================================================================
 # tools/server_test/e2e_json.ps1 —— `--json` / `--out=<path>` 的端到端断言（T1 / D50）
 #
-# 来源：新写（plan_cli.md §0 D50、T1）；Ok/Bad/Check 与产物检查沿用 e2e.ps1 的写法。
+# 来源：新写（D50 / T1，原 plan_cli.md，现合并进 plan.md）；Ok/Bad/Check 与产物检查沿用 e2e.ps1 的写法。
 # 依赖：只需 PowerShell 7 + 已构建的 `.out/AutoDbg_<arch>.exe`；不需要 VM、不需要网络。
 # 用法：
 #   pwsh -File tools/server_test/e2e_json.ps1 [-Render 64|86] [-Variant modern|legacy]

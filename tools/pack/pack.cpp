@@ -36,7 +36,7 @@
  * 白名单 = 项目声明的系统库（AGENTS §7 的 SYSLIBS）+ ntdll / msvcrt / ucrtbase。
  *
  * ❗`gdi32.dll` 是 S4（GUI 自动化：截图 / 像素）新引入的：w95 数据集里有，
- *   而且是手写 DIB 截图的必要依赖（plan_server.md §7.2）。
+ *   而且是手写 DIB 截图的必要依赖（D24：PNG stored deflate；原 plan_server.md，现 plan.md §3）。
  *
  * ❗ucrtbase.dll 只出现在 x64 产物（make.bat 的 64 分支链 src\sys\ucrtbase.lib），
  *   x86 legacy 变体不得引入（Universal CRT 在 Win9x 不存在）。P3 接入 make.bat 时，

@@ -1,6 +1,6 @@
 #!/usr/bin/env pwsh
 # =============================================================================
-# tools/w9x_test/w9x.ps1 —— Win9x 实机测试 harness（P7 / plan_p7_win9x.md）
+# tools/w9x_test/w9x.ps1 —— Win9x 实机测试 harness（P7 / plan.md §1.3）
 #
 # 分工：脚本跑在 host（PowerShell 7），被测产物跑在 guest（Win98），全部走 vmrun。
 # 凭据：不入库。优先 config.local.ps1（已 .gitignore），其次环境变量
@@ -8,7 +8,7 @@
 #
 # 每轮流程（§6）：静态门禁（§16，host 侧，便宜）→ revert 快照 1 → start → 等 Tools → 跑 case
 #
-# 实测口径（W0/W1/W3 已核实，见 plan_p7_win9x.md §3.1 / §4.2.1）：
+# 实测口径（W0/W1/W3 已核实，见 plan.md §1.3 与 PITFALLS.md 的 W 节）：
 #   ① `runProgramInGuest` 会传递**真实程序**的退出码（AutoDbg 脚本 error → vmrun 返回 2）。
 #   ② `command.com /c <命令>` 经 vmrun 跑时**不执行命令**（只返回 0）→ 不能用批处理
 #      捕获退出码或做重定向；退出码只能靠 vmrun 本身拿。

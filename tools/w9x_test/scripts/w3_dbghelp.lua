@@ -1,4 +1,4 @@
--- w3_dbghelp.lua —— dynapi 降级探针（P7 W3 / plan_p7_win9x.md §4.2 case 13）
+-- w3_dbghelp.lua —— dynapi 降级探针（P7 W3 / plan.md §1.3 case 13）
 -- 目标：dbghelp.dll 不是 Win9x 自带（Win95/98/ME 没有）→ `SymFunctionTableAccess` /
 --       `UnDecorateSymbolName` / `StackWalk*` 走 dynapi 动态解析，取不到必须**优雅退化**
 --       （不是硬失败）。用 Run 起一个被调试目标（第二个 AutoDbg 实例，跑 sleep.lua 撑 15 秒），
