@@ -82,7 +82,7 @@ make.bat i <dir>         :: 指定输出目录（默认 .out）
 ```
 
 - 无脚本参数时弹文件对话框（启动器里的 `GetOpenFileNameW`，9x 降级 A 版）选脚本。
-- 选项（启动器层）：`-h` / `--help`（打 usage 后退出 0）、`--version`（版本/ABI/架构后退出 0；版本串来自构建期的 `git describe`，见 §1）、`--flavor=lua|luajit`（默认 lua 5.5）、`--variant=modern|legacy`（仅排障；正常靠平台探测 + 映射失败回退）、`--list`（列出载荷里的模块）、`--module-dir=<dir>`（调试：从磁盘取同名 DLL，仍走内存映射）、`--quiet`（关错误弹窗）、`--selftest`（跑纯函数自测）、`--json` / `--out=<path>`（机器可读结果信封，§12.6；两者互斥于 `--server`，同时给 → 启动器报错、退出码 2）、`--server[=http|tcp]` 及其 `--server-*` 子选项（§12.1）、**客户端（T3/D42）**：`--remote=<host:port>`、`--remote-token=<hex>`、`--pid=<n>`、`--read-timeout=<ms>`、`--max-frame=<bytes>`、`--cancel` / `--kill` / `--detach` / `--health`（这四条离开 `--remote` → 启动器报错、退出码 2；带 `--remote` 时 `--version` 变成「查 server 版本」）。
+- 选项（启动器层）：`-h` / `--help`（打 usage 后退出 0）、`--version`（版本/ABI/架构后退出 0；版本串来自构建期的 `git describe`，见 §1）、`--flavor=lua|luajit`（默认 lua 5.5）、`--variant=modern|legacy`（仅排障；正常靠平台探测 + 映射失败回退）、`--list`（列出载荷里的模块）、`--module-dir=<dir>`（调试：从磁盘取同名 DLL，仍走内存映射）、`--quiet`（关错误弹窗）、`--selftest`（跑纯函数自测）、`--json` / `--out=<path>`（机器可读结果信封，§12.6；两者互斥于 `--server`，同时给 → 启动器报错、退出码 2）、`--server[=tcp]`（raw TCP 帧；`--server=http` 已随 D41 删除并报错）及其 `--server-*` 子选项（§12.1）、**客户端（T3/D42）**：`--remote=<host:port>`、`--remote-token=<hex>`、`--pid=<n>`、`--read-timeout=<ms>`、`--max-frame=<bytes>`、`--cancel` / `--kill` / `--detach` / `--health`（这四条离开 `--remote` → 启动器报错、退出码 2；带 `--remote` 时 `--version` 变成「查 server 版本」）。
   启动器的输出一律 **ASCII**（它走 `WriteFile` 写字节，中文在 CP936 控制台上会乱码；模块那边走 `WriteConsoleW` 才例外）。
 - **脚本首行标记**也能选 flavor：`--!lua` / `--!luajit`（优先级：命令行 > 首行标记 > 字节码 magic > 默认 lua）。
   其它 `--!xxx` 一律报错退出（D9）；例外：`--!autodbg` / `--!adbg` 是**编辑器侧标记**
@@ -98,8 +98,8 @@ make.bat i <dir>         :: 指定输出目录（默认 .out）
 | 链 | 入口 | 说明 |
 | --- | --- | --- |
 | 导入表门禁 | `uv --directory tools/api_check run scan_dir.py` | 扫 `.out` 下全部产物，按产物自动选口径（`AutoDbgLegacy_*` 与启动器 → `w95`、其余 x86 → `wxp`、x64 → `w7`），有目标系统不可用的导入就打印并返回 1。单文件用法：`uv --directory tools/api_check run main.py <exe\|dll> <w95\|w98\|w982\|wxp>`（x64 免第二个参数） |
-| 纯函数自测 | `.out\AutoDbg_<arch>.exe --selftest` | 覆盖 `http` / `json_writer` / `base64` / `png_writer` / `dbl2str` / **帧编解码** 等纯计算层（基线 70 → T1/D50 转义口径 +11 = 81 → **T2 帧编解码 +20 = 101**）；`feat/cli-tcp` 上 `http` / `base64` 段随 D41 / D44 删除，要补 `decide_console_action` 的断言 |
-| server 端到端 | `pwsh tools/server_test/e2e.ps1 -Render <64\|86> [-Variant legacy]`，另有 `e2e_gui.ps1` / `e2e_mcp.ps1` / `e2e_io.ps1` / `nvim_smoke.ps1` | 起 server → 断言 → 停；不需要 VM，也不改产品行为。`feat/cli-tcp`（D41）上 `e2e_mcp.ps1` 删除 |
+| 纯函数自测 | `.out\AutoDbg_<arch>.exe --selftest` | 覆盖 `json_writer` / `png_writer` / `dbl2str` / **帧编解码** 等纯计算层（基线 70 → T1/D50 转义 +11 = 81 → T2 帧编解码 +20 = 101 → **T5 删 `http`/`base64` 两段后 = 67**）；待补：`decide_console_action` 的断言 |
+| GUI 自动化（本地） | `pwsh tools/server_test/e2e_gui.ps1 -Render <64\|86> [-Variant legacy]` | 起一个 `gui_target.ps1` 靶子窗口，用**本地 CLI** 跑 `gui.*` 脚本断言（屏幕/窗口/控件/截图/`gui.pick`）；`-AllowInput` 才跑会动真鼠标/键盘的用例。T5 之前它走 HTTP `/run`，现已改成本地（`gui.*` 与传输无关，21 条断言） |
 | raw TCP 帧（T2/T3/T4/D42） | `pwsh tools/server_test/e2e_tcp.ps1 -Render <64\|86> [-Variant legacy]` | `--server=tcp`：握手帧（`id` = 协议版本、`data` = token）→ `info`；版本不符 / 首帧非握手 / 错 token 的 `error` 帧；`script` → `out`+`result`+`end`；`control` 的 health / version / cancel / 未知 / shutdown；**执行期的 control**（Lua 死循环 + 引擎空转）；**`--remote` 客户端**（跑脚本 / `--json` 信封 / 语法错误 / health / version / 另一个进程的 `--cancel`）；**`open_file` 读向**（远程 open 应答、read/tell/seek/lines 字节与位置语义、等回包超时 → `nil,"timeout"` 且脚本继续）。41 条断言，legacy 同样必须真过 |
 | JSON 信封（T1/D50） | `pwsh tools/server_test/e2e_json.ps1 -Render <64\|86> [-Variant legacy]` | 本地模式 `--json` / `--out=<path>`：那一行 JSON 独占 stdout、字段齐全、`result` / `pid` / `detached` / `images` 口径、`--json` 与 `--server` 互斥（退出码 2）、退出码口径不变；那一行必须**纯 ASCII**（CP936 → UTF-8 或逐字节降级）。`-Variant legacy` **必须真过**（这段就是用来暴露 GBK 的） |
 | Win9x 实机 | `pwsh tools/w9x_test/w9x.ps1 -Action check\|run\|record` | 需要 VMware 的 Win98 guest 与凭据（`tools/w9x_test/config.local.ps1`，已 gitignore）；**没有 VM / 凭据时 SKIP（exit 0）**。矩阵与剩余项见 `plan_p7_win9x.md` |
@@ -148,9 +148,11 @@ src/scripting/lua/   唯一感知 lua_State 的层
   registry.cpp       register_lua_api()：29 个全局 + Var 元表 + gui 表 + read_file/write_file（后者在 feat/cli-tcp 上由 open_file 的文件对象承担，D44）
   state              create_state_with_libs() / run_script_file() / 烘焙 lualib
   main.cpp           autodbg_run（唯一导出）+ CRT 兼容层
-  server / exec / exec_guard / output / file_io / gui_bindings / variant / bson / helpers（`exec_session` 与 `http` 在 `feat/cli-tcp` 上随 D43 / D41 删除）
+  server_config / tcp_server（raw TCP 服务端）/ client（`--remote`）/ exec / exec_guard / output /
+  file_io + file_stream（`open_file`）/ gui_bindings / variant / bson / helpers
+  （`http` / `base64` / `exec_session` / `effects` / `mcp.lua` 已在 T5 随 D41/D43/D44 删除）
 src/common/          共享基础设施：allocator、containers、dynapi、handle、dbl2str、cmdline、
-                     net（winsock 动态载入）、http（HTTP/1.1 子集）、json_writer、base64、rand、png_writer、selftest
+                     net（winsock 动态载入）、frame（帧头编解码）、json_writer、rand、png_writer、selftest
 src/sys/             零 CRT 运行时：影子头文件、*.def 导入表、x86 MASM（flt.asm）、mainCRTStartup、
                      CRT 缺口实现（strtoull.c / destruct_eh.c）
   pack/              打包与加载：boot.h（exe↔模块 ABI 契约）、payload（LZMA 单流解包）、
@@ -404,29 +406,16 @@ payload              // 单条 LZMA 流：各模块原始字节按 entry 顺序�
 - 所有新 API 走 dynapi 并有降级（`PrintWindow`、`MonitorFromWindow`、`SetProcessDPIAware`、`BlockInput`）；静态只多链 `gdi32.lib`（w95 就有）。
 - `gui` 是**唯一**的 GUI 入口：不要为 GUI 再加平铺全局名（§5 第 6 条）。
 
-### 12.3 MCP（在 `feat/cli-tcp` 上整节删除，D41）
+### 12.3 MCP（已删除，D41）
 
-> 保留备查：本节描述的 HTTP + JSON-RPC 分发在 `feat/cli-tcp` 上整体删除。`lua_api` 与 12 工具的正文（`lualib/autodbg_api.lua`）迁到 **`tools/agent/autodbg-skill/SKILL.md`**（markdown 是所有 coding agent 都读的格式）。S12 的教训（每个对外接口都要有门禁断言）在帧命令面上继续适用。
+- HTTP + JSON-RPC 分发（`lualib/mcp.lua`）、会话表（`exec_session`）、`POST /mcp` 与 `--server=http`
+  已在 T5（D41）整体删除。原 `lua_api` 的正文随后进 `tools/agent/autodbg-skill/SKILL.md`（T6）。
+- S12 的教训（每个对外接口都要有门禁断言）在帧命令面上继续适用：`control` / `read_req` 等
+  每一条都有 `e2e_tcp.ps1` 的断言。
 
-- 传输在 C（`POST /mcp`，`Mcp-Session-Id` 头表达会话，D35）；**JSON-RPC 分发在 Lua**（`lualib/mcp.lua`，用 `jsonx`），C 侧不写 JSON 解析器（D28）。
-- 当前 **12 个工具**：`lua_eval`、**`lua_api`**（Lua API 速查，给 AI 写代码用）、`dbg_status`、
-  `gui_screenshot`、`gui_windows`、`gui_find`、`gui_click`、`gui_type`、`gui_press`、`gui_text`、
-  `gui_set_text`、`gui_post`。
-- **`initialize.instructions`**：一段给模型的总体说明（执行模型 + “先调 lua_api” + 输出/写文件用法）；
-  `lua_api(topic)` 的正文在 `lualib/autodbg_api.lua`（**改绑定层时同步它**，节：model/run/attach/
-  breakpoints/hwbp/memory/variant/context/symbols/scan/events/gui/files/pitfalls/recipes）。
-- ❗**工具集口径**：一次 `tools/call` = 一次 Lua 执行（串行）。`Run`/`Attach` 会阻塞到目标退出/`Detach`，
-  所以**不提供**“单独读内存 / 下断点 / 单步”的交互式工具（它们需要「已停止的目标」这个状态，现在没有）。
-  调试逻辑写在 `lua_eval` 的场景脚本里，在 `Attach`/`Run` 的回调内做（这是设计，不是缺口，`PITFALLS.md` S12）。
-- 会话是持久 `lua_State` + `DebuggerSession`（≤8 个、空闲 30 min 回收，Lua 全局变量跨请求保留），
-  但**不是「后台附加」**：`Attach` 期间 worker 被占住，后续请求只能排队（满了 503）或 `/cancel`。
-- `Accept: text/event-stream` → `chunked` 单事件（D36；增量推帧未做）。
-- 宿主身份全局 `_autodbg_info()`（`registry.cpp`）：`{version, version_source, abi, flavor, variant, pid, client_io}`，
-  MCP 的 `serverInfo.version` 与 `dbg_status` 用它（不再写死 `0.1.0`）。
+### 12.4 client 文件 I/O（唯一入口：`open_file` 的文件对象）
 
-### 12.4 client 文件 I/O（`open_file` 流式 / `write_file` 一次性）
-
-> ❗D44 / D45：`read_file` / `write_file` 被文件对象的 io 风格方法取代（`f:read("*a"|"*l"|"*n"|N)`、`f:read_line()`、`f:lines()`、`f:seek()`、`f:tell()`、`f:setbuf()`、`f:write()`、`f:flush()`、`f:close()`）。效果协议 + `base64` + 协程执行器 + `/effects` 一起删。
+> ❗D44 / D45：`read_file` / `write_file` 已被文件对象的 io 风格方法取代（`f:read("*a"|"*l"|"*n"|N)`、`f:read_line()`、`f:lines()`、`f:seek()`、`f:tell()`、`f:setbuf()`、`f:write()`、`f:flush()`、`f:close()`）；效果协议 + `base64` + 协程执行器 + `/effects` 已在 **T5 删除**。
 > 「调试回调里不可用」这条限制取消：回调里 `f:read()` 可以**阻塞等回包**（等待循环按 ≤250 ms 切片 `select`，每片检查 `exec_guard`），超时 → `nil, "timeout"` 后回调返回、断点继续。前提：执行连接的**唯一 reader 是脚本线程**（三个消费点：`f:read()` 等待循环、`on_wait_timeout` 的非阻塞 poll、`lua_sethook` tick）；其它连接是控制连接，由 accept 线程处理。
 
 文件在**客户端**那台机器上；本机脚本模式下两者都等价于 `io.open`。
@@ -455,17 +444,8 @@ payload              // 单条 LZMA 流：各模块原始字节按 entry 顺序�
   的 `yield_blocker`）；要去掉流式就用旧的非流式路径。
 - 客户端实现：`nvim/lua/autodbg/stream.lua`（uv TCP + chunked + 帧解析，`data` 帧直接写本地文件）。
 
-**② 非流式（老路径）：`write_file` / `read_file` + `/effects`**
-
-- 用**协程挂起 + 效果协议**（D37）：响应回 `pending{token, op, stdout_so_far, effects}`，客户端本地执行后
-  `POST /effects?token=<sid:gen>` 恢复；token 未知/过期/**重放** → 404。单次 ≤ 8 MB。
-- C 侧只做 `lua_yield` 与效果表序列化（`file_io.cpp`）；客户端结果 JSON 交给 `lualib/effects.lua` 还原成 Lua 值。
-- **服务器从不触碰客户端磁盘**，也**不重放脚本**。
-- ❗**调试回调里不可用**（`Attach`/`Run` 回调、断点/异常回调）：回调是引擎经 `pcall` C 调用进来的，
-  `lua_yield` 跨不过这个边界（LuaJIT 根本不支持；Lua 5.5 也不允许跨普通 `lua_pcall`）→ 返回
-  `nil, <可操作错误>`，不会让 Lua 抛 `attempt to yield across a C-call boundary` 打断会话。
-  **回调里想写文件请用 `open_file`**（流式），不要再攒表 + 末尾写。
-  判定靠 `helpers.cpp` 的 `callback_depth()`（`pcall()` 维护），`PITFALLS.md` L9。
+- ❗T5（D44）：`read_file` / `write_file` + 效果协议（`/effects`、token、base64、协程执行器）已整体删除；
+  文件 I/O 只有 `open_file` 的文件对象（读写都走帧，见上面的 T4 段）。
 
 ### 12.5 neovim 插件（`nvim/`，子模块）
 

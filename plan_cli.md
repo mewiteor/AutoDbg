@@ -232,6 +232,15 @@ D43 说「每次调用无状态」，所以**不能有隐形状态**：「记住
    ⏳ **剩下**：回调里（`Attach`/`Run` 回包内）的真阻塞读只做了单元级验证（`--read-timeout` 路径已通），
    还没盖「断点继续」那一条；`read_req` 目前只发 bytes/line/seek/tell 四种。
 5. **T5 删除**：`http.*` / `mcp.lua` / `effects.lua` / base64 / 协程执行器 / 会话表 / `yield_blocker` / nvim 的 `http.lua` + chunked 半边。**必须排在 T2/T4 之后**，否则 `open_file` 在回调里写/读的能力会先失去。
+   ✅ **已完成（本仓）**：`server.cpp`（HTTP）/ `server.hpp` / `http.*` / `base64.*` / `exec_session.*` /
+   `exec.cpp` 的协程段 / `file_io.cpp` 的效果协议（只剩 client_io 开关）/ `lualib/{mcp,effects,autodbg_api}.lua` /
+   `registry.cpp` 的 `read_file`/`write_file` 全删；配置解析搬到 `server_config.*`；
+   **`--server=http` 改为报案（退码 2），`--server` / `--server=tcp` 都是 raw TCP**；
+   `--selftest` 101 → 67（http/base64 两段随依赖一起走）；门禁脚本删 `e2e.ps1` /
+   `e2e_mcp.ps1` / `e2e_io.ps1` / `nvim_smoke.*`，`e2e_gui.ps1` 改成本地 CLI（21 条）。
+   顺手修了一个真缺陷：本地模式下脚本的 `...` 第一个参数竟然是脚本路径（命令行未对齐）。
+   ⏳ **剩下**：`nvim/`（子模块、独立仓）的 `http.lua` / `effects.lua` / chunked 半边 ——
+   随插件改到 raw TCP 客户端时在它自己的仓里删，并恢复一份 `nvim_smoke` 等价门禁。
 6. **T6 agent 文档**：`tools/agent/autodbg-skill/SKILL.md`（Agent Skills 格式）+ 三五个 recipe。在 CLI 口径下这份 markdown 是**唯一契约文档**，不是锦上添花 —— `autodbg_api.lua` 的内容搬过去，否则模型只能靠训练数据猜参数形状（就是 S12 复发）。
 7. **T7（可选，独立立项）**引擎 `begin/pump/continue` + `--repl`。D45 之后它不再是文件读的前提，但「不靠回调、看着目标跑」仍然需要它。
 

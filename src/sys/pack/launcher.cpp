@@ -617,7 +617,7 @@ void print_usage()
     out("      --selftest             run built-in pure-function self test\n");
     out("      --json                 print one machine-readable JSON line (D50)\n");
     out("      --out=<path>           write the same JSON to <path>; stdout stays empty\n");
-    out("      --server[=http|tcp]      server mode: http (default, deprecated) or raw tcp frames\n");
+    out("      --server[=tcp]           server mode (raw tcp frames; http was removed, D41)\n");
     out("      --server-addr=<ip:port>  listen address (default 127.0.0.1:8642)\n");
     out("      --server-port=<port>     only override the port\n");
     out("      --server-token=<hex|auto|none>\n");
@@ -812,21 +812,21 @@ extern "C" int launcher_main(int argc, char **argv)
         else if (str_eq(a, "--server") || starts_with(a, "--server="))
         {
             const char *v = (a[8] == '=') ? (a + 9) : "";
-            /* T2（D42）：`--server=tcp` 选 raw TCP 帧（新口径）；`--server` / `--server=http`
-             * 仍是现行 HTTP（随 D41 删除）。只报错不猜。 */
-            if (str_ieq(v, "tcp"))
+            /* T5（D41/D42）：HTTP 传输已删除 —— `--server` / `--server=tcp` 都是 raw TCP 帧；
+             * `--server=http` 明确报错（不静默降级，否则旧脚本会连上一个完全不同的协议）。 */
+            if (str_ieq(v, "") || str_ieq(v, "tcp"))
             {
                 server_mode   = true;
                 server_mode_v = 2;
             }
-            else if (str_ieq(v, "") || str_ieq(v, "http"))
+            else if (str_ieq(v, "http"))
             {
-                server_mode   = true;
-                server_mode_v = 1;
+                out_err("launcher: --server=http was removed (D41); use --server=tcp\n");
+                return 2;
             }
             else
             {
-                out_err("launcher: --server=<http|tcp> only\n");
+                out_err("launcher: --server=<tcp> only\n");
                 return 2;
             }
         }

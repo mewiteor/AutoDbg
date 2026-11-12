@@ -1,4 +1,4 @@
-﻿# =============================================================================
+# =============================================================================
 # tools/server_test/e2e_gui.ps1 —— GUI 自动化端到端验收（S4）
 #
 # 来源：新写（plan_server.md S4）。
@@ -42,20 +42,25 @@ function Check([string]$n, [bool]$c, [string]$d = '') { if ($c) { Ok $n $d } els
 
 function RunLua([string]$src, [string[]]$Args2 = @())
 {
-    $q = ''
-    if ($Args2.Count -gt 0)
-    {
-        $pairs = @()
-        foreach ($a in $Args2) { $pairs += ('arg=' + [System.Uri]::EscapeDataString($a)) }
-        $q = '?' + ($pairs -join '&') + '&format=text'
-    }
-    else { $q = '?format=text' }
+    # T5（D41）：HTTP 的 `/run` 已删 —— 这里改成**本地 CLI**：写临时脚本 → 跑 exe → 收 stdout+stderr。
+    # `gui.*` 与传输无关，本地跑反而更接近实际用法（也省掉了 server 启动/健康检查）。
+    $script:seq = 1 + [int]$script:seq
+    $file = Join-Path $TmpDir ("gui{0}.lua" -f $script:seq)
+    [System.IO.File]::WriteAllText($file, $src, (New-Object System.Text.UTF8Encoding($false)))
 
-    $bytes = [System.Text.Encoding]::UTF8.GetBytes($src)
-    $r = Invoke-WebRequest -Uri "http://127.0.0.1:$Port/run$q" -Method Post -Body $bytes `
-        -ContentType 'text/x-lua; charset=utf-8' -Headers @{ 'X-AutoDbg-Filename' = 'gui_e2e.lua' } `
-        -TimeoutSec 60 -SkipHttpErrorCheck
-    return $r.Content
+    $out = Join-Path $TmpDir 'gui.out'
+    $err = Join-Path $TmpDir 'gui.err'
+    $a = @('--quiet')
+    if ($Variant) { $a += "--variant=$Variant" }
+    $a += $file
+    if ($Args2.Count -gt 0) { $a += $Args2 }
+
+    $p = Start-Process -FilePath $Exe -ArgumentList $a -RedirectStandardOutput $out `
+        -RedirectStandardError $err -PassThru -NoNewWindow
+    $null = $p.WaitForExit(60000)
+    $o = if (Test-Path $out) { Get-Content $out -Raw } else { '' }
+    $e = if (Test-Path $err) { Get-Content $err -Raw } else { '' }
+    return ($o + $e)
 }
 
 function Result([string]$text, [string]$key)
@@ -64,29 +69,11 @@ function Result([string]$text, [string]$key)
     if ($m.Success) { return $m.Groups[1].Value.Trim() } else { return '' }
 }
 
-# ---------------------------------------------------------------- 起 server / 靶子
-$srvArgs = @('--server', "--server-port=$Port")
-if ($Variant) { $srvArgs += "--variant=$Variant" }
-$srvOut = Join-Path $TmpDir 'server.out'
-$srvErr = Join-Path $TmpDir 'server.err'
-$server = Start-Process -FilePath $Exe -ArgumentList $srvArgs -RedirectStandardOutput $srvOut -RedirectStandardError $srvErr -PassThru -NoNewWindow
-
+# ---------------------------------------------------------------- 靶子（T5：不再需要 server）
+$script:seq = 0
 $target = $null
 try
 {
-    $deadline = (Get-Date).AddSeconds(15)
-    $ready = $false
-    while ((Get-Date) -lt $deadline)
-    {
-        if ($server.HasExited) { break }
-        try
-        {
-            if ((Invoke-WebRequest -Uri "http://127.0.0.1:$Port/health" -TimeoutSec 2 -SkipHttpErrorCheck).StatusCode -eq 200) { $ready = $true; break }
-        }
-        catch { Start-Sleep -Milliseconds 150 }
-    }
-    if (-not $ready) { Write-Output 'SKIP: server 未就绪'; exit 2 }
-
     $targetOut = Join-Path $TmpDir 'target.out'
     $targetErr = Join-Path $TmpDir 'target.err'
     $target = Start-Process -FilePath 'pwsh' -ArgumentList @('-NoProfile', '-File', $TargetScript) `
@@ -271,11 +258,6 @@ print("CLOSED=1")
 finally
 {
     if ($target -and -not $KeepTarget -and -not $target.HasExited) { try { $target.Kill() } catch { } }
-    if (-not $server.HasExited)
-    {
-        try { Invoke-WebRequest -Uri "http://127.0.0.1:$Port/shutdown" -Method Post -TimeoutSec 2 -SkipHttpErrorCheck | Out-Null } catch { }
-        if (-not $server.WaitForExit(3000)) { $server.Kill() }
-    }
 }
 
 Write-Output ''

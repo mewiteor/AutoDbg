@@ -104,7 +104,7 @@
 | O6 | 输出 sink 一装上，别的线程的诊断也被收进当前请求的 `stdout` | `core::set_output_sink` 是**全局**的 | 非执行线程的诊断**直写 `WriteFile`**，不经 `core::Print*` |
 | O7 | 模块凭空长大几十 KB | 大结构体数组（内嵌 `http_request` ≈2 KB、带默认成员初始化）以初值形态进 `.data`（`job g_jobs[32]` → +72 KB） | 队列/表只持**指针**，请求体堆上分配 |
 
-## S. server 模式 / MCP / client 文件 I/O
+## S. server 模式 / MCP / client 文件 I/O（❗T5/D41/D44 之后：MCP、HTTP、effects、base64 均已删除，S 节里涉及它们条目仅作历史备查）
 
 > `feat/cli-tcp`（D41 / D44）落地后 **S1 / S5 / S8 / S10 / S11 作废**（它们绑在 HTTP 与效果协议上）。保留备查：这些是当时定位问题的第一手依据，删除后仍是「为什么会写成那样」的答案。S12 的教训——每个对外接口都要有门禁断言——在帧命令面上继续适用。
 

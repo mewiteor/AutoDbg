@@ -3,17 +3,15 @@
  *
  * 来源：新写。
  * 与旧实现的差异：无（新文件）。
- * 覆盖：HTTP 请求解析（含各种拒绝路径）、HTTP 响应生成、json_writer（转义/嵌套/数字/
- *   深度溢出、**T1（D50）的全转义出口**）、base64（向量/往返/非法输入）、rand（hex 形状与
- *   两次不相等）、**帧头编解码（T2：定长头 / json 长度反推 / raw 长度前缀 / 全部拒绝路径）**。
+ * 覆盖：json_writer（转义/嵌套/数字/深度溢出/T1 的全转义出口）、rand（hex 形状与两次不相等）、
+ *   帧头编解码（T2：定长头 / json 长度反推 / raw 长度前缀 / 全部拒绝路径）、PNG/BMP 编码。
+ * ❗T5（D41/D44）删除了 HTTP 与 base64 两段：它们跟着 http.* / ase64.* 一起消失。
  * 说明：断言用 `strcmp`/`memcmp` 逐字节比较（跨架构/跨编译器稳定）；
  *   期望值都是**手写的字面量**，不要在这里用被测代码生成期望值（否则等于没测）。
  * ========================================================================== */
 #include "selftest.hpp"
 
-#include "base64.hpp"
 #include "frame.hpp"   /* T2：帧头编解码（plan_cli.md §2.1） */
-#include "http.hpp"
 #include "json_writer.hpp"
 #include "png_writer.hpp"
 #include "rand.hpp"
@@ -146,205 +144,6 @@ void check_str(test_ctx *t, const char *name, const char *got, const char *want)
     fail(t, name, buf);
 }
 
-/* ------------------------------ HTTP 解析 ------------------------------ */
-void test_http_parse(test_ctx *t)
-{
-    {
-        const char *req = "GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n";
-        http_request r{};
-        size_t       head = 0;
-        bool ok = http_parse_request(req, strlen(req), &r, &head) == http_parse_status::ok;
-        check_bool(t, "http.parse.get-minimal", ok, "expected ok");
-        check_int(t, "http.parse.get-minimal.method", (long long)r.method, (long long)http_method::get, nullptr);
-        check_str(t, "http.parse.get-minimal.path", r.path, "/health");
-        check_int(t, "http.parse.get-minimal.head-len", (long long)head, (long long)strlen(req), nullptr);
-    }
-
-    {
-        const char *req = "POST /run?format=json&args=a&args=b HTTP/1.1\r\n"
-                          "Content-Type: text/x-lua\r\n"
-                          "X-AutoDbg-Filename: buffer.lua\r\n"
-                          "X-AutoDbg-Format: Text\r\n"
-                          "Authorization: Bearer abc123\r\n"
-                          "Expect: 100-continue\r\n"
-                          "Content-Length: 5\r\n"
-                          "\r\n"
-                          "hello";
-        http_request r{};
-        size_t       head = 0;
-        bool ok = http_parse_request(req, strlen(req), &r, &head) == http_parse_status::ok;
-        check_bool(t, "http.parse.post-headers", ok, "expected ok");
-        check_int(t, "http.parse.post-headers.method", (long long)r.method, (long long)http_method::post, nullptr);
-        check_str(t, "http.parse.post-headers.path", r.path, "/run");
-        check_str(t, "http.parse.post-headers.query", r.query, "format=json&args=a&args=b");
-        check_str(t, "http.parse.post-headers.filename", r.filename, "buffer.lua");
-        check_str(t, "http.parse.post-headers.format-lowercased", r.format, "text");
-        check_str(t, "http.parse.post-headers.token", r.token, "abc123");
-        check_bool(t, "http.parse.post-headers.expect-continue", r.expect_continue, "expected true");
-        check_int(t, "http.parse.post-headers.content-length", r.content_length, 5, nullptr);
-        check_int(t, "http.parse.post-headers.body-offset",
-                  (long long)(strlen(req) - head), 5, "body should be 5 bytes");
-    }
-
-    {
-        char        dst[32];
-        bool        found = http_query_get("b=%20x+y", "b", dst, sizeof dst);
-        check_bool(t, "http.parse.query-decode", found && strcmp(dst, " x y") == 0, "expected ' x y'");
-    }
-
-    {
-        /* 严格 CRLF：只有 LF 的头块永远等不到结束标记 → incomplete */
-        const char *req = "GET / HTTP/1.0\n\n";
-        http_request r{};
-        size_t       head = 0;
-        check_bool(t, "http.parse.lf-only-incomplete",
-                   http_parse_request(req, strlen(req), &r, &head) == http_parse_status::incomplete,
-                   "LF-only must not parse");
-    }
-
-    {
-        /* 头部还一个字节都没收到时必须是 incomplete（S1 实测过的坑：空缓冲曾被判成 400） */
-        http_request r{};
-        size_t       head = 0;
-        check_bool(t, "http.parse.empty-incomplete",
-                   http_parse_request(nullptr, 0, &r, &head) == http_parse_status::incomplete, nullptr);
-    }
-
-    {
-        const char *req = "GET /health HTT";
-        http_request r{};
-        size_t       head = 0;
-        check_bool(t, "http.parse.incomplete",
-                   http_parse_request(req, strlen(req), &r, &head) == http_parse_status::incomplete, nullptr);
-    }
-
-    {
-        const char *req = "GARBAGE\r\n\r\n";
-        http_request r{};
-        size_t       head = 0;
-        check_bool(t, "http.parse.bad-request-line",
-                   http_parse_request(req, strlen(req), &r, &head) == http_parse_status::bad_request, nullptr);
-    }
-
-    {
-        const char *req = "GET / HTTP/2.0\r\n\r\n";
-        http_request r{};
-        size_t       head = 0;
-        check_bool(t, "http.parse.bad-version",
-                   http_parse_request(req, strlen(req), &r, &head) == http_parse_status::bad_request, nullptr);
-    }
-
-    {
-        const char *req = "GET foo HTTP/1.1\r\n\r\n";
-        http_request r{};
-        size_t       head = 0;
-        check_bool(t, "http.parse.target-needs-slash",
-                   http_parse_request(req, strlen(req), &r, &head) == http_parse_status::bad_request, nullptr);
-    }
-
-    {
-        const char *req = "GET / HTTP/1.1\r\nA: 1\r\nB: 2\r\n\r\n";
-        const char *fold = "GET / HTTP/1.1\r\nA: 1\r\n : 2\r\n\r\n";
-        http_request r{};
-        size_t       head = 0;
-        (void)req;
-        check_bool(t, "http.parse.obs-fold-rejected",
-                   http_parse_request(fold, strlen(fold), &r, &head) == http_parse_status::bad_request, nullptr);
-    }
-
-    {
-        const char *req = "POST /run HTTP/1.1\r\nContent-Length: 0\r\nContent-Length: 5\r\n\r\n";
-        http_request r{};
-        size_t       head = 0;
-        check_bool(t, "http.parse.dup-content-length",
-                   http_parse_request(req, strlen(req), &r, &head) == http_parse_status::bad_request, nullptr);
-    }
-
-    {
-        const char *req = "POST /run HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n";
-        http_request r{};
-        size_t       head = 0;
-        check_bool(t, "http.parse.chunked-unsupported",
-                   http_parse_request(req, strlen(req), &r, &head) == http_parse_status::unsupported, nullptr);
-    }
-
-    {
-        /* 65 个头 → too_large */
-        char buf[2048];
-        size_t n = 0;
-        const char *first = "GET / HTTP/1.1\r\n";
-        for (const char *p = first; *p != '\0'; p++)
-            buf[n++] = *p;
-        for (int i = 0; i < k_http_max_headers + 1; i++)
-        {
-            const char *h = "X: 1\r\n";
-            for (const char *p = h; *p != '\0'; p++)
-                buf[n++] = *p;
-        }
-        buf[n++] = '\r';
-        buf[n++] = '\n';
-        http_request r{};
-        size_t       head = 0;
-        check_bool(t, "http.parse.too-many-headers",
-                   http_parse_request(buf, n, &r, &head) == http_parse_status::too_large, nullptr);
-    }
-
-    {
-        /* 没有结束标记且已超上限 → too_large（不能让对方无限发头） */
-        static char buf[k_http_max_header_block + 16];
-        size_t      n = 0;
-        const char *first = "GET / HTTP/1.1\r\nX: ";
-        for (const char *p = first; *p != '\0'; p++)
-            buf[n++] = *p;
-        while (n < sizeof buf)
-            buf[n++] = 'a';
-        http_request r{};
-        size_t       head = 0;
-        check_bool(t, "http.parse.header-block-too-large",
-                   http_parse_request(buf, n, &r, &head) == http_parse_status::too_large, nullptr);
-    }
-}
-
-/* ------------------------------ HTTP 响应 ------------------------------ */
-void test_http_response(test_ctx *t)
-{
-    {
-        http_response resp(200, "text/plain; charset=utf-8");
-        resp.add_header("X-AutoDbg-Exit", "0");
-        resp.write("hello", 5);
-
-        size_t      len = 0;
-        const char *raw = resp.finish(&len);
-        const char *want = "HTTP/1.1 200 OK\r\n"
-                           "X-AutoDbg-Exit: 0\r\n"
-                           "Content-Type: text/plain; charset=utf-8\r\n"
-                           "Content-Length: 5\r\n"
-                           "Connection: close\r\n"
-                           "\r\n"
-                           "hello";
-        check_bool(t, "http.response.byte-identical",
-                   raw != nullptr && len == strlen(want) && memcmp(raw, want, len) == 0, "content mismatch");
-    }
-
-    {
-        http_response resp(504, nullptr);
-        size_t        len = 0;
-        const char   *raw = resp.finish(&len);
-        bool ok = raw != nullptr && len > 13 && memcmp(raw, "HTTP/1.1 504 ", 13) == 0 &&
-                  resp.status() == 504;
-        check_bool(t, "http.response.reason", ok, "504 reason line");
-    }
-
-    {
-        http_response resp(413, nullptr);
-        resp.add_header_number("Content-Length", 42);
-        size_t len = 0;
-        (void)resp.finish(&len);
-        check_bool(t, "http.response.header-number", len > 0, "finish failed");
-    }
-}
-
-/* ------------------------------ JSON ------------------------------ */
 void test_json(test_ctx *t)
 {
     {
@@ -557,60 +356,6 @@ void test_json(test_ctx *t)
     }
 }
 
-/* ------------------------------ base64 ------------------------------ */
-void test_base64(test_ctx *t)
-{
-    {
-        char out[32];
-        size_t n = base64_encode("hello", 5, out, sizeof out);
-        check_bool(t, "base64.encode-vector", n == 8 && strcmp(out, "aGVsbG8=") == 0, "hello vector");
-    }
-
-    {
-        char   out[64];
-        char   back[64];
-        size_t n = base64_encode("hello", 5, out, sizeof out);
-        size_t m = base64_decode(out, n, back, sizeof back);
-        check_bool(t, "base64.roundtrip", m == 5 && memcmp(back, "hello", 5) == 0, "roundtrip failed");
-    }
-
-    {
-        char out[128];
-        char back[128];
-        bool ok = true;
-        for (size_t len = 0; len <= 9; len++)
-        {
-            unsigned char src[16];
-            for (size_t i = 0; i < len; i++)
-                src[i] = (unsigned char)(0xA0 + i);
-            size_t en = base64_encode(src, len, out, sizeof out);
-            size_t de = base64_decode(out, en, back, sizeof back);
-            if (en == (size_t)-1 || de != len || (len > 0 && memcmp(back, src, len) != 0))
-            {
-                ok = false;
-                break;
-            }
-        }
-        check_bool(t, "base64.roundtrip-all-lengths", ok, "length sweep failed");
-    }
-
-    {
-        /* 拒绝：1 个字符（截断）、4 个填充、非法字符。
-         * ❗**无填充**（`n % 4 == 3`）是合法写法 → `aGVsbG8` 必须解出 `hello`（不报错）。 */
-        char   back[16];
-        char   unpadded[16];
-        size_t a  = base64_decode("a", 1, back, sizeof back);
-        size_t b  = base64_decode("====", 4, back, sizeof back);
-        size_t c  = base64_decode("ab$d", 4, back, sizeof back);
-        size_t u  = base64_decode("aGVsbG8", 7, unpadded, sizeof unpadded);
-        check_bool(t, "base64.reject-invalid", a == (size_t)-1 && b == (size_t)-1 && c == (size_t)-1,
-                   "expected rejection");
-        check_bool(t, "base64.accept-unpadded",
-                   u == 5 && memcmp(unpadded, "hello", 5) == 0, "unpadded 'aGVsbG8' must decode to 'hello'");
-    }
-}
-
-/* ------------------------------ rand ------------------------------ */
 void test_rand(test_ctx *t){
     char a[33];
     char b[33];
@@ -771,10 +516,7 @@ int run_selftests(selftest_report_fn report, void *ctx)
     t.total  = 0;
     t.failed = 0;
 
-    test_http_parse(&t);
-    test_http_response(&t);
     test_json(&t);
-    test_base64(&t);
     test_rand(&t);
     test_frame(&t);
     test_image(&t);

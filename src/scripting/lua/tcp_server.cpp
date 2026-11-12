@@ -23,7 +23,7 @@
 #include "exec.hpp"        /* exec_script：一次性执行（D22/D43） */
 #include "exec_guard.hpp"  /* guard_exec_begin / request_cancel / soft action */
 #include "output.hpp"      /* output_begin / output_end：stdout 收进缓冲并发 `out` 帧 */
-#include "server.hpp"      /* server_config + server_config_from_boot（S0 解析 / D21 策略） */
+#include "server_config.hpp" /* S0 解析 / D21 策略（T5：从 HTTP 的 server.cpp 抽出来） */
 #include "stream.hpp"      /* 帧协议（类型/版本/传输钩子/poll） */
 
 #include "common/allocator.hpp"

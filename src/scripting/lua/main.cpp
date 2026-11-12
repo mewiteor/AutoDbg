@@ -28,7 +28,7 @@
 #include "state.hpp"     /* run_script_file / g_wfilepath */
 #include "file_io.hpp"    /* T4：set_client_read_timeout（等回包的上限） */
 #include "client.hpp"    /* T3（D42）：`--remote` 客户端模式 */
-#include "server.hpp"    /* S0：server 模式入口（plan_server.md §3.1 / D27） */
+#include "tcp_server.hpp" /* T5（D41）：server 只剩 raw TCP（HTTP 已删） */
 #include "output.hpp"    /* T1（D50）：stdout/stderr 分桶 + `images` 登记表 */
 #include "exec_guard.hpp" /* T1（D50）：`canceled`（guard_stop_reason）与 `detached`（guard_detached） */
 #include "common/dynapi.hpp" /* get_proc_as：Win95 缺失的 kernel32 API 动态解析 */
@@ -43,7 +43,7 @@
 #include <commdlg.h>
 #include <intrin.h>
 #include <shlwapi.h>
-#include <string.h>      /* T1（D50）：strlen（信封字段长度） */
+#include <string.h>      /* T1（D50）：strlen；T5：strcmp（脚本参数对齐） */
 #include <strsafe.h>
 
 #define _CRTDBG_MAP_ALLOC
@@ -62,6 +62,34 @@ using autodbg::core::init_tab; /* CRC 表（原 lib.c → core/util） */
  * ❗为什么是指针 + `new` 而不是普通静态对象：零 CRT 构建（`/nodefaultlib`，msvcrt.def）
  *   **没有 `_atexit`**，带非平凡析构的静态对象会让链接器要 `_atexit`（LNK2019）。
  *   会话在进程生命期内常驻、退出时随进程释放（与旧实现同为“不释放链表”，行为中性）。 */
+/* T5：脚本路径比对（自己写：影子头下 include <wchar.h> 会与 vcruntime_string.h 撞重定义） */
+static bool path_same_a(const char *a, const char *b)
+{
+    while (*a != '\0' && *b != '\0')
+    {
+        char x = (*a >= 'A' && *a <= 'Z') ? (char)(*a - 'A' + 'a') : *a;
+        char y = (*b >= 'A' && *b <= 'Z') ? (char)(*b - 'A' + 'a') : *b;
+        if (x != y)
+            return false;
+        a++;
+        b++;
+    }
+    return *a == *b;
+}
+
+static bool path_same_w(const wchar_t *a, const wchar_t *b)
+{
+    while (*a != L'\0' && *b != L'\0')
+    {
+        wchar_t x = (*a >= L'A' && *a <= L'Z') ? (wchar_t)(*a - L'A' + L'a') : *a;
+        wchar_t y = (*b >= L'A' && *b <= L'Z') ? (wchar_t)(*b - L'A' + L'a') : *b;
+        if (x != y)
+            return false;
+        a++;
+        b++;
+    }
+    return *a == *b;
+}
 static autodbg::core::DebuggerSession *s_session = nullptr;
 
 /* ---- T1（D50）：JSON 模式的进程级状态（一次进程只跑一次，不需要重置） ----
@@ -426,7 +454,7 @@ extern "C" __declspec(dllexport) int __cdecl autodbg_run(const autodbg_boot *boo
     if (boot->selftest != 0)
         return run_selftest_mode();
     if (boot->server_mode != 0)
-        return autodbg::server::server_main(boot);
+        return autodbg::server::tcp_server_main(boot);
 
     /* ---- 拆命令行（缓冲由我们自己持有：拆分是原地改写） ---- */
     static LPTSTR s_argv[64];
@@ -474,36 +502,60 @@ extern "C" __declspec(dllexport) int __cdecl autodbg_run(const autodbg_boot *boo
     }
 #endif
 
-    /* ---- 启动器选定的脚本覆盖 argv[1] ---- */
+    /* ---- 启动器选定的脚本覆盖 argv[1] ----
+     * ❗T5：启动器传来的是**整条命令行**（含它自己的选项），所以直接覆盖 argv[1] 会把
+     *   「脚本路径」留在 argv[2] 里 → 脚本的 `...` 第一个参数变成脚本路径
+     *   （实测：`--quiet a.lua 123` 里 `...` == `a.lua`）。这里先找到启动器那一份脚本在
+     *   原 argv 里的位置，再把**它后面的**元素搬到 argv[2..]。 */
+    {
 #ifdef _UNICODE
-    if (boot->script_w != nullptr)
-    {
-        if (argc < 2)
-        {
-            s_argv[1] = (LPTSTR)boot->script_w;
-            s_argv[2] = nullptr;
-            argc      = 2;
-        }
-        else
-        {
-            s_argv[1] = (LPTSTR)boot->script_w;
-        }
-    }
+        const wchar_t *wanted = boot->script_w;
 #else
-    if (boot->script_a != nullptr)
-    {
-        if (argc < 2)
+        const char *wanted = boot->script_a;
+#endif
+        if (wanted != nullptr)
         {
-            s_argv[1] = (LPTSTR)boot->script_a;
-            s_argv[2] = nullptr;
-            argc      = 2;
-        }
-        else
-        {
-            s_argv[1] = (LPTSTR)boot->script_a;
+            int script_at = -1;
+            for (int i = 0; i < argc; i++)
+            {
+                /* ❗不能比指针：启动器传的是它自己静态缓冲里的那份，本层 argv 是重新拆
+                 * 出来的拷贝。比**字符串**（两边都来自同一条命令行文本，方向一致）。 */
+#ifdef _UNICODE
+                bool same = (s_argv[i] != nullptr && boot->script_w != nullptr &&
+                             path_same_w(s_argv[i], boot->script_w));
+#else
+                bool same = (s_argv[i] != nullptr && boot->script_a != nullptr &&
+                             path_same_a(s_argv[i], boot->script_a));
+#endif
+                if (same)
+                {
+                    script_at = i;
+                    break;
+                }
+            }
+
+            if (script_at >= 0)
+            {
+                int j = 0;
+                s_argv[1] = s_argv[script_at];
+                j         = 2;
+                for (int i = script_at + 1; i < argc; i++)
+                    s_argv[j++] = s_argv[i];
+                s_argv[j] = nullptr;
+                argc      = j;
+            }
+            else
+            {
+                /* 指针对不上（例如启动器改写过命令行）：退化成旧行为（至少有脚本） */
+                if (argc < 2)
+                {
+                    s_argv[1] = (LPTSTR)((boot->script_a != nullptr) ? (LPTSTR)boot->script_a : (LPTSTR)boot->script_w);
+                    s_argv[2] = nullptr;
+                    argc      = 2;
+                }
+            }
         }
     }
-#endif
 
     /* ---- T3（D42）：客户端模式：不跑本地脚本，连 server 把脚本/控制命令发过去。
      * ❗必须在**装输出收集器之前**分派：客户端的 stdout/stderr 是它自己控制的
