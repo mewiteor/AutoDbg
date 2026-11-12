@@ -70,7 +70,7 @@ end(&err)                        run_shutdown（761）+ detach；D47 的降级�
 
 | # | 原语 | 为什么不能少 | 现在的状态 |
 | --- | --- | --- | --- |
-| 1 | `list_modules()` / `ea_owner(ea)` | AI 与 IDA 对齐的键只有 `(modname, rva)`；运行时 base、size、entry、region 类型是判断「这个 EA 属于哪个副本」的唯一依据 | `peinfos()` 是内部链表，Lua 侧只有 `GetModBase(name)` |
+| 1 | `list_modules()`（带 `machine` 与 pid） | AI 与 IDA 对齐的键只有 `(modname, rva)`；运行时 base、size、entry、region 类型是判断「这个 EA 属于哪个副本」的唯一依据 | `peinfos()` 是内部链表，Lua 侧只有 `GetModBase(name)`。❗`ea_owner(ea)` 不需要单独实现——`Ea2ModnameRva`（契约名，返回形状不可动）已经覆盖它；缺的是**反向**：同名多实例时 `GetModBase(name)` 只取第一个 |
 | 2 | `list_threads()` + `tid → handle` | 栈回溯 / `GetContext` 都要 tid；现在只有内部链表 | `types.hpp:44-51`，无 Lua 面 |
 | 3 | `list_breakpoints()` / `list_hw_breakpoints()` | 客户端不知道「我 armed 了什么、哪条是 single、原始字节是什么」就无法推理 | 只有 set/del/enable/disable |
 | 4 | **命中计数与命中记录**（per bp：hits、pid/tid、时间） | AI 问「命中了几次 / 被哪个线程命中」；没有它只能靠 `print` 散文 | `BreakpointInfo` 无计数字段（56-66） |
@@ -228,5 +228,37 @@ repl.state-member-parity     run() 重构后既有门禁全绿（逐字节验证
 2. `hits()` 队列上限与 drop 策略（丢最旧 / 丢最新 / 计数后停）—— 我推荐 64 + 丢最旧 + `dropped` 计数，因为诚实性优先。
 3. proto 到底 bump 不 bump（§5）：如果 AI 客户端只有 nvim 一个，可以先只在 T7 里 bump；如果第三方 agent 已经在连，必须 bump。
 4. fixture 落在 `scan_dir.py` 的哪个口径（w95 还是排除）——这条决定了 fixture 能不能用 NT-only 的调用。
-5. `--repl` 的 stdin 在真控制台上走 `ReadConsoleW` 还是 `ReadConsoleInput`（后者已在用且 95 可，前者要先查导入表）。
-6. Lua sugar 的落点：`lualib/`（按文件名设全局，不能设 `Run`）还是 `dbg` 表的方法（C 注册）——我推荐 sugar 挂 `dbg` 表，lualib 只放纯 Lua 的策略函数。
+5. ~~`ReadConsoleW` 要先查导入表~~ —— 已查（`tools/api_check/datas.bin` 按 OS 段）：`ReadConsoleW` 全 w95 可 ⇒ 不需要 dynapi。剩下的只是「先 `ReadFile`（管道可跑，门禁靠它）再回退 `ReadConsoleW`」这个顺序。
+6. session 上限与 idle 回收的数值（`hits()` 队列上限照 64 已推荐，但「几个 session」「空闲多久回收」还没数）。
+7. `session.default-parity` 这条门禁的落点：契约名走默认 session、`sess:xxx` 走 session 对象，两者必须逐字节一致（§10 第 6 条）。
+8. 多 session 的 pump 口径：「事件属于别的 session」时是立刻 dispatch 还是入 queue（§10 第 5 条建议入 queue + 返回归属）。
+9. Lua sugar 的落点：`lualib/`（按文件名设全局，不能设 `Run`）还是 `dbg` 表的方法（C 注册）——我推荐 sugar 挂 `dbg` 表，lualib 只放纯 Lua 的策略函数。转义符口径（已讨论）：文件名去扩展名后，`<转义符><字母>` → 大写，其余原样；转义符选 `-`（`_` 不行，它是标识符字符，会跟「按文件名」约定打架）。只转 `name` 不转 `path`（`path` 是 chunkname，`nvim_smoke` 的 `err.error-text` 靠它）；`gen_lua_lib.lua` 要在构建期校验「结果是合法标识符」。
+
+---
+
+## 10. 多 session（进程树路由）
+
+这是 §2.2 的自然延伸，也是 A/B 对比用例（同一脚本跑两个实例、比较内存）唯一能成立的形式——两个实例同架构，所以不需要任何进程间通信。
+
+1. **session 的键是一棵树**（root pid + 由它派生的 pid 集），不是单个 pid。`debug_loop.cpp:512` 的 `params->pid == event.pid` 只在第一个 `CREATE_PROCESS` 时匹配，本质是「假设只有一个进程」的隐式状态。
+2. **事件与模块/线程表已经是全树口径**：每个 `CREATE_PROCESS` 都建 `PEInfo` 节点（节点带 `dwProcessId`，`types.hpp:115`）、调 `update_breakpoints(info)`、调 `scylla_hide_on_create_process(DBGEvent.dwProcessId, ...)`。
+3. **但内存与断点补丁只认 root**：`memory.cpp` 的 `read`/`write`/`VirtualProtectEx` 全用 `proc().hProcess`，且 `read(size_t addr, void*, size_t)` 签名里没有 pid；`apply_breakpoints_for_module` → `write()` → `proc().hProcess` ⇒ 断点记录有、补丁打到错的进程。需要按 pid 的句柄表（`OpenProcess` 全 w95；9x 不认 `PROCESS_QUERY_INFORMATION` 的降级已在 `util.cpp:690`）。
+4. **断点的进程维度只能落在新记录层**：`BreakpointInfo` 的 key 是 `(modname, rva)`，没有 pid，且布局不可动（§5 第 7 条）。线程句柄反而没问题——`CREATE_THREAD`/`CREATE_PROCESS` 给的 `hThread` 是调试器拥有的有效句柄。
+5. **pump 的多 session 口径**：`pump(sess, timeout)` = 先看 sess 的 `hits()` queue；空则读一条事件；事件属于 sess → dispatch；属于别的 session → 入它自己的 queue 并返回归属（❗不在名义上 pump A 的时候跑 B 的 callback）。被忽略的 session 会停在事件未应答状态（`cont()` 的 `DBG_EVENT_UNHANDLED` 就是为此存在）⇒ 脚本必须显式 drain 每个 session，不能靠引擎自动继续。
+6. **契约名继续作用于默认 session**（29 个名字一个字不改），多 session 走 session 对象的方法（新名字，§5 第 6 条允许）⇒ 门禁必须有一条逐字节对照：`session.default-parity`。
+7. **一棵树只能有一个调试器**（子进程自动归同一个）⇒ session 不能跨进程；要拆必须显式 `DebugActiveProcessStop`（NT+；9x 没有，D47 降级）⇒ 分派在 `Run`/`Attach` 时定，不可迁移。9x 上还有另一条硬后果：不能 attach 已运行进程（case 30）⇒ 98 上 session 只能由 CreateProcess 建立，session 生命周期 = 执行生命周期，不能跨调用恢复。
+8. 回调里不能 pump（§2.3）⇒ 跨 session 比较只能在两边都停住时做；跑着的 session 只能读内存，不能读 context（`SuspendThread` 明确不提供）。
+
+新断言（`e2e_tcp.ps1`）：
+
+```text
+route.child-process            被调试进程创建的子进程 → 事件归属同一 session
+route.child-handle             读子进程必须用该进程的句柄，不是 root 的
+route.same-name-two-processes  list_modules() 能区分同名多实例
+route.other-session-queued     B 的事件入 queue；A 仍能读内存；B 停在未应答状态
+pump.reentry-rejected          回调里 pump（已有）
+session.tree-key               pid-set 归属
+session.one-exec-connection    一执行连接一 session（其它连接只能走 control）
+session.idle-reclaim / session.cap
+session.default-parity         契约名与 sess: 方法逐字节一致
+```
