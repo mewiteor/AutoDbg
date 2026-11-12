@@ -165,9 +165,9 @@ sequence of interactive calls.
 
 ### Open
 
-- [ ] Win9x real-machine verification (matrix, encoding, dynapi degradation paths) — see `plan.md` §1.3.
-- [ ] neovim plugin: move from HTTP to the raw TCP client, restore its smoke gate.
-- [ ] Blocking `f:read()` inside `Attach`/`Run` callbacks: end-to-end case with "timeout → callback returns → breakpoint continues".
+
+
+
 - [ ] Engine `begin/pump/continue` + `--repl` (T7, optional) — a script-free way to watch a target run.
 - [ ] PageGuard memory breakpoints, memory snapshot / scatter-gather reads.
 - [ ] Python (`cffi`) middleware, Linux `ptrace` HAL, Capstone/Unicorn integration, `BsonDecode`.

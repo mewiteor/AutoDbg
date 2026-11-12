@@ -154,9 +154,9 @@ Run({
 
 ### 待完成
 
-- [ ] Win9x 实机验证（矩阵、编码、dynapi 降级路径）—— 见 `plan.md` §1.3。
-- [ ] neovim 插件：迁到 raw TCP 客户端并恢复 smoke 门禁。
-- [ ] `Attach`/`Run` 回调里的阻塞 `f:read()`：补「超时 → 回调返回 → 断点继续」的端到端用例。
+
+
+
 - [ ] 引擎 `begin/pump/continue` + `--repl`（T7，可选）—— 不用回调也能「看着目标跑」。
 - [ ] PageGuard 内存断点、内存快照 / 分散聚合读取。
 - [ ] Python (`cffi`) 中间层、Linux `ptrace` HAL、Capstone/Unicorn 集成、`BsonDecode`。

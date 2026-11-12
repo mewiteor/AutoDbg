@@ -66,7 +66,7 @@ make.bat i <dir>         :: 指定输出目录（默认 .out）
 ## 2. 代码生成与自举
 
 - `tools/gen_lua_lib.lua`：把 `lualib/*.lua` 编译成字节码，生成 `datas_<flavor>/datas_<flavor>.c` + `datas_<flavor>/datas.h`（`all_bytecodes[]` 表）。
-  运行期 `state.cpp` 逐条 `luaL_loadbuffer` + `lua_pcall`，结果按**文件名**设为全局（当前为 `effects`、`inspect`、`jsonx`、`mcp`、`moses`）——脚本里直接用全局名，不是 `require`。
+  运行期 `state.cpp` 逐条 `luaL_loadbuffer` + `lua_pcall`，结果按**文件名**设为全局（当前为 `inspect`、`jsonx`、`moses`；`effects`、`mcp` 已随 T5/D44 删除）——脚本里直接用全局名，不是 `require`。
   ❗字节码格式取决于跑脚本的解释器：`lua` 变体必须用本项目的 Lua 5.5 解释器（`lua_<arch>.exe`），`luajit` 变体必须用 `luajit_<arch>.exe`。
   `datas` 是 **flavor 级共享产物**：只有 modern 变体负责生成，legacy 复用（否则 ninja 报 `multiple rules generate`）。
   ❗按**文件名**顺序烘焙意味着「后加载的库不能用先加载的全局」，只能在调用时查（`PITFALLS.md` L4）。
@@ -97,11 +97,11 @@ make.bat i <dir>         :: 指定输出目录（默认 .out）
 | --- | --- | --- |
 | 导入表门禁 | `uv --directory tools/api_check run scan_dir.py` | 扫 `.out` 下全部产物，按产物自动选口径（`AutoDbgLegacy_*` 与启动器 → `w95`、其余 x86 → `wxp`、x64 → `w7`），有目标系统不可用的导入就打印并返回 1。单文件用法：`uv --directory tools/api_check run main.py <exe\|dll> <w95\|w98\|w982\|wxp>`（x64 免第二个参数） |
 | 纯函数自测 | `.out\AutoDbg_<arch>.exe --selftest` | 覆盖 `json_writer` / `png_writer` / `dbl2str` / **帧编解码** 等纯计算层（基线 70 → T1/D50 转义 +11 = 81 → T2 帧编解码 +20 = 101 → **T5 删 `http`/`base64` 两段后 = 67**）；待补：`decide_console_action` 的断言 |
-| GUI 自动化（本地） | `pwsh tools/server_test/e2e_gui.ps1 -Render <64\|86> [-Variant legacy]` | 起一个 `gui_target.ps1` 靶子窗口，用**本地 CLI** 跑 `gui.*` 脚本断言（屏幕/窗口/控件/截图/`gui.pick`）；`-AllowInput` 才跑会动真鼠标/键盘的用例。T5 之前它走 HTTP `/run`，现已改成本地（`gui.*` 与传输无关，21 条断言） |
+| GUI 自动化（本地） | `pwsh tools/server_test/e2e_gui.ps1 -Render <64\|86> [-Variant legacy]` | 起一个 `gui_target.ps1` 靶子窗口，用**本地 CLI** 跑 `gui.*` 脚本断言（屏幕/窗口/控件/截图/`gui.pick`）；`-AllowInput` 才跑会动真鼠标/键盘的用例。T5 之前它走 HTTP `/run`，现已改成本地（`gui.*` 与传输无关，21 条断言；带 `-AllowInput` 是 26 条） |
 | raw TCP 帧（T2/T3/T4/D42） | `pwsh tools/server_test/e2e_tcp.ps1 -Render <64\|86> [-Variant legacy]` | `--server=tcp`：握手帧（`id` = 协议版本、`data` = token）→ `info`；版本不符 / 首帧非握手 / 错 token 的 `error` 帧；`script` → `out`+`result`+`end`；`control` 的 health / version / cancel / 未知 / shutdown；**执行期的 control**（Lua 死循环 + 引擎空转）；**`--remote` 客户端**（跑脚本 / `--json` 信封 / 语法错误 / health / version / 另一个进程的 `--cancel`）；**`open_file` 读向**（远程 open 应答、read/tell/seek/lines 字节与位置语义、等回包超时 → `nil,"timeout"` 且脚本继续）、**调试回调里的阻塞读**（超时后回调返回、下一次 `Run` 照常；迟到的 `read_resp` 被丢弃）；**`0.0.0.0` 横幅列出网卡地址**。48 条断言，legacy 同样必须真过 |
 | JSON 信封（T1/D50） | `pwsh tools/server_test/e2e_json.ps1 -Render <64\|86> [-Variant legacy]` | 本地模式 `--json` / `--out=<path>`：那一行 JSON 独占 stdout、字段齐全、`result` / `pid` / `detached` / `images` 口径、`--json` 与 `--server` 互斥（退出码 2）、退出码口径不变；那一行必须**纯 ASCII**（CP936 → UTF-8 或逐字节降级）。`-Variant legacy` **必须真过**（这段就是用来暴露 GBK 的） |
-| agent 技能包（T6） | `pwsh tools/agent/check_skill.ps1 -Render <64\|86>` | `tools/agent/autodbg-skill/` 是 CLI 口径下的**唯一对外契约文档**：检查 `SKILL.md` 的 frontmatter（`name` / `description`）并把每个 `.md` 里的 ` ```lua ` 片段交给产物做语法检查（只解析不执行）。14 条断言 / 36 个 Lua 片段 |
-| nvim 客户端（T5） | `pwsh tools/server_test/nvim_smoke.ps1 -Render <64\|86> [-Variant legacy]` | 起 `--server=tcp` → headless nvim 跑 `nvim_smoke.lua`：远程执行 + 结果 buffer、异步路径不出 `E5560`、语法错误 → chunkname + quickfix、`M.cancel`（控制帧）、health/version（`info`）、`open_file` 写/读回（帧上的 `open`/`data`/`close`/`read_req`）。24 条断言；**nvim 不在 PATH 时 SKIP** |
+| agent 技能包（T6） | `pwsh tools/agent/check_skill.ps1 -Render <64\|86>` | `tools/agent/autodbg-skill/` 是 CLI 口径下的**唯一对外契约文档**：检查 `SKILL.md` 的 frontmatter（`name` / `description`）并把每个 `.md` 里的 ` ```lua ` 片段交给产物做语法检查（只解析不执行）。14 条断言（6 条静态 + 8 个含 lua 块的 md）/ 39 个 Lua 片段 |
+| nvim 客户端（T5） | `pwsh tools/server_test/nvim_smoke.ps1 -Render <64\|86> [-Variant legacy]` | 起 `--server=tcp` → headless nvim 跑 `nvim_smoke.lua`：远程执行 + 结果 buffer、异步路径不出 `E5560`、语法错误 → chunkname + quickfix、`M.cancel`（控制帧）、health/version（`info`）、`open_file` 写/读回（帧上的 `open`/`data`/`close`/`read_req`）。31 条断言；**nvim 不在 PATH 时 SKIP** |
 | Win9x 实机 | `pwsh tools/w9x_test/w9x.ps1 -Action check\|run\|record` | 需要 VMware 的 Win98 guest 与凭据（`tools/w9x_test/config.local.ps1`，已 gitignore）；**没有 VM / 凭据时 SKIP（exit 0）**。矩阵与剩余项见 `plan.md` §1.3 |
 
 - 黄金输出在本仓库 `tests/golden/w9x/`（Win98 guest 的输出），行尾与比较口径见 D15（golden 统一 LF，比较走「CRLF→LF + 去末尾空行」归一化）。
@@ -145,7 +145,7 @@ src/core/            调试引擎（C++，禁 Lua）
   memory / pe / context / breakpoints / hardware_breakpoints / process / stack_trace / hide / util
 src/scripting/lua/   唯一感知 lua_State 的层
   bindings.cpp       29 个契约全局的薄封装（参数编组 → 调 core）+ on_wait_timeout
-  registry.cpp       register_lua_api()：29 个全局 + Var 元表 + gui 表 + read_file/write_file（后者在 feat/cli-tcp 上由 open_file 的文件对象承担，D44）
+  registry.cpp       register_lua_api()：29 个全局 + Var 元表 + `gui` 表（`read_file`/`write_file` 已随 T5/D44 删除——文件 I/O 只有 `open_file` 的文件对象）
   state              create_state_with_libs() / run_script_file() / 烘焙 lualib
   main.cpp           autodbg_run（唯一导出）+ CRT 兼容层
   server_config / tcp_server（raw TCP 服务端）/ client（`--remote`）/ exec / exec_guard / output /
@@ -161,7 +161,7 @@ src/sys/             零 CRT 运行时：影子头文件、*.def 导入表、x86
   lzma/              7-Zip LZMA（Public domain）：解码侧进产品，编码侧只给 tools/pack
 src/ScyllaHide/      第三方反反调试（只被 modern 变体链接）
 thirdpart/           Lua 5.5.1（子模块）与 LuaJIT（子模块）
-lualib/              烘焙进模块的 Lua 库（effects、inspect、jsonx、mcp、moses）
+lualib/              烘焙进模块的 Lua 库（inspect、jsonx、moses）
 nvim/                neovim 插件（子模块，独立仓库 AutoDbg.nvim）
 tools/               构建期：gen_lua_lib.lua / gen_hook_data.lua / pack（载荷生成）/ pever（PE 版本补丁）
                      测试与门禁：api_check（导入表）、server_test（e2e）、w9x_test（Win9x 实机）
@@ -370,17 +370,17 @@ payload              // 单条 LZMA 流：各模块原始字节按 entry 顺序�
 
 见 `PITFALLS.md` 的 O 节（输出与排障）与 M 节（映射器）。速记：模块里的 `Print*` / `Error*` 在非控制台下走 `WriteFile`、控制台里走 `WriteConsole`（重定向才能看到）；怀疑寄存器被写坏时用 `RtlCaptureContext` 抓 callee-saved 快照；回退链要带 `load_error.text`；负例判据用「已提交字节的双窗口增量」。
 
-## 12. 已实现的扩展面（server / GUI / MCP / client 文件 I/O）
+## 12. 已实现的扩展面（server / GUI / client 文件 I/O）
 
 > 这一段只记**现行接口约定**（改之前要知道的事实）；剩余工作与设计取舍见 `plan.md`。
-> ❗`plan_cli.md` 的 **D41–D50 已拍板**：MCP 与 HTTP 在 `feat/cli-tcp` 上整体删除，对外只剩 CLI + raw TCP 帧。下面被取代的条目（§12.1 的端点、§12.3 整节、§12.4 的效果协议）都在原地标注，落地前仍按现状读。
+> ❗D41–D50（原 `plan_cli.md`，现 `plan.md`）已全部落地：MCP 与 HTTP 已整体删除，对外只剩 CLI + raw TCP 帧。下面被取代的条目（§12.1 的端点、§12.3 整节、§12.4 的效果协议）只在原地留历史标注。
 
 ### 12.1 server 模式
 
 > ❗D41 / D42：HTTP 形态整体删除。`--server-*` 的语义保留（认证默认 D21 不变，token 走握手帧），`--server-max-body` → `--server-max-frame`，新增 `--server-read-timeout`（默认 **5000 ms**，单次文件操作）与 `--server-timeout`（整次执行 wall-clock）分开；端点改成帧，`--health` / `--version` 改由 CLI 经 TCP 提供。
 >
 > **T2 已落地（分支 `feat/cli-tcp`）**：`--server=tcp` 选 raw TCP 帧（`boot.server_mode = 2`，不需要新 ABI 字段）→
-> `src/scripting/lua/tcp_server.cpp`；`--server` / `--server=http` 仍是现行 HTTP（待删）。
+> `src/scripting/lua/tcp_server.cpp`；HTTP 半边已随 T5 删除：`--server` 就是 raw TCP，`--server=http` 直接报错（退码 2）。
 > 已实现：监听 + 串行 accept、握手帧（`id` = 协议版本、`data` = token、其余字段留 json 给执行侧）、
 > `script` → `out`/`result`/`end`、`control`（health/version → `info`；cancel → guard + `ack`；
 > kill/detach → 软动作 + `ack`；shutdown → `ack` + 停机）、**执行期的两个 poll 点**
@@ -454,7 +454,7 @@ payload              // 单条 LZMA 流：各模块原始字节按 entry 顺序�
 - 本地模式：buffer 写到临时文件跑完即删（AutoDbg 只接受脚本路径），临时路径在输出里被换回 buffer 名（quickfix 仍可用）；默认带 `--quiet`（免 headless 被 MessageBox 挂住）；flavor 由脚本自己的 `--!lua`/`--!luajit` 决定。
 - 远程模式：`vim.system` + `curl`（非流式）或 `vim.uv` TCP（**流式，默认**）；结果落 scratch buffer，`<file>:<line>:` 进 quickfix；默认响应格式 **JSON**（D33）。
   ❗uv 回调是 **fast event context**：里面不能调 nvim API，`on_done` 一律 `vim.schedule`（`PITFALLS.md` N12）。
-- 客户端效果循环在 `nvim/lua/autodbg/effects.lua`（base64 + `exec_effect`，≤16 轮，把每轮 `stdout_so_far` 拼回最终结果）。
+- 客户端只剩 raw TCP 帧（`nvim/lua/autodbg/tcp.lua`）：`open_file` 的读写都走帧；效果循环与 `http.lua` 已随 D41/D44 删除。
 - **脚本头标记（modeline）**：`nvim/lua/autodbg/modeline.lua` 解析前/后 5 行里的
   `--!autodbg url=… token=… / host=… port=… / exe=… / arch=x86|x64`（也认 `-- autodbg:` / `-- adbg:`），
   **覆盖 `setup{}` 的默认值**；裸 `--!autodbg` 只做标记。
@@ -527,7 +527,7 @@ payload              // 单条 LZMA 流：各模块原始字节按 entry 顺序�
 | D33 | nvim 插件默认响应格式 | **JSON**（要渲染 `exit`/`canceled`/`timed_out`/`truncated`）；`format="text"` 仍可配 |
 | D34 | 文本注入策略 + 焦点 | 可打印 ASCII 走「VK + Shift」；非 ASCII 才用 `KEYEVENTF_UNICODE`；另有 `gui.focus(hwnd)` |
 | D35 | MCP 会话契约 | 会话只经 **`Mcp-Session-Id` 头**表达；**不做** REST 的 `/session` CRUD |
-| D36 | SSE/流式形态 | `Accept: text/event-stream` → `chunked` + **单事件**；增量推帧留待后续（见 `plan_server.md`） |
+| D36 | SSE/流式形态 | `Accept: text/event-stream` → `chunked` + **单事件**；增量推帧留待后续（已随 HTTP 作废，见 `plan.md` §3） |
 | D37 | client 文件 I/O 机制 | **协程挂起 + 效果协议**（`read_file`/`write_file` → `yield` 效果表 → 客户端本地执行 → `POST /effects` 恢复）；不重放脚本、不碰客户端磁盘 |
 | D38 | 挂起/恢复的落地细节 | ①`/run` 也跑在协程里，完成即关、挂起则留；②MCP 用 `call_yielding` 让 yield 穿透 pcall；③`lualib/effects.lua` 顶层不能取 `jsonx`（按文件名烘焙，effects 先于 jsonx） |
 | D39 | nvim 插件的运行模式 | **本地优先**：标记 `exe=` > `setup.exe` > PATH 里的 `AutoDbg_{64,86}.exe`，拿到就跑本地；拿不到（或标记的 exe 不存在）→ **回落远程**（用 `url`/`host`/`port`）。`mode = "remote"` 强制远程，`mode = "local"` 则必须本地（找不到报错，不静默回落） |
