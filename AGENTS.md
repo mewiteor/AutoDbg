@@ -18,6 +18,7 @@
 | `AGENTS.md`（本文） | 工作约定：构建 / 门禁 / 约束 / 风格 / 架构 / 打包 ABI / 已定决策 |
 | `PITFALLS.md` | **已踩过的坑**（现象 → 根因 → 现在的做法），改代码前先扫对应小节 |
 | `plan.md` | **剩余工作**（Win9x 矩阵、server/GUI 实测、CLI/帧协议尾巴）——原 `plan_p7_win9x.md`、`plan_server.md`、`plan_cli.md` 已合并到这里 |
+| `plan_t7.md` | **T7（低级引擎 API + REPL）的独立计划**——在分支 `feat/t7-low-level-api` 上推进（`plan.md` §1.1 第 6 条是它的出处） |
 | `nvim/README.md` | neovim 插件的安装、配置与命令 |
 
 ## 1. 构建
@@ -186,6 +187,7 @@ tests/golden/w9x/    Win98 guest 的黄金输出
 | `AGENTS.md`（本文） | 构建 / 门禁 / 约束 / 风格 / 架构 / 打包 ABI / 已定决策 |
 | `PITFALLS.md` | 已踩过的坑，按「构建 / 零 CRT / 模块映射 / Lua / 输出 / server / nvim / Win9x / 门禁」分类 |
 | `plan.md` | **剩余工作**（Win9x 矩阵、server/GUI 实测与文档同步、CLI/帧协议尾巴）——三份 plan 的合并版 |
+| `plan_t7.md` | T7 的独立计划：状态机（begin/pump/cont/end）、「不能没有」的数据面原语、REPL 与协议归因、AI + IDA MCP 的缺口 |
 | `nvim/README.md` | neovim 插件的安装、配置、命令与可编程 API |
 | `tools/agent/autodbg-skill/` | **面向 agent 的技能包**（Agent Skills 格式）：`SKILL.md` 入口 + `references/`（CLI / Lua API / 地雷）+ `recipes/`（5 个场景）。CLI 口径下的唯一对外契约文档 |
 | `make.bat` | 构建定义（ninja 生成器） |
