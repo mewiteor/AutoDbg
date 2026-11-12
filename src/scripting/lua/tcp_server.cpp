@@ -19,6 +19,7 @@
  * ========================================================================== */
 #include "tcp_server.hpp"
 
+#include "file_io.hpp"    /* T4（D44）：set_client_io —— open_file 指向客户端那台机器 */
 #include "exec.hpp"        /* exec_script：一次性执行（D22/D43） */
 #include "exec_guard.hpp"  /* guard_exec_begin / request_cancel / soft action */
 #include "output.hpp"      /* output_begin / output_end：stdout 收进缓冲并发 `out` 帧 */
@@ -798,6 +799,9 @@ int tcp_server_main(const autodbg_boot *boot)
     PrintF("autodbg server(tcp): max_frame=%u timeout=%us echo=%s winsock=%s\n", cfg.max_body, cfg.timeout_sec,
            cfg.echo ? "on" : "off",
            (autodbg::common::net_module_name() != nullptr) ? autodbg::common::net_module_name() : "(none)");
+
+    /* T4（D44）：server 模式下 open_file 指向**客户端**那台机器（帧协议），不是本机磁盘。 */
+    autodbg::host::set_client_io(true);
 
     /* ---- worker 线程 + 单槽队列 ---- */
     g_boot = boot;

@@ -36,6 +36,10 @@ void register_file_api(lua_State *L);
 /* 注册 `open_file` 与文件对象（流式 client 文件 I/O；实现见 `file_stream.cpp`） */
 void register_stream_file_api(lua_State *L);
 
+/* T4（D45）：一次文件操作（等客户端回包）的等待上限；默认 5000 ms。
+ * 宿主层用 `boot->read_timeout_ms` 覆盖（ABI 4 的 `--read-timeout=`）。 */
+void set_client_read_timeout(unsigned ms);
+
 /* ---- 给宿主（server）用的效果协议助手 ---- */
 /* 把「协程里 yield 出来的效果表」（idx 处）序列化成 JSON：
  *   { "id":1, "op":"read_file", "path":"…", "offset":0, "length":0 }

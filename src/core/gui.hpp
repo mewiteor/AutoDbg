@@ -84,6 +84,10 @@ bool  window_focus(HWND hwnd);
 bool  window_text(HWND hwnd, TCHAR *out, size_t cap);
 bool  window_set_text(HWND hwnd, LPCTSTR text);
 unsigned window_foreground_pid();
+
+/* T4（D48）：鼠标选取目标（GetCursorPos → WindowFromPoint → GetWindowThreadProcessId）。\
+ * 取不到（无交互桌面）→ 降级到前台窗口；都不行 → false。 */
+bool window_pick(unsigned *pid, HWND *hwnd);
 bool  window_center(HWND hwnd, int *x, int *y); /* 窗口中心点（屏幕坐标） */
 bool  window_post(HWND hwnd, unsigned msg, unsigned wparam, unsigned lparam);
 bool  window_send(HWND hwnd, unsigned msg, unsigned wparam, unsigned lparam, size_t *result);

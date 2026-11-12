@@ -26,6 +26,7 @@
 #include "core/core.hpp" /* DebuggerSession + set_current_session */
 #include "core/util.hpp" /* E / ErrorS / Error / ErrorN / macro helpers */
 #include "state.hpp"     /* run_script_file / g_wfilepath */
+#include "file_io.hpp"    /* T4：set_client_read_timeout（等回包的上限） */
 #include "client.hpp"    /* T3（D42）：`--remote` 客户端模式 */
 #include "server.hpp"    /* S0：server 模式入口（plan_server.md §3.1 / D27） */
 #include "output.hpp"    /* T1（D50）：stdout/stderr 分桶 + `images` 登记表 */
@@ -418,6 +419,10 @@ extern "C" __declspec(dllexport) int __cdecl autodbg_run(const autodbg_boot *boo
     }
 
     /* ---- S0（plan_server.md D27）：这两个模式都不需要脚本 → 在拆命令行之前分流 ---- */
+    /* T4（D45）：一次文件操作/等回包的上限来自 ABI 4 的 --read-timeout；
+     * ❗必须在 server / client 分流**之前**设：server 自己也要用它等客户端回包。 */
+    autodbg::host::set_client_read_timeout(boot->read_timeout_ms);
+
     if (boot->selftest != 0)
         return run_selftest_mode();
     if (boot->server_mode != 0)

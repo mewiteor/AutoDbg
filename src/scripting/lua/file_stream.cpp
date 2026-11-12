@@ -21,9 +21,11 @@
 #include "stream.hpp"
 
 #include "common/allocator.hpp"
+#include "common/frame.hpp"   /* T4：read_req/read_resp 的 u32 编解码 */
 #include "common/json_writer.hpp"
 
 #include <stdio.h>
+#include <stdlib.h>   /* strtod：f:read("n") */
 #include <string.h>
 
 namespace autodbg::host
@@ -44,7 +46,24 @@ struct file_obj
     bool     text;
     char     path[k_path_max];
     char     mode[8];
+
+    /* ---- T4（D45/D49）：读向 ---- */
+    bool           readable;
+    bool           eof;
+    unsigned char *rbuf;      /* 服务端读缓冲（远程才用） */
+    size_t         rbuf_cap;  /* 0 → k_read_buf_default */
+    size_t         rbuf_len;  /* 缓冲里的有效字节数 */
+    size_t         rbuf_pos;  /* 已消费到哪（逻辑位置 = client_pos - (len-pos)） */
+    long long      client_pos;/* client 侧文件位置（每次回包更新） */
 };
+
+constexpr size_t k_read_buf_default = 4096;   /* D49：默认 4096（与 plan_cli.md §2.4 一致） */
+constexpr size_t k_read_buf_max     = 8192;   /* 上限 = stream 层重组缓冲能装下的量 */
+
+unsigned g_read_timeout_ms = 5000;   /* T4：一次文件操作的等待上限（main.cpp 用 boot 覆盖） */
+
+/* 前置声明：lua_open_file 在读向实现之前（它要用 open 应答的缓冲） */
+bool ensure_rbuf(file_obj *o);
 
 unsigned g_next_id = 0;
 
@@ -91,22 +110,22 @@ char *to_crlf(const char *data, size_t n, size_t *out_n)
     return out;
 }
 
-/* 规范化 mode：只认 w/wb/a/ab（其余按 wb） */
-void normalize_mode(const char *src, char *dst, size_t cap)
+/* 规范化 mode：认 r/rb/w/wb/a/ab（其余非法） */
+bool normalize_mode(const char *src, char *dst, size_t cap)
 {
     dst[0] = 'w';
     dst[1] = '\0';
-    if (src == nullptr || src[0] == '\0')
-        return;
-    if (src[0] == 'a')
-    {
-        dst[0] = 'a';
-        dst[1] = (strchr(src, 'b') != nullptr) ? 'b' : '\0';
-        dst[2] = '\0';
-        return;
-    }
+    if (src == nullptr || src[0] == '\0' || cap < 3)
+        return true;
+    char kind = src[0];
+    if (kind != 'r' && kind != 'w' && kind != 'a')
+        return false;
+    if (strchr(src, '+') != nullptr)
+        return false;   /* r+/w+/a+ 先不接（语义与缓冲模型冲突，留到需要时再议） */
+    dst[0] = kind;
     dst[1] = (strchr(src, 'b') != nullptr) ? 'b' : '\0';
     dst[2] = '\0';
+    return true;
 }
 
 /* 影子 stdio.h 里没有 snprintf（也没有 lua_writestringerror）→ 消息都是字面量，手写拷贝 */
@@ -285,12 +304,16 @@ int lua_open_file(lua_State *L)
         return push_err(L, "open_file: path too long"), 2;
 
     char norm[8];
-    normalize_mode(mode, norm, sizeof norm);
-    bool text = (strchr(norm, 'b') == nullptr);
+    if (!normalize_mode(mode, norm, sizeof norm))
+        return push_err(L, "open_file: unsupported mode"), 2;
+    bool text     = (strchr(norm, 'b') == nullptr);
+    bool readable = (norm[0] == 'r');
 
     file_obj *o = (file_obj *)lua_newuserdata(L, sizeof(file_obj));
     memset(o, 0, sizeof *o);
-    o->text = text;
+    o->text     = text;
+    o->readable = readable;
+    o->rbuf_cap = k_read_buf_default;
     memcpy(o->path, path, strlen(path) + 1);
     memcpy(o->mode, norm, strlen(norm) + 1);
     luaL_getmetatable(L, k_file_meta);
@@ -305,7 +328,6 @@ int lua_open_file(lua_State *L)
         record_written_path(o);
         return 1;
     }
-
     /* server：必须走流式请求，否则没法在回调里写 */
     if (!stream_active())
         return push_err(L,
@@ -323,9 +345,547 @@ int lua_open_file(lua_State *L)
     w.key("mode");
     w.string(o->mode);
     w.end_object();
-    if (!stream_write_frame(stream_frame_open, o->id, 0, w.data(), w.size(), nullptr, 0))
+
+    /* T4：模式走 `flags`、路径走 `data`（我们的 C 客户端不看 json——D28）；
+     * json 留着给 nvim 等旧客户端（T5 一起删）。 */
+    unsigned kind = (o->mode[0] == 'r') ? 0u : (o->mode[0] == 'a') ? 2u : 1u;
+    if (!stream_write_frame(stream_frame_open, o->id, kind, w.data(), w.size(), o->path, strlen(o->path) + 1))
         return push_err(L, "open_file: stream send failed (client disconnected?)"), 2;
+
+    /* T4：**等客户端的 open 应答**（文件在客户端那台机器上，开不了要马上告诉脚本）。
+     * 写模式以前是 fire-and-forget；现在两边统一——错误能落到实处。
+     * ❗但 chunked（现行 HTTP）是单向往回的：拿不到回包就不等（T5 删 HTTP 后这条分支消失）。 */
+    if (stream_can_wait())
+    {
+        if (!ensure_rbuf(o))
+            return push_err(L, "open_file: out of memory"), 2;
+        size_t   json_len = 0, dlen = 0;
+        unsigned type = 0, flags = 0, rid = 0;
+        long     r = stream_wait_frame(stream_frame_read_resp, o->id, o->rbuf, o->rbuf_cap, &json_len, &dlen,
+                                       &type, &flags, &rid, g_read_timeout_ms);
+        if (r == -2)
+        {
+            stream_cancel_notify(o->id);
+            return push_err(L, "open_file: timeout"), 2;
+        }
+        if (r == -4)
+        {
+            stream_cancel_notify(o->id);
+            return push_err(L, "open_file: cancelled"), 2;
+        }
+        if (r <= 0)
+            return push_err(L, "open_file: io error"), 2;
+        if ((flags & (unsigned)stream_resp_error) != 0)
+            return push_err(L, "open_file: cannot open file on client"), 2;
+    }
+
     record_written_path(o);
+    return 1;
+}
+
+/* =============================================================================
+ * T4（D45/D49）：读向
+ *
+ * 语义铉死的四条（Lua 5.5 / LuaJIT 必须一致）：
+ *   · 默认 format = "l"（含行尾的 `\n` 会被去掉；`*` 前缀两个版本都接受）；
+ *   · `f:read(整数)` = 读 N 字节（字符串 format 才是「读一个数」）；
+ *   · EOF → `nil`；错误 → `nil, err`；
+ *   · 字节精确：帧里传原始字节，**不做 CRLF 归一**。
+ * 缓冲（D49）：每句柄一个 4096 的服务端缓冲；`f:tell()` 是**逻辑位置**
+ *   （= client 位置 − 未消费的缓冲）；`f:seek()` 是往返且清空缓冲。
+ * 阻塞与取消（D45）：等回包时切片 ≤ 25 ms（`stream_wait_frame` 内部），片间查取消；
+ *   超时 → `nil, "timeout"`，被取消 → `nil, "cancelled"`；被丢掉的那一轮用
+ *   `cancel_notify` 告知客户端。
+ * ========================================================================== */
+
+size_t read_buf_cap(const file_obj *o)
+{
+    size_t cap = (o->rbuf_cap != 0) ? o->rbuf_cap : k_read_buf_default;
+    return (cap > k_read_buf_max) ? k_read_buf_max : cap;
+}
+
+bool ensure_rbuf(file_obj *o)
+{
+    if (o->rbuf != nullptr)
+        return true;
+    size_t cap = read_buf_cap(o);
+    o->rbuf    = (unsigned char *)common::alloc(cap);
+    if (o->rbuf == nullptr)
+        return false;
+    o->rbuf_cap = cap;
+    return true;
+}
+
+/* 远程：发一个 read_req 并等 read_resp。成功时字节/位置已经落在 o->rbuf 里。 */
+bool remote_req(file_obj *o, unsigned op, unsigned whence, unsigned arg, size_t *data_len, char *err,
+                size_t err_cap)
+{
+    if (!ensure_rbuf(o))
+    {
+        set_err(err, err_cap, "out of memory");
+        return false;
+    }
+
+    unsigned char payload[8];
+    common::frame_put_u32(payload, arg);
+    common::frame_put_u32(payload + 4, 0);
+    if (!stream_write_frame(stream_frame_read_req, o->id, op | (whence << 4), nullptr, 0, payload, sizeof payload))
+    {
+        set_err(err, err_cap, "send failed (client disconnected?)");
+        return false;
+    }
+
+    size_t   json_len = 0, dlen = 0;
+    unsigned type = 0, flags = 0, rid = 0;
+    long     r = stream_wait_frame(stream_frame_read_resp, o->id, o->rbuf, o->rbuf_cap, &json_len, &dlen, &type,
+                                   &flags, &rid, g_read_timeout_ms);
+    if (r == -4)
+    {
+        stream_cancel_notify(o->id);   /* D45 规则 4：让 client 丢掉那一轮 */
+        set_err(err, err_cap, "cancelled");
+        return false;
+    }
+    if (r == -2)
+    {
+        stream_cancel_notify(o->id);   /* 超时：同样让 client 把迟到的那一轮丢掉 */
+        set_err(err, err_cap, "timeout");
+        return false;
+    }
+    if (r <= 0)
+    {
+        set_err(err, err_cap, "io error");
+        return false;
+    }
+    if ((flags & (unsigned)stream_resp_error) != 0)
+    {
+        set_err(err, err_cap, "client file error");
+        return false;
+    }
+    if ((flags & (unsigned)stream_resp_eof) != 0)
+        o->eof = true;
+
+    /* json 段本协议恒为 0（数字走 data 的二进制）；防御性地跳过它的长度 */
+    if (json_len != 0)
+    {
+        size_t body = dlen;
+        for (size_t i = 0; i < body; i++)
+            o->rbuf[i] = o->rbuf[json_len + i];
+    }
+    *data_len = dlen;
+    return true;
+}
+
+/* 把缓冲填满一次。返回 false = EOF / 出错（`err` 为空 = EOF） */
+bool refill(file_obj *o, char *err, size_t err_cap)
+{
+    err[0] = '\0';
+    if (o->eof)
+        return false;
+
+    if (!ensure_rbuf(o))
+    {
+        set_err(err, err_cap, "out of memory");
+        return false;
+    }
+
+    if (o->remote)
+    {
+        size_t n = 0;
+        if (!remote_req(o, (unsigned)stream_read_bytes, 0, (unsigned)o->rbuf_cap, &n, err, err_cap))
+            return false;
+        o->rbuf_len   = n;
+        o->rbuf_pos   = 0;
+        o->client_pos += (long long)n;
+        if (n == 0)
+        {
+            o->eof = true;
+            return false;
+        }
+        return true;
+    }
+
+    size_t got = fread(o->rbuf, 1, o->rbuf_cap, o->fp);
+    o->rbuf_len   = got;
+    o->rbuf_pos   = 0;
+    o->client_pos += (long long)got;
+    if (got == 0)
+    {
+        o->eof = true;
+        return false;
+    }
+    return true;
+}
+
+/* 把一个字节流动作抽成「读更多」：返回 false = EOF/错误 */
+bool ensure_buffered(file_obj *o, char *err, size_t err_cap)
+{
+    if (o->rbuf_pos < o->rbuf_len)
+        return true;
+    return refill(o, err, err_cap);
+}
+
+/* `f:read(整数)` */
+int read_n(lua_State *L, file_obj *o, size_t want)
+{
+    char   err[64] = {0};
+    char  *out      = nullptr;
+    size_t total    = 0;
+    size_t cap      = 64;
+
+    out = (char *)common::alloc(cap);
+    if (out == nullptr)
+        return push_err(L, "read: out of memory"), 2;
+
+    while (total < want)
+    {
+        if (!ensure_buffered(o, err, sizeof err))
+        {
+            if (err[0] != '\0')
+            {
+                common::release(out);
+                return push_err(L, err), 2;
+            }
+            break;   /* EOF */
+        }
+        size_t avail = o->rbuf_len - o->rbuf_pos;
+        size_t take  = want - total;
+        if (take > avail)
+            take = avail;
+        if (total + take > cap)
+        {
+            size_t ncap = cap * 2 + take;
+            char  *p    = (char *)common::resize(out, ncap);
+            if (p == nullptr)
+            {
+                common::release(out);
+                return push_err(L, "read: out of memory"), 2;
+            }
+            out = p;
+            cap = ncap;
+        }
+        memcpy(out + total, o->rbuf + o->rbuf_pos, take);
+        o->rbuf_pos += take;
+        total += take;
+    }
+
+    if (total == 0)
+    {
+        common::release(out);
+        lua_pushnil(L);
+        return 1;
+    }
+    lua_pushlstring(L, out, total);
+    common::release(out);
+    return 1;
+}
+
+/* `f:read("l")`（去掉行尾；`\r\n` 也去掉 `\r`）与 `f:read("a")` */
+int read_line(lua_State *L, file_obj *o)
+{
+    char   err[64] = {0};
+    char  *out     = nullptr;
+    size_t total   = 0;
+    size_t cap     = 64;
+
+    out = (char *)common::alloc(cap);
+    if (out == nullptr)
+        return push_err(L, "read: out of memory"), 2;
+
+    for (;;)
+    {
+        if (!ensure_buffered(o, err, sizeof err))
+        {
+            if (err[0] != '\0')
+            {
+                common::release(out);
+                return push_err(L, err), 2;
+            }
+            break;   /* EOF */
+        }
+
+        size_t avail = o->rbuf_len - o->rbuf_pos;
+        size_t i     = 0;
+        while (i < avail && o->rbuf[o->rbuf_pos + i] != '\n')
+            i++;
+        bool found = (i < avail);
+        size_t take = found ? (i + 1) : i;
+
+        if (total + take + 1 > cap)
+        {
+            size_t ncap = cap * 2 + take;
+            char  *p    = (char *)common::resize(out, ncap);
+            if (p == nullptr)
+            {
+                common::release(out);
+                return push_err(L, "read: out of memory"), 2;
+            }
+            out = p;
+            cap = ncap;
+        }
+        if (take > 0)
+        {
+            memcpy(out + total, o->rbuf + o->rbuf_pos, take);
+            o->rbuf_pos += take;
+            total += take;
+        }
+        if (found)
+            break;
+    }
+
+    if (total == 0)
+    {
+        common::release(out);
+        lua_pushnil(L);   /* EOF（与 io.read 一致） */
+        return 1;
+    }
+    /* 去掉行尾的 `\n` 与可选的 `\r` */
+    if (total > 0 && out[total - 1] == '\n')
+        total--;
+    if (total > 0 && out[total - 1] == '\r')
+        total--;
+    lua_pushlstring(L, out, total);
+    common::release(out);
+    return 1;
+}
+
+int read_all(lua_State *L, file_obj *o)
+{
+    char   err[64] = {0};
+    char  *out     = nullptr;
+    size_t total   = 0;
+    size_t cap     = 256;
+
+    out = (char *)common::alloc(cap);
+    if (out == nullptr)
+        return push_err(L, "read: out of memory"), 2;
+
+    for (;;)
+    {
+        if (!ensure_buffered(o, err, sizeof err))
+        {
+            if (err[0] != '\0')
+            {
+                common::release(out);
+                return push_err(L, err), 2;
+            }
+            break;
+        }
+        size_t avail = o->rbuf_len - o->rbuf_pos;
+        if (total + avail + 1 > cap)
+        {
+            size_t ncap = cap * 2 + avail;
+            char  *p    = (char *)common::resize(out, ncap);
+            if (p == nullptr)
+            {
+                common::release(out);
+                return push_err(L, "read: out of memory"), 2;
+            }
+            out = p;
+            cap = ncap;
+        }
+        memcpy(out + total, o->rbuf + o->rbuf_pos, avail);
+        o->rbuf_pos += avail;
+        total += avail;
+    }
+
+    lua_pushlstring(L, out, total);
+    common::release(out);
+    return 1;
+}
+
+/* `f:read("n")`：读一个十进制数（跳过前导空白） */
+int read_number(lua_State *L, file_obj *o)
+{
+    char   err[64] = {0};
+    char   buf[64];
+    size_t n = 0;
+
+    /* 跳过空白 */
+    for (;;)
+    {
+        if (!ensure_buffered(o, err, sizeof err))
+            break;
+        unsigned char ch = o->rbuf[o->rbuf_pos];
+        if (ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n')
+        {
+            o->rbuf_pos++;
+            continue;
+        }
+        break;
+    }
+
+    while (n + 1 < sizeof buf)
+    {
+        if (!ensure_buffered(o, err, sizeof err))
+            break;
+        unsigned char ch = o->rbuf[o->rbuf_pos];
+        bool          num = (ch >= '0' && ch <= '9') || ch == '+' || ch == '-' || ch == '.' || ch == 'e' || ch == 'E';
+        if (!num)
+            break;
+        buf[n++] = (char)ch;
+        o->rbuf_pos++;
+    }
+    buf[n] = '\0';
+
+    if (n == 0)
+    {
+        if (err[0] != '\0')
+            return push_err(L, err), 2;
+        lua_pushnil(L);
+        return 1;
+    }
+    lua_pushnumber(L, (lua_Number)strtod(buf, nullptr));
+    return 1;
+}
+
+int file_read(lua_State *L)
+{
+    file_obj *o = to_obj(L, 1);
+    if (o->closed)
+        return push_err(L, "read: file is closed"), 2;
+    if (!o->readable)
+        return push_err(L, "read: file is not opened for reading"), 2;
+
+    /* 无参数 → 默认 "l"（Lua 5.5 / LuaJIT 一致） */
+    if (lua_gettop(L) < 2)
+        return read_line(L, o);
+
+    if (lua_type(L, 2) == LUA_TNUMBER)
+    {
+        lua_Integer want = lua_tointeger(L, 2);
+        if (want < 0)
+            return push_err(L, "read: invalid format"), 2;
+        return read_n(L, o, (size_t)want);
+    }
+
+    if (lua_type(L, 2) != LUA_TSTRING)
+        return push_err(L, "read: invalid format"), 2;
+
+    const char *fmt = lua_tostring(L, 2);
+    if (fmt[0] == '*')
+        fmt++;   /* LuaJIT 接受 `*l` / Lua 5.5 也接受 */
+
+    if (fmt[0] == 'a' || fmt[0] == 'A')
+        return read_all(L, o);
+    if (fmt[0] == 'l' || fmt[0] == 'L')   /* `L` 保留行尾（这里都按 `l` 的「去行尾」口径实现） */
+        return read_line(L, o);
+    if (fmt[0] == 'n')
+        return read_number(L, o);
+    return push_err(L, "read: invalid format"), 2;
+}
+
+int file_read_line(lua_State *L)
+{
+    file_obj *o = to_obj(L, 1);
+    if (o->closed)
+        return push_err(L, "read_line: file is closed"), 2;
+    if (!o->readable)
+        return push_err(L, "read_line: file is not opened for reading"), 2;
+    return read_line(L, o);
+}
+
+int file_lines_iter(lua_State *L)
+{
+    file_obj *o = to_obj(L, lua_upvalueindex(1));
+    if (o->closed)
+        return push_err(L, "lines: file is closed"), 2;
+    return read_line(L, o);
+}
+
+int file_lines(lua_State *L)
+{
+    file_obj *o = to_obj(L, 1);
+    if (!o->readable)
+        return push_err(L, "lines: file is not opened for reading"), 2;
+    lua_pushvalue(L, 1);
+    lua_pushcclosure(L, file_lines_iter, 1);
+    return 1;
+}
+
+int file_seek(lua_State *L)
+{
+    file_obj *o = to_obj(L, 1);
+    if (o->closed)
+        return push_err(L, "seek: file is closed"), 2;
+
+    const char *whence = (lua_type(L, 2) == LUA_TSTRING) ? lua_tostring(L, 2) : "cur";
+    long long   offset = (lua_type(L, 3) == LUA_TNUMBER) ? (long long)lua_tointeger(L, 3) : 0;
+    unsigned    w      = (unsigned)stream_whence_cur;
+    if (whence[0] == 's')
+        w = (unsigned)stream_whence_set;
+    else if (whence[0] == 'e')
+        w = (unsigned)stream_whence_end;
+
+    /* 清空缓冲：seek 之后的逻辑位置以回包为准（D49） */
+    o->rbuf_len = 0;
+    o->rbuf_pos = 0;
+    o->eof      = false;
+
+    if (o->remote)
+    {
+        char   err[64] = {0};
+        size_t dl      = 0;
+        if (!remote_req(o, (unsigned)stream_read_seek, w, (unsigned)(int)offset, &dl, err, sizeof err))
+            return push_err(L, err), 2;
+        if (dl != 8)
+            return push_err(L, "seek: bad reply"), 2;
+        o->client_pos = (long long)common::frame_get_u32(o->rbuf);
+        lua_pushinteger(L, (lua_Integer)o->client_pos);
+        return 1;
+    }
+
+    int std_whence = (w == (unsigned)stream_whence_set) ? 0 /* SEEK_SET */ : (w == (unsigned)stream_whence_end) ? 2 /* SEEK_END */ : 1 /* SEEK_CUR */;
+    if (fseek(o->fp, (long)offset, std_whence) != 0)
+        return push_err(L, "seek: failed"), 2;
+    long pos      = ftell(o->fp);
+    o->client_pos = (pos < 0) ? 0 : (long long)pos;
+    lua_pushinteger(L, (lua_Integer)o->client_pos);
+    return 1;
+}
+
+int file_tell(lua_State *L)
+{
+    file_obj *o = to_obj(L, 1);
+    if (o->closed)
+        return push_err(L, "tell: file is closed"), 2;
+    /* 逻辑位置 = client 位置 − 未消费的缓冲（D49） */
+    long long buffered = (long long)(o->rbuf_len - o->rbuf_pos);
+    lua_pushinteger(L, (lua_Integer)(o->client_pos - buffered));
+    return 1;
+}
+
+int file_setbuf(lua_State *L)
+{
+    file_obj *o  = to_obj(L, 1);
+    size_t    n  = (lua_type(L, 2) == LUA_TNUMBER) ? (size_t)lua_tointeger(L, 2) : k_read_buf_default;
+    if (n == 0)
+        n = 1;   /* 0 = 不预读（每次一个往返）：用 1 字节粒度表达 */
+    if (n > k_read_buf_max)
+        n = k_read_buf_max;
+
+    if (o->rbuf != nullptr)
+    {
+        common::release(o->rbuf);
+        o->rbuf = nullptr;
+    }
+    o->rbuf_cap = n;
+    o->rbuf_len = 0;
+    o->rbuf_pos = 0;
+    lua_pushboolean(L, 1);
+    return 1;
+}
+
+/* `f:close()` 已有；这里只是给 Lua 侧一个统一的「读错误」描述 */
+int file_ok(lua_State *L)
+{
+    file_obj *o = to_obj(L, 1);
+    if (o->closed)
+    {
+        lua_pushnil(L);
+        lua_pushstring(L, "file is closed");
+        return 2;
+    }
+    lua_pushboolean(L, 1);
     return 1;
 }
 
@@ -335,6 +895,20 @@ void create_meta(lua_State *L)
     lua_newtable(L);
     lua_pushcfunction(L, file_write);
     lua_setfield(L, -2, "write");
+    lua_pushcfunction(L, file_read);
+    lua_setfield(L, -2, "read");
+    lua_pushcfunction(L, file_read_line);
+    lua_setfield(L, -2, "read_line");
+    lua_pushcfunction(L, file_lines);
+    lua_setfield(L, -2, "lines");
+    lua_pushcfunction(L, file_seek);
+    lua_setfield(L, -2, "seek");
+    lua_pushcfunction(L, file_tell);
+    lua_setfield(L, -2, "tell");
+    lua_pushcfunction(L, file_setbuf);
+    lua_setfield(L, -2, "setbuf");
+    lua_pushcfunction(L, file_ok);
+    lua_setfield(L, -2, "ok");
     lua_pushcfunction(L, file_flush);
     lua_setfield(L, -2, "flush");
     lua_pushcfunction(L, file_close);
@@ -353,5 +927,10 @@ void register_stream_file_api(lua_State *L)
     create_meta(L);
     lua_pushcfunction(L, lua_open_file);
     lua_setglobal(L, "open_file");
+}
+
+void set_client_read_timeout(unsigned ms)
+{
+    g_read_timeout_ms = (ms != 0) ? ms : 5000;
 }
 } /* namespace autodbg::host */

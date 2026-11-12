@@ -28,6 +28,8 @@
 #      cancel / kill / detach —— 都不需要等脚本跑完
 #   ⑫ 客户端 `--remote`（T3）：跑脚本 / `--json` 信封 / 语法错误透传 / health / version /
 #      **另一个进程的 `--cancel`**（accept 线程接控制连接）/ 无 `--remote` 时拒绝控制命令
+#   ⑬ `open_file` 读向（T4/D45）：远程 open 应答、read/tell/seek/lines 的字节与位置语义、
+#      **等回包超时 → nil,"timeout" 且脚本继续**（用一个故意不回 read_req 的假客户端）
 # =============================================================================
 [CmdletBinding()]
 param(
@@ -436,6 +438,79 @@ With-Server @() {
     $null = $rp.WaitForExit(8000)
     Check 'client.cancel-ends-runner' $rp.HasExited 'runner still running'
     if (-not $rp.HasExited) { $rp.Kill() }
+}
+
+# ------------------------------------------- ⑬ open_file 读向（T4 / D45 / D49）
+$dataFile = Join-Path $TmpDir 'data.txt'
+[System.IO.File]::WriteAllText($dataFile, "alpha`nbeta`ngamma`n", (New-Object System.Text.UTF8Encoding($false)))
+
+# ① 真客户端跑一个读脚本：open 往返 + read("l") + read(N) + tell（逻辑位置）+ seek + lines
+$readLua = Join-Path $TmpDir 'read.lua'
+[System.IO.File]::WriteAllText($readLua, @"
+local f, err = open_file('$($dataFile.Replace('\', '/'))', 'rb')
+if not f then print('open-failed ' .. tostring(err)) return end
+print('line1=' .. tostring(f:read('l')))
+print('bytes3=' .. tostring(f:read(3)))
+print('tell=' .. f:tell())
+print('seek0=' .. f:seek('set', 0))
+print('line2=' .. tostring(f:read('l')))
+local n = 0
+for line in f:lines() do n = n + 1 end
+print('lines=' .. n)
+f:close()
+"@, (New-Object System.Text.UTF8Encoding($false)))
+
+With-Server @() {
+    param($c)
+    $null = $c
+    $r = Run-Client @("--remote=127.0.0.1:$Port", $readLua)
+    Check 'open.read-lines' ($r.code -eq 0 -and $r.out -match 'line1=alpha' -and $r.out -match 'line2=alpha' -and $r.out -match 'lines=2') `
+        "code=$($r.code) out=[$($r.out)] err=[$($r.err)]"
+    Check 'open.read-bytes-and-tell' ($r.out -match 'bytes3=bet' -and $r.out -match 'tell=9') "out=[$($r.out)]"
+    Check 'open.seek-roundtrip' ($r.out -match 'seek0=0') "out=[$($r.out)]"
+}
+
+# ② 超时：假客户端回 open 的 ok，但**永不回 read_req** → 脚本拿到 nil,"timeout" 且继续往下跑
+# 服务端的等待上限由 `--read-timeout=400` 给（ABI 4 的字段）
+$toSrc = @'
+local f = open_file([[C:/ProgramData/Temp/autodbg_tcp_e2e/data.txt]], 'rb')
+if not f then print('open-failed') return end
+local d, e = f:read('l')
+print('read=' .. tostring(d) .. ' err=' .. tostring(e))
+print('after-timeout')
+'@
+
+$clientRes = Start-Server @('--read-timeout=400')
+if ($null -eq $clientRes) {
+    Bad 'read.timeout' 'server did not start'
+} else {
+    $s = $clientRes.GetStream()
+    Send-Frame $s 10 0 1 '' $null
+    $null = Recv-Frame $s                                   # info
+    Send-Frame $s 11 0 0 '' ([System.Text.Encoding]::UTF8.GetBytes($toSrc))
+
+    $outText = ''
+    $result = $null
+    $sawReadReq = $false
+    for ($i = 0; $i -lt 40; $i++) {
+        $f = Recv-Frame $s
+        if ($null -eq $f) { break }
+        if ($f.type -eq 1) {                                # open：回一个 ok（否则 open 也会超时）
+            Send-Frame $s 13 0 $f.id '' $null
+            continue
+        }
+        if ($f.type -eq 7) { $sawReadReq = $true; continue } # read_req：故意不回
+        if ($f.type -eq 4) { $outText += $f.data; continue }
+        if ($f.type -eq 5) { $result = $f.json | ConvertFrom-Json; continue }
+        if ($f.type -eq 14) { break }
+    }
+    try { $clientRes.Close() } catch { }
+    Stop-Server
+    $script:proc = $null
+
+    Check 'read.timeout-saw-request' $sawReadReq 'server never asked the client for bytes'
+    Check 'read.timeout-nil-and-reason' ($outText -match 'read=nil err=timeout') "stdout=[$outText]"
+    Check 'read.timeout-script-continues' ($outText -match 'after-timeout' -and $result.ok -eq $true) "stdout=[$outText] result=$($result | ConvertTo-Json -Compress)"
 }
 
 Write-Output ''

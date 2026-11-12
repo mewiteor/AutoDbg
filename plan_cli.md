@@ -224,6 +224,13 @@ D43 说「每次调用无状态」，所以**不能有隐形状态**：「记住
    ❗尚未做：握手 json 里的 `pid` / `filename` / `read_timeout` / `max_frame` 还没被服务端消费（`--pid` 也还没
    影响 Attach）；`read_req`/`read_resp` 属 T4。
 4. **T4 `open_file():read` 的阻塞语义** + buffer + stale 帧 + `cancel_notify` + `gui.pick()`；跑通「回调里阻塞读 → 超时返回 `nil,"timeout"` → 断点继续」。
+   ✅ **已完成**：`file_stream.cpp` 的读向（r/rb + 4096 缓冲 + 逻辑 `tell` + 往返 `seek` + `lines`），
+   `stream_wait_frame`（切片 25 ms + 片间查取消 + stale 帧丢弃 + `cancel_notify`），
+   `client.cpp` 的本地文件后端（`open`/`data`/`close`/`read_req` → `read_resp`，全二进制，D28），
+   `gui.pick()`（`GetCursorPos` → `WindowFromPoint` → `GetWindowThreadProcessId`，降级前台窗口）。
+   门禁 `e2e_tcp.ps1` 35 → 41 条（含「假客户端不回 read_req」的超时用例）。
+   ⏳ **剩下**：回调里（`Attach`/`Run` 回包内）的真阻塞读只做了单元级验证（`--read-timeout` 路径已通），
+   还没盖「断点继续」那一条；`read_req` 目前只发 bytes/line/seek/tell 四种。
 5. **T5 删除**：`http.*` / `mcp.lua` / `effects.lua` / base64 / 协程执行器 / 会话表 / `yield_blocker` / nvim 的 `http.lua` + chunked 半边。**必须排在 T2/T4 之后**，否则 `open_file` 在回调里写/读的能力会先失去。
 6. **T6 agent 文档**：`tools/agent/autodbg-skill/SKILL.md`（Agent Skills 格式）+ 三五个 recipe。在 CLI 口径下这份 markdown 是**唯一契约文档**，不是锦上添花 —— `autodbg_api.lua` 的内容搬过去，否则模型只能靠训练数据猜参数形状（就是 S12 复发）。
 7. **T7（可选，独立立项）**引擎 `begin/pump/continue` + `--repl`。D45 之后它不再是文件读的前提，但「不靠回调、看着目标跑」仍然需要它。

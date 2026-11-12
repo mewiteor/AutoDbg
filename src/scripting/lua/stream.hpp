@@ -88,6 +88,34 @@ enum stream_control_cmd
 
 /* `ack` 帧的 `reason`：短 ASCII 串，直接进 JSON（不带引号） */
 
+/* ---- T4（D45/D49）`open_file` 的读写协议（二进制，D28：两侧都不得解 JSON） ----
+ * `open`（1，server → client）：json {path, mode}，`id` = 句柄。file / client 均回一个
+ *   `read_resp`（flags bit1 = 失败）；服务端 `open_file` 会等这个应答。
+ * `read_req`（7，server → client）：`id` = 句柄，`flags` = op | (whence << 4)，
+ *   `data` = 8 字节 {u32 bytes 或 offset, u32 保留}。
+ * `read_resp`（13，client → server）：`id` = 句柄，`flags` bit0 = EOF / bit1 = 错误，
+ *   `data` = 字节（read/line）或 8 字节 {u32 pos}（seek/tell）。
+ * `data`（2，server → client）：写模式的原始字节；`close`（3）：关句柄。 */
+enum stream_read_op
+{
+    stream_read_bytes = 0,  /* 最多读 N 字节 */
+    stream_read_line  = 1,  /* 读一行（含 `\n`） */
+    stream_read_seek  = 2,  /* offset + whence */
+    stream_read_tell  = 3,  /* 要当前位置 */
+};
+enum stream_read_whence
+{
+    stream_whence_set = 0,
+    stream_whence_cur = 1,
+    stream_whence_end = 2,
+};
+enum stream_read_resp_flags
+{
+    stream_resp_eof   = 0x01,  /* 这一轮到了文件尾 */
+    stream_resp_error = 0x02,  /* 客户端本地 I/O 失败（
+                                * 详细文本不进回路：D28 不解 JSON） */
+};
+
 /* 传输钩子（单连接、串行）。
  *   send：写满为止；false = 客户端断开/超时。
  *   recv：>0 = 读到的字节数；0 = 对端关闭；-1 = 错误；-2 = 超时（调用方自己切片）。
@@ -162,6 +190,23 @@ int stream_poll_frame(unsigned *out_type, unsigned *out_flags, char *json, size_
 /* poll 一帧：若是 `control` 就交给 handler（不是 control 就忽略）。
  * 执行期两个点的**唯一**入口——`bindings.cpp` 与 `exec_guard.cpp` 都调它。 */
 void stream_poll_and_dispatch();
+
+/* ---- 主读路径（T4 / D45）：脚本线程等一帧（阻塞读的回包、open 的应答都用它） ----
+ * 切片等待（≤ 250 ms 一片），片间查 `exec_guard`；`timeout_ms` 是整次等待的上限。
+ * 处理规则：`control` → 分发后继续等；`read_resp` 但 id 不符 → **丢弃**（stale，D45 规则 3）；
+ * `cancel_notify` → 返回 -4；其它类型原样报给调用方（调用方自己决定要不要）。
+ * 返回：>0 = payload 总长（json+data 已拷进 `buf`，切分见 `*out_json_len` / `*out_data_len`）
+ *       0 = 对端关闭 / `end` 帧；-1 = 传输错误；-2 = 超时；-3 = 帧非法；-4 = 被取消 */
+long stream_wait_frame(unsigned want_type, unsigned want_id, void *buf, size_t cap, size_t *out_json_len,
+                       size_t *out_data_len, unsigned *out_type, unsigned *out_flags, unsigned *out_id,
+                       unsigned timeout_ms);
+
+/* 当前传输能不能**双向**（收到客户端的回包）：只有 raw 分帧且 recv_nowait 就位才行。
+ * chunked（现行 HTTP）是单向的 → `open_file` 在那种请求里只能 fire-and-forget（T5 删）。 */
+bool stream_can_wait();
+
+/* 给客户端发 `cancel_notify {id}`：告诉它「刚才那个请求作废，别回包」（D45 规则 4） */
+bool stream_cancel_notify(unsigned id);
 } /* namespace autodbg::host */
 
 #endif /* AUTODBG_SCRIPTING_LUA_STREAM_HPP */

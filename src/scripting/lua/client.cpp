@@ -22,6 +22,7 @@
 
 #include <windows.h>
 
+#include <stdio.h>   /* T4：本地文件后端（fopen/fread/fwrite） */
 #include <string.h>
 
 namespace autodbg::host
@@ -132,7 +133,161 @@ bool read_frame(conn *c, unsigned *type, unsigned *id, unsigned *flags, size_t *
     return true;
 }
 
-/* 把 token 归一：`--remote-token=none` / 未给 → 空；`auto` 在客户端侧无意义 → 也当空 */
+/* ---------------------------------------------------------------- 本地文件后端
+ * T4（D44/D45）：文件在**客户端**这台机器上。`open` 帧的路径走 `data`、模式走 `flags`
+ * （D28：本进程不解 JSON；帧里那份 json {path,mode} 留给 nvim 等旧客户端，T5 一起删）。 */
+constexpr int          k_max_files = 32;
+struct local_file
+{
+    unsigned id;
+    FILE    *fp;
+    bool     used;
+};
+local_file g_files[k_max_files];
+
+local_file *find_file(unsigned id)
+{
+    for (int i = 0; i < k_max_files; i++)
+        if (g_files[i].used && g_files[i].id == id)
+            return &g_files[i];
+    return nullptr;
+}
+
+local_file *add_file(unsigned id, FILE *fp)
+{
+    for (int i = 0; i < k_max_files; i++)
+    {
+        if (!g_files[i].used)
+        {
+            g_files[i].used = true;
+            g_files[i].id   = id;
+            g_files[i].fp   = fp;
+            return &g_files[i];
+        }
+    }
+    return nullptr;
+}
+
+void drop_file(unsigned id)
+{
+    local_file *f = find_file(id);
+    if (f == nullptr)
+        return;
+    if (f->fp != nullptr)
+        fclose(f->fp);
+    f->used = false;
+    f->fp   = nullptr;
+}
+
+void close_all_files()
+{
+    for (int i = 0; i < k_max_files; i++)
+        drop_file(g_files[i].id);
+}
+
+/* `read_resp` 的两种形态：纯标志 / 带 8 字节位置 */
+bool reply_flags(conn *c, unsigned id, unsigned flags)
+{
+    return write_frame(c, stream_frame_read_resp, id, flags, nullptr, 0, nullptr, 0);
+}
+bool reply_data(conn *c, unsigned id, unsigned flags, const void *data, size_t n)
+{
+    return write_frame(c, stream_frame_read_resp, id, flags, nullptr, 0, data, n);
+}
+bool reply_pos(conn *c, unsigned id, unsigned flags, long pos)
+{
+    unsigned char b[8];
+    autodbg::common::frame_put_u32(b, (unsigned)pos);
+    autodbg::common::frame_put_u32(b + 4, 0);
+    return write_frame(c, stream_frame_read_resp, id, flags, nullptr, 0, b, sizeof b);
+}
+
+/* `open` 帧：flags = 0 读 / 1 写 / 2 追加；data = 路径（NUL 结尾） */
+void client_open(conn *c, unsigned id, unsigned flags, const char *path)
+{
+    const char *mode = (flags == 1u) ? "wb" : (flags == 2u) ? "ab" : "rb";
+    FILE       *fp   = fopen(path, mode);
+    if (fp == nullptr)
+    {
+        reply_flags(c, id, (unsigned)stream_resp_error);
+        return;
+    }
+    if (add_file(id, fp) == nullptr)
+    {
+        fclose(fp);
+        reply_flags(c, id, (unsigned)stream_resp_error);
+        return;
+    }
+    reply_flags(c, id, 0);
+}
+
+/* `read_req`：flags = op | (whence << 4)；data = {u32 arg, u32 保留} */
+void client_read_req(conn *c, unsigned id, unsigned flags, const unsigned char *arg_data, size_t arg_len)
+{
+    local_file *f = find_file(id);
+    if (f == nullptr || f->fp == nullptr)
+    {
+        reply_flags(c, id, (unsigned)stream_resp_error);
+        return;
+    }
+
+    unsigned op     = flags & 0x0Fu;
+    unsigned whence = (flags >> 4) & 0x0Fu;
+    unsigned arg    = (arg_len >= 4) ? autodbg::common::frame_get_u32(arg_data) : 0;
+
+    if (op == (unsigned)stream_read_seek)
+    {
+        int std_whence = (whence == (unsigned)stream_whence_set) ? SEEK_SET
+                         : (whence == (unsigned)stream_whence_end) ? SEEK_END
+                                                                   : SEEK_CUR;
+        if (fseek(f->fp, (long)(int)arg, std_whence) != 0)
+        {
+            reply_flags(c, id, (unsigned)stream_resp_error);
+            return;
+        }
+        reply_pos(c, id, 0, ftell(f->fp));
+        return;
+    }
+    if (op == (unsigned)stream_read_tell)
+    {
+        reply_pos(c, id, 0, ftell(f->fp));
+        return;
+    }
+
+    /* read / line：一次最多回 k_client_read_max 字节（服务端缓冲上限 8192） */
+    constexpr size_t k_client_read_max = 8192;
+    unsigned char    buf[k_client_read_max];
+    size_t           want = (arg == 0) ? k_client_read_max : (size_t)arg;
+    if (want > k_client_read_max)
+        want = k_client_read_max;
+
+    size_t got = 0;
+    unsigned out_flags = 0;
+    if (op == (unsigned)stream_read_line)
+    {
+        /* 读到一个换行（含）或满缓冲 */
+        while (got < want)
+        {
+            int ch = getc(f->fp);
+            if (ch == EOF)
+            {
+                out_flags |= (unsigned)stream_resp_eof;
+                break;
+            }
+            buf[got++] = (unsigned char)ch;
+            if (ch == '\n')
+                break;
+        }
+    }
+    else
+    {
+        got = fread(buf, 1, want, f->fp);
+        if (got == 0)
+            out_flags |= (unsigned)stream_resp_eof;
+    }
+
+    reply_data(c, id, out_flags, buf, got);
+}
 size_t token_bytes(const autodbg_boot *boot, char *out, size_t cap)
 {
     out[0] = '\0';
@@ -446,6 +601,36 @@ int client_main(const autodbg_boot *boot)
                 autodbg::core::PrintExN(is_err ? STD_ERROR_HANDLE : STD_OUTPUT_HANDLE, (const char *)(c.buf + json_len),
                                         data_len);
             }
+            continue;
+        }
+        if (type == stream_frame_open)
+        {
+            /* 路径在 data 段（NUL 结尾）、模式在 flags（D28：本进程不解 JSON） */
+            char path[512];
+            size_t n = data_len;
+            if (n + 1 > sizeof path)
+                n = sizeof path - 1;
+            for (size_t i = 0; i < n; i++)
+                path[i] = (char)c.buf[json_len + i];
+            path[n] = '\0';
+            client_open(&c, id, flags & 0x0Fu, path);
+            continue;
+        }
+        if (type == stream_frame_data)
+        {
+            local_file *lf = find_file(id);
+            if (lf != nullptr && lf->fp != nullptr && data_len > 0)
+                fwrite(c.buf + json_len, 1, data_len, lf->fp);
+            continue;
+        }
+        if (type == stream_frame_read_req)
+        {
+            client_read_req(&c, id, flags, (const unsigned char *)(c.buf + json_len), data_len);
+            continue;
+        }
+        if (type == stream_frame_close)
+        {
+            drop_file(id);
             continue;
         }
         if (type == stream_frame_result)

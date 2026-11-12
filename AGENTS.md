@@ -100,7 +100,7 @@ make.bat i <dir>         :: 指定输出目录（默认 .out）
 | 导入表门禁 | `uv --directory tools/api_check run scan_dir.py` | 扫 `.out` 下全部产物，按产物自动选口径（`AutoDbgLegacy_*` 与启动器 → `w95`、其余 x86 → `wxp`、x64 → `w7`），有目标系统不可用的导入就打印并返回 1。单文件用法：`uv --directory tools/api_check run main.py <exe\|dll> <w95\|w98\|w982\|wxp>`（x64 免第二个参数） |
 | 纯函数自测 | `.out\AutoDbg_<arch>.exe --selftest` | 覆盖 `http` / `json_writer` / `base64` / `png_writer` / `dbl2str` / **帧编解码** 等纯计算层（基线 70 → T1/D50 转义口径 +11 = 81 → **T2 帧编解码 +20 = 101**）；`feat/cli-tcp` 上 `http` / `base64` 段随 D41 / D44 删除，要补 `decide_console_action` 的断言 |
 | server 端到端 | `pwsh tools/server_test/e2e.ps1 -Render <64\|86> [-Variant legacy]`，另有 `e2e_gui.ps1` / `e2e_mcp.ps1` / `e2e_io.ps1` / `nvim_smoke.ps1` | 起 server → 断言 → 停；不需要 VM，也不改产品行为。`feat/cli-tcp`（D41）上 `e2e_mcp.ps1` 删除 |
-| raw TCP 帧（T2/T3/D42） | `pwsh tools/server_test/e2e_tcp.ps1 -Render <64\|86> [-Variant legacy]` | `--server=tcp`：握手帧（`id` = 协议版本、`data` = token）→ `info`；版本不符 / 首帧非握手 / 错 token 的 `error` 帧；`script` → `out`+`result`+`end`（含语法错误透传 `exit`）；`control` 的 health / version / cancel / 未知 / shutdown；**执行期的 control**（Lua 死循环 + 引擎空转）；**`--remote` 客户端**（跑脚本 / `--json` 信封 / 语法错误 / health / version / **另一个进程的 `--cancel`**）。35 条断言，legacy 同样必须真过 |
+| raw TCP 帧（T2/T3/T4/D42） | `pwsh tools/server_test/e2e_tcp.ps1 -Render <64\|86> [-Variant legacy]` | `--server=tcp`：握手帧（`id` = 协议版本、`data` = token）→ `info`；版本不符 / 首帧非握手 / 错 token 的 `error` 帧；`script` → `out`+`result`+`end`；`control` 的 health / version / cancel / 未知 / shutdown；**执行期的 control**（Lua 死循环 + 引擎空转）；**`--remote` 客户端**（跑脚本 / `--json` 信封 / 语法错误 / health / version / 另一个进程的 `--cancel`）；**`open_file` 读向**（远程 open 应答、read/tell/seek/lines 字节与位置语义、等回包超时 → `nil,"timeout"` 且脚本继续）。41 条断言，legacy 同样必须真过 |
 | JSON 信封（T1/D50） | `pwsh tools/server_test/e2e_json.ps1 -Render <64\|86> [-Variant legacy]` | 本地模式 `--json` / `--out=<path>`：那一行 JSON 独占 stdout、字段齐全、`result` / `pid` / `detached` / `images` 口径、`--json` 与 `--server` 互斥（退出码 2）、退出码口径不变；那一行必须**纯 ASCII**（CP936 → UTF-8 或逐字节降级）。`-Variant legacy` **必须真过**（这段就是用来暴露 GBK 的） |
 | Win9x 实机 | `pwsh tools/w9x_test/w9x.ps1 -Action check\|run\|record` | 需要 VMware 的 Win98 guest 与凭据（`tools/w9x_test/config.local.ps1`，已 gitignore）；**没有 VM / 凭据时 SKIP（exit 0）**。矩阵与剩余项见 `plan_p7_win9x.md` |
 
@@ -430,6 +430,16 @@ payload              // 单条 LZMA 流：各模块原始字节按 entry 顺序�
 > 「调试回调里不可用」这条限制取消：回调里 `f:read()` 可以**阻塞等回包**（等待循环按 ≤250 ms 切片 `select`，每片检查 `exec_guard`），超时 → `nil, "timeout"` 后回调返回、断点继续。前提：执行连接的**唯一 reader 是脚本线程**（三个消费点：`f:read()` 等待循环、`on_wait_timeout` 的非阻塞 poll、`lua_sethook` tick）；其它连接是控制连接，由 accept 线程处理。
 
 文件在**客户端**那台机器上；本机脚本模式下两者都等价于 `io.open`。
+
+> **T4 已落地（分支 `feat/cli-tcp`）**：`open_file` 现在真支持**读**（r/rb），语义按 D49 钉死：
+> 默认 format `"l"`（去行尾）、`f:read(整数)` 读 N 字节、EOF → `nil`、错误 → `nil, err`、
+> 字节精确（不做 CRLF 归一）、每句柄 4096 缓冲（`f:setbuf()` 可调，上限 8192）、
+> `f:tell()` 是逻辑位置、`f:seek()` 往返且清缓冲、`f:lines()` 自己实现迭代器。
+> 帧协议（二进制，D28）：`open` 的路径走 `data`、模式走 `flags`；`read_req` 的
+> `flags` = op | (whence << 4)、`data` = {u32 arg}；`read_resp` 的 `flags` bit0 = EOF /
+> bit1 = 错误、`data` = 字节或 {u32 pos}。等回包时切片 25 ms，片间查取消 →
+> `nil, "cancelled"`；超时 → `nil, "timeout"` 并用 `cancel_notify` 让客户端丢掉那一轮。
+> ❗chunked（现行 HTTP）是单向往回的：那种请求里 `open` 不等应答（T5 删 HTTP 后这条分支消失）。
 
 **① 流式（默认，`X-AutoDbg-Stream: 1`）——大块数据、调试回调里都靠它**
 
