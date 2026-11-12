@@ -17,9 +17,7 @@
 | --- | --- |
 | `AGENTS.md`（本文） | 工作约定：构建 / 门禁 / 约束 / 风格 / 架构 / 打包 ABI / 已定决策 |
 | `PITFALLS.md` | **已踩过的坑**（现象 → 根因 → 现在的做法），改代码前先扫对应小节 |
-| `plan_p7_win9x.md` | Win9x 实机测试的**剩余**工作 |
-| `plan_server.md` | server / MCP / GUI / client 文件 I/O 的**剩余**工作（其中传输与文件 I/O 的方向已被 `plan_cli.md` 的 D41–D50 取代） |
-| `plan_cli.md` | **已拍板的 CLI + raw TCP 路线**（D41–D50）与落地任务清单 |
+| `plan.md` | **剩余工作**（Win9x 矩阵、server/GUI 实测、CLI/帧协议尾巴）——原 `plan_p7_win9x.md`、`plan_server.md`、`plan_cli.md` 已合并到这里 |
 | `nvim/README.md` | neovim 插件的安装、配置与命令 |
 
 ## 1. 构建
@@ -104,10 +102,10 @@ make.bat i <dir>         :: 指定输出目录（默认 .out）
 | JSON 信封（T1/D50） | `pwsh tools/server_test/e2e_json.ps1 -Render <64\|86> [-Variant legacy]` | 本地模式 `--json` / `--out=<path>`：那一行 JSON 独占 stdout、字段齐全、`result` / `pid` / `detached` / `images` 口径、`--json` 与 `--server` 互斥（退出码 2）、退出码口径不变；那一行必须**纯 ASCII**（CP936 → UTF-8 或逐字节降级）。`-Variant legacy` **必须真过**（这段就是用来暴露 GBK 的） |
 | agent 技能包（T6） | `pwsh tools/agent/check_skill.ps1 -Render <64\|86>` | `tools/agent/autodbg-skill/` 是 CLI 口径下的**唯一对外契约文档**：检查 `SKILL.md` 的 frontmatter（`name` / `description`）并把每个 `.md` 里的 ` ```lua ` 片段交给产物做语法检查（只解析不执行）。14 条断言 / 36 个 Lua 片段 |
 | nvim 客户端（T5） | `pwsh tools/server_test/nvim_smoke.ps1 -Render <64\|86> [-Variant legacy]` | 起 `--server=tcp` → headless nvim 跑 `nvim_smoke.lua`：远程执行 + 结果 buffer、异步路径不出 `E5560`、语法错误 → chunkname + quickfix、`M.cancel`（控制帧）、health/version（`info`）、`open_file` 写/读回（帧上的 `open`/`data`/`close`/`read_req`）。24 条断言；**nvim 不在 PATH 时 SKIP** |
-| Win9x 实机 | `pwsh tools/w9x_test/w9x.ps1 -Action check\|run\|record` | 需要 VMware 的 Win98 guest 与凭据（`tools/w9x_test/config.local.ps1`，已 gitignore）；**没有 VM / 凭据时 SKIP（exit 0）**。矩阵与剩余项见 `plan_p7_win9x.md` |
+| Win9x 实机 | `pwsh tools/w9x_test/w9x.ps1 -Action check\|run\|record` | 需要 VMware 的 Win98 guest 与凭据（`tools/w9x_test/config.local.ps1`，已 gitignore）；**没有 VM / 凭据时 SKIP（exit 0）**。矩阵与剩余项见 `plan.md` §1.3 |
 
 - 黄金输出在本仓库 `tests/golden/w9x/`（Win98 guest 的输出），行尾与比较口径见 D15（golden 统一 LF，比较走「CRLF→LF + 去末尾空行」归一化）。
-- 行为类缺陷（需要真机跑调试会话才能确认的）**只记录不修**，等 Win9x 环境就绪（`plan_p7_win9x.md`）。
+- 行为类缺陷（需要真机跑调试会话才能确认的）**只记录不修**，等 Win9x 环境就绪（`plan.md` §1.3）。
 - 导入表类问题可用 `tools/api_check/main.py <符号>` 静态审计；新增任何 CRT/系统符号前先查。改完引擎/构建开关后跑一次 `scan_dir.py`，别让 `dbghelp.dll`、`K32*`、XP+ 的 `Nt*` 之类偷偷回到 legacy 导入表里。
 
 ## 5. 关键约束
@@ -122,7 +120,7 @@ make.bat i <dir>         :: 指定输出目录（默认 .out）
 8. **入口与 CRT 兼容层必须保持 C 链接**（`/ENTRY:mainCRTStartup` 与 `msvcrt.def` 按 C 名字查找）；零 CRT 下没有 `_atexit`，带非平凡析构的静态对象会 LNK2019（`main.cpp` 用 `new` 而非静态对象的原因）。
 9. **CRT 缺口的补法**：`msvcrt.dll` / `ucrtbase.dll` 都没有（或只有 XP+ 版本）的符号，在 `src/sys/` 里自己实现，并同步影子头声明，这样各架构导入表零新增。现有两例：① `src/sys/strtoull.c` + `src/sys/include/stdlib.h`（LuaJIT 的 `tonumber(s, base)` 要 `strtoull`；`msvcrt.dll` 只有 XP+ 的 `_strtoui64`，Win9x 连它都没有）；② `src/sys/destruct_eh.c`（LuaJIT 的 `lj_err.c` 无条件引用 `__DestructExceptionObject`，Win9x 的 `msvcrt.dll` 没有它）——后者无法纯自实现，做法是「自己提供符号 + 运行时向已加载的 `msvcrt.dll` 转发，取不到就降级」。
 10. **模块化运行时（§11）是硬边界**：引擎与绑定跑在**手工映射的模块**里，不得依赖 OS 加载器特性——禁止 `__declspec(thread)` / `thread_local`（含「函数内非平凡构造的 static」，`PITFALLS.md` M10）、模块内资源一律传自己的 `HMODULE`、不引入新的导出（唯一契约是 `autodbg_run` + `autodbg_boot`）。x86 的 `__aullshr` 类编译期辅助符号一律用 `src/sys/flt.asm`（**禁止**在 C 里重写），x86 产物与 x86 构建期工具都要链 `src\sys\flt.obj`。
-11. **server 模式 = 远程代码执行**：默认只绑 loopback 且免 token（D21），非 loopback 强制 token；不要在文档/示例里鼓励把 `--server-addr` 绑到不可信网络（`plan_server.md` 的剩余项里也不要引入绕过这条的开关）。
+11. **server 模式 = 远程代码执行**：默认只绑 loopback 且免 token（D21），非 loopback 强制 token；不要在文档/示例里鼓励把 `--server-addr` 绑到不可信网络（`plan.md` 的剩余项里也不要引入绕过这条的开关）。
 
 ## 6. 代码风格
 
@@ -187,8 +185,7 @@ tests/golden/w9x/    Win98 guest 的黄金输出
 | --- | --- |
 | `AGENTS.md`（本文） | 构建 / 门禁 / 约束 / 风格 / 架构 / 打包 ABI / 已定决策 |
 | `PITFALLS.md` | 已踩过的坑，按「构建 / 零 CRT / 模块映射 / Lua / 输出 / server / nvim / Win9x / 门禁」分类 |
-| `plan_p7_win9x.md` | Win9x 实机测试的剩余工作（环境、通道、矩阵、编排器） |
-| `plan_server.md` | server / MCP / GUI / client 文件 I/O 的剩余工作 |
+| `plan.md` | **剩余工作**（Win9x 矩阵、server/GUI 实测与文档同步、CLI/帧协议尾巴）——三份 plan 的合并版 |
 | `nvim/README.md` | neovim 插件的安装、配置、命令与可编程 API |
 | `tools/agent/autodbg-skill/` | **面向 agent 的技能包**（Agent Skills 格式）：`SKILL.md` 入口 + `references/`（CLI / Lua API / 地雷）+ `recipes/`（5 个场景）。CLI 口径下的唯一对外契约文档 |
 | `make.bat` | 构建定义（ninja 生成器） |
@@ -375,7 +372,7 @@ payload              // 单条 LZMA 流：各模块原始字节按 entry 顺序�
 
 ## 12. 已实现的扩展面（server / GUI / MCP / client 文件 I/O）
 
-> 这一段只记**现行接口约定**（改之前要知道的事实）；剩余工作与设计取舍见 `plan_server.md`。
+> 这一段只记**现行接口约定**（改之前要知道的事实）；剩余工作与设计取舍见 `plan.md`。
 > ❗`plan_cli.md` 的 **D41–D50 已拍板**：MCP 与 HTTP 在 `feat/cli-tcp` 上整体删除，对外只剩 CLI + raw TCP 帧。下面被取代的条目（§12.1 的端点、§12.3 整节、§12.4 的效果协议）都在原地标注，落地前仍按现状读。
 
 ### 12.1 server 模式

@@ -111,7 +111,7 @@ on **the client's** machine. Loopback needs no token; a non-loopback listen addr
 (`--server-token=auto` prints it in the banner).
 
 > The HTTP transport (`--server=http`, `POST /run`, `/health`, MCP) was removed: the CLI plus these
-> frames is the whole contract now (D41/D42 in `plan_cli.md`).
+> frames is the whole contract now (D41/D42 in `plan.md`).
 
 ### From neovim
 
@@ -165,7 +165,7 @@ sequence of interactive calls.
 
 ### Open
 
-- [ ] Win9x real-machine verification (matrix, encoding, dynapi degradation paths) — see `plan_p7_win9x.md`.
+- [ ] Win9x real-machine verification (matrix, encoding, dynapi degradation paths) — see `plan.md` §1.3.
 - [ ] neovim plugin: move from HTTP to the raw TCP client, restore its smoke gate.
 - [ ] Blocking `f:read()` inside `Attach`/`Run` callbacks: end-to-end case with "timeout → callback returns → breakpoint continues".
 - [ ] Engine `begin/pump/continue` + `--repl` (T7, optional) — a script-free way to watch a target run.
@@ -180,9 +180,7 @@ sequence of interactive calls.
 | --- | --- |
 | `AGENTS.md` | Build, gates, hard constraints, code style, architecture, packaging ABI, decided items |
 | `PITFALLS.md` | Every trap already hit (symptom → cause → current fix) |
-| `plan_cli.md` | The decided CLI + raw TCP roadmap (D41–D50) and its task list |
-| `plan_p7_win9x.md` | Remaining Win9x real-machine test work |
-| `plan_server.md` | Historical server/MCP notes (transport decisions superseded by `plan_cli.md`) |
+| `plan.md` | Remaining work (Win9x matrix, server/GUI measurements, CLI/frame leftovers) — merged from `plan_cli.md` / `plan_server.md` / `plan_p7_win9x.md` |
 | `tools/agent/autodbg-skill/` | The agent-facing contract document (skill package) |
 | `nvim/README.md` | neovim plugin installation, commands, options |
 

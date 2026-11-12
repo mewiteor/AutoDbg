@@ -107,7 +107,7 @@ Run({
 
 客户端就是同一个二进制：握手（协议版本 + token）→ 把脚本用帧发过去 → 打印它的输出 → 用脚本的退出码退出。`open_file` 打开的文件在**客户端**那台机器上读写。loopback 免 token；非 loopback 监听必须给 token（`--server-token=auto` 会在启动横幅里打印）。
 
-> HTTP 传输（`--server=http`、`POST /run`、`/health`、MCP）已经删除：现在对外契约就是 CLI + 这些帧（`plan_cli.md` 的 D41/D42）。
+> HTTP 传输（`--server=http`、`POST /run`、`/health`、MCP）已经删除：现在对外契约就是 CLI + 这些帧（`plan.md` 的 D41/D42）。
 
 ### 在 neovim 里
 
@@ -154,7 +154,7 @@ Run({
 
 ### 待完成
 
-- [ ] Win9x 实机验证（矩阵、编码、dynapi 降级路径）—— 见 `plan_p7_win9x.md`。
+- [ ] Win9x 实机验证（矩阵、编码、dynapi 降级路径）—— 见 `plan.md` §1.3。
 - [ ] neovim 插件：迁到 raw TCP 客户端并恢复 smoke 门禁。
 - [ ] `Attach`/`Run` 回调里的阻塞 `f:read()`：补「超时 → 回调返回 → 断点继续」的端到端用例。
 - [ ] 引擎 `begin/pump/continue` + `--repl`（T7，可选）—— 不用回调也能「看着目标跑」。
@@ -169,9 +169,7 @@ Run({
 | --- | --- |
 | `AGENTS.md` | 构建、门禁、硬约束、代码风格、架构、打包 ABI、已定决策 |
 | `PITFALLS.md` | 已踩过的坑（现象 → 根因 → 现在的做法） |
-| `plan_cli.md` | 已拍板的 CLI + raw TCP 路线（D41–D50）与任务清单 |
-| `plan_p7_win9x.md` | Win9x 实机测试的剩余工作 |
-| `plan_server.md` | 历史上的 server/MCP 记录（传输与文件 I/O 的方向已被 `plan_cli.md` 取代） |
+| `plan.md` | 剩余工作（Win9x 矩阵、server/GUI 实测、CLI/帧协议尾巴）——`plan_cli.md` / `plan_server.md` / `plan_p7_win9x.md` 的合并版 |
 | `tools/agent/autodbg-skill/` | 面向 agent 的契约文档（技能包） |
 | `nvim/README.md` | neovim 插件的安装、配置与命令 |
 
