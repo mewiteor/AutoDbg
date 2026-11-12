@@ -55,6 +55,11 @@ struct file_obj
     size_t         rbuf_len;  /* 缓冲里的有效字节数 */
     size_t         rbuf_pos;  /* 已消费到哪（逻辑位置 = client_pos - (len-pos)） */
     long long      client_pos;/* client 侧文件位置（每次回包更新） */
+    /* T4（D45 规则 3）：上一轮超时/取消后，可能有迟到的 `read_resp` 还在路上。
+     * 守规矩的客户端收到 `cancel_notify` 就不发；不守规矩的还会发 —— 服务端必须自己丢掉它，
+     * 否则它会被**下一次 read_req** 当成数据（=
+     * 「读超时之后的下一次读拿到上一轮的旧数据」）。 */
+    unsigned       stale_replies;
 };
 
 constexpr size_t k_read_buf_default = 4096;   /* D49：默认 4096（与 plan_cli.md §2.4 一致） */
@@ -429,6 +434,20 @@ bool remote_req(file_obj *o, unsigned op, unsigned whence, unsigned arg, size_t 
     unsigned char payload[8];
     common::frame_put_u32(payload, arg);
     common::frame_put_u32(payload + 4, 0);
+
+    /* 先把「上一轮迟到的那一份」捞掉（非阻塞），再发新的 read_req —— 顺序不能反，
+     * 否则新请求的回包与旧回包在同一个句柄上无法区分（D45 规则 3）。 */
+    while (o->stale_replies > 0)
+    {
+        unsigned st = 0, sf = 0, sid = 0;
+        size_t   sjl = 0, sdl = 0;
+        long     sr = stream_wait_frame(stream_frame_read_resp, o->id, o->rbuf, o->rbuf_cap, &sjl, &sdl, &st, &sf,
+                                    &sid, 1 /* 1 ms：只薠已经到的 */);
+        if (sr <= 0)
+            break;   /* -2 = 没滞留帧；其它 = 错，交给下面的正式请求报 */
+        o->stale_replies--;
+    }
+
     if (!stream_write_frame(stream_frame_read_req, o->id, op | (whence << 4), nullptr, 0, payload, sizeof payload))
     {
         set_err(err, err_cap, "send failed (client disconnected?)");
@@ -442,12 +461,14 @@ bool remote_req(file_obj *o, unsigned op, unsigned whence, unsigned arg, size_t 
     if (r == -4)
     {
         stream_cancel_notify(o->id);   /* D45 规则 4：让 client 丢掉那一轮 */
+        o->stale_replies++;            /* 但它真发了的话，我们也要自己丢掉 */
         set_err(err, err_cap, "cancelled");
         return false;
     }
     if (r == -2)
     {
         stream_cancel_notify(o->id);   /* 超时：同样让 client 把迟到的那一轮丢掉 */
+        o->stale_replies++;
         set_err(err, err_cap, "timeout");
         return false;
     }

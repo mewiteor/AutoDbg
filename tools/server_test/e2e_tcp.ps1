@@ -30,6 +30,8 @@
 #      **另一个进程的 `--cancel`**（accept 线程接控制连接）/ 无 `--remote` 时拒绝控制命令
 #   ⑬ `open_file` 读向（T4/D45）：远程 open 应答、read/tell/seek/lines 的字节与位置语义、
 #      **等回包超时 → nil,"timeout" 且脚本继续**（用一个故意不回 read_req 的假客户端）
+#   ⑭ **调试回调里的阻塞读**（T4 收尾）：`Run` 的 callback 里 `f:read`，超时后回调返回、
+#      调试会话不断（下一次 `Run` 照常）；并且**迟到的 read_resp 被丢弃**（D45 规则 3）
 # =============================================================================
 [CmdletBinding()]
 param(
@@ -511,6 +513,82 @@ if ($null -eq $clientRes) {
     Check 'read.timeout-saw-request' $sawReadReq 'server never asked the client for bytes'
     Check 'read.timeout-nil-and-reason' ($outText -match 'read=nil err=timeout') "stdout=[$outText]"
     Check 'read.timeout-script-continues' ($outText -match 'after-timeout' -and $result.ok -eq $true) "stdout=[$outText] result=$($result | ConvertTo-Json -Compress)"
+}
+
+# ---------------------------------- ⑭ 回调里的阻塞读：超时 → 回调返回 → 断点继续（T4 收尾）
+# 这一段就是 D45 的核心：`f:read()` 在**调试回调**里等回包（不 yield）。假客户端：
+#   · `open` → 回 ok；
+#   · `read_req` → **第一次不回**（让 hit1 超时），等看到 hit1 的 stdout 后再补一个
+#     **迟到的 read_resp（带 LATE 字样）** —— 它必须被丢弃，不能被 hit2 当成数据；
+#   · 第二次 read_req 也不回 → hit2 也必须超时。
+# 两次 hit 是两个独立的 `Run`，所以也验证了「超时之后调试会话没坏（下一次 Run 照常）」。
+$cbSrc = @'
+local path = [[C:/ProgramData/Temp/autodbg_tcp_e2e/data.txt]]
+local f = open_file(path, 'rb')
+if not f then print('open-failed') return end
+
+for i = 1, 2 do
+  Run({
+    cmdline = [[C:\Windows\System32\cmd.exe]] .. ' /c ping -n 2 127.0.0.1',
+    callback = function()
+      -- ❗调试回调里阻塞读（不 yield）：等不到回包就超时返回
+      local d, e = f:read('l')
+      print('hit' .. i .. ' read=' .. tostring(d) .. ' err=' .. tostring(e))
+      Detach()
+      return true
+    end,
+  })
+end
+f:close()
+print('after-both-runs')
+'@
+
+$cbRes = Start-Server @('--read-timeout=400')
+if ($null -eq $cbRes) {
+    Bad 'callback.read' 'server did not start'
+} else {
+    $s = $cbRes.GetStream()
+    Send-Frame $s 10 0 1 '' $null
+    $null = Recv-Frame $s
+    Send-Frame $s 11 0 0 '' ([System.Text.Encoding]::UTF8.GetBytes($cbSrc))
+
+    $outText = ''
+    $result = $null
+    $handleId = -1
+    $readReqs = 0
+    $staleSent = $false
+    for ($i = 0; $i -lt 120; $i++) {
+        $f = Recv-Frame $s
+        if ($null -eq $f) { break }
+        if ($f.type -eq 1) {                                # open：记下句柄，回 ok
+            $handleId = $f.id
+            Send-Frame $s 13 0 $f.id '' $null
+            continue
+        }
+        if ($f.type -eq 7) {                                # read_req：前两次都故意不回
+            $readReqs++
+            continue
+        }
+        if ($f.type -eq 4) {
+            $outText += $f.data
+            # hit1 超时之后补一个**迟到**的应答（不守规矩的客户端行为）→ 服务端必须丢掉
+            if (-not $staleSent -and $handleId -ge 0 -and $f.data -match 'hit1') {
+                $staleSent = $true
+                Send-Frame $s 13 0 $handleId '' ([System.Text.Encoding]::UTF8.GetBytes("LATE\n"))
+            }
+            continue
+        }
+        if ($f.type -eq 5) { $result = $f.json | ConvertFrom-Json; continue }
+        if ($f.type -eq 14) { break }
+    }
+    try { $cbRes.Close() } catch { }
+    Stop-Server
+    $script:proc = $null
+
+    Check 'callback.read-asked-twice' ($readReqs -eq 2) "read_req=$readReqs（每 hit 一次 refill；多出来说明 stale 被当成数据了）"
+    Check 'callback.read-timeout-per-run' (([regex]::Matches($outText, 'read=nil err=timeout')).Count -ge 2) "stdout=[$outText]"
+    Check 'callback.read-session-survives' ($outText -match 'hit2 read=nil' -and $outText -match 'after-both-runs' -and $result.ok -eq $true) "stdout=[$outText]"
+    Check 'callback.read-stale-discarded' (-not ($outText -match 'LATE')) "stdout=[$outText]"
 }
 
 Write-Output ''

@@ -1,8 +1,8 @@
 # plan_cli.md —— CLI + raw TCP 路线（已拍板）
 
-> 状态：**已拍板**，待落地分支 `feat/cli-tcp`。对外契约只剩 **CLI + raw TCP 帧**：MCP 与 HTTP 代码整体删除。
+> 状态：**T1–T6 全部落地**（分支 `feat/cli-tcp` 已并入 `main`）。对外契约只剩 **CLI + raw TCP 帧**：MCP 与 HTTP 代码已删除。
 > 决策 D41–D50 已登记进 `AGENTS.md` §13；`AGENTS.md` §12.3（MCP）与 §12.4（效果协议）已在原地标注被本文件取代。
-> 前置说明：pi 的 MCP 地址热切换扩展**不入库**（留在 `git stash@{0}`），本文件不依赖它；§6 的 pi 实测事实保留，是 D41 的依据。
+> 前置说明：pi 的 MCP 地址热切换扩展从未入库（那个 stash 已按计划丢弃），本文件不依赖它；§6 的 pi 实测事实保留，是 D41 的依据。
 > 已踩的坑见 `PITFALLS.md`（S 节 = server / 帧协议）。`plan_server.md` 的 §2.1 / §2.2 / §2.6 / §5.2 随本方案作废。
 
 ---
@@ -228,9 +228,11 @@ D43 说「每次调用无状态」，所以**不能有隐形状态**：「记住
    `stream_wait_frame`（切片 25 ms + 片间查取消 + stale 帧丢弃 + `cancel_notify`），
    `client.cpp` 的本地文件后端（`open`/`data`/`close`/`read_req` → `read_resp`，全二进制，D28），
    `gui.pick()`（`GetCursorPos` → `WindowFromPoint` → `GetWindowThreadProcessId`，降级前台窗口）。
-   门禁 `e2e_tcp.ps1` 35 → 41 条（含「假客户端不回 read_req」的超时用例）。
-   ⏳ **剩下**：回调里（`Attach`/`Run` 回包内）的真阻塞读只做了单元级验证（`--read-timeout` 路径已通），
-   还没盖「断点继续」那一条；`read_req` 目前只发 bytes/line/seek/tell 四种。
+   门禁 `e2e_tcp.ps1` 35 → 45 条。
+   ✅ **回调里也验了（T4 收尾）**：`Run` 的 callback 里 `f:read` 超时 → 回调返回 → 下一次 `Run` 照常
+   （调试会话不坏，`callback.read-session-survives`）；并补齐 stale 兜底：超时/取消后**迟到的
+   `read_resp` 会在下一次 `read_req` 发出前被丢掉**（D45 规则 3，不依赖客户端守规矩，
+   `callback.read-stale-discarded`）。`read_req` 目前只有 bytes/line/seek/tell 四种操作。
 5. **T5 删除**：`http.*` / `mcp.lua` / `effects.lua` / base64 / 协程执行器 / 会话表 / `yield_blocker` / nvim 的 `http.lua` + chunked 半边。**必须排在 T2/T4 之后**，否则 `open_file` 在回调里写/读的能力会先失去。
    ✅ **已完成（本仓）**：`server.cpp`（HTTP）/ `server.hpp` / `http.*` / `base64.*` / `exec_session.*` /
    `exec.cpp` 的协程段 / `file_io.cpp` 的效果协议（只剩 client_io 开关）/ `lualib/{mcp,effects,autodbg_api}.lua` /
