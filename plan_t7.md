@@ -64,6 +64,10 @@ end(&err)                        run_shutdown（761）+ detach；D47 的降级�
 
 `on_wait_timeout` 的语义不变：pump 的空闲路径照旧问宿主，那正是执行期唯一的 control poll 点（`exec_guard.cpp:133` → `stream_poll_and_dispatch`）。
 
+**落地状态（T7.1 = `8e35348` + `ca3bde1`）**：本机全部门禁跑过且绿（导入表 12 产物、json 32、gui 21、tcp 48、skill 14、nvim_smoke 32、w9x gate），除自测 `67` → `70` 外断言数未变。两点记录：
+① `src/common/selftest.cpp` 为此 include 了 `src/scripting/lua/console_input.hpp`（那个头只带 `windows.h`，§5 第 5 条没被破坏），但依赖方向是 `common → scripting`，与分层相反；理顺只需把纯函数 `decide_console_action` 挪进 `src/common/`（它本来不做 I/O、不碰 Lua），留待 T7.3 一起定。
+② `pump` 的返回值只表达事件码（`0` = 没等到事件），「该不该停」仍靠会话标志，所以绑定层要用无参的 `cont()` 判断循环是否已终止 —— 「没等到事件」与「已 detach 退出」在返回值上不可区分；`cont()`（无参标志）与 `cont(pid, tid, code)`（显式应答）是同名重载，保留不改，但绑定层容易误用。
+
 ### 2.2 「人工不一定好用，但不能没有」的数据面补口
 
 这一批按「缺了就只能靠猜」来选，不按好不好用：
