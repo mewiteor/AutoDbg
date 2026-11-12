@@ -116,6 +116,44 @@ check("cancel.finished", cslot.done == true, "done=" .. tostring(cslot.done))
 check("cancel.canceled-flag", cslot.res and cslot.res.canceled == true,
   cslot.res and ("canceled=" .. tostring(cslot.res.canceled) .. " exit=" .. tostring(cslot.res.exit)) or "nil")
 
+-- ------------------------------------------------ ⑦ 脚本头标记里的地址优先（两种写法）
+-- setup 里故意放一个不可达地址（192.0.2.0/24 是 TEST-NET，必定连不上）：
+-- 如果模型标记没生效，就会去连它而不是 server。
+ad.setup({
+  mode = "remote",
+  host = "192.0.2.1",
+  port = 9,
+  open = "none",
+  focus = false,
+  sync_timeout_ms = 8000,
+  lsp = { enable = false },
+  snippets = { enable = false },
+})
+
+-- 复刻用户报的那个脚本头（`--!lua` + `--!autodbg url=… token=…`）:
+set_buffer({ "--!lua", ("--!autodbg url=http://127.0.0.1:%d token=11111111"):format(port), 'print("x")' },
+  "smoke_modeline.lua")
+local mv = ad.version({ sync = true })
+check("modeline.url-overrides-setup", mv.ok == true, "error=" .. tostring(mv.error))
+
+set_buffer({ ("--!autodbg host=127.0.0.1 port=%d"):format(port), 'print("x")' }, "smoke_modeline2.lua")
+local mh = ad.health({ sync = true })
+check("modeline.host-port", mh.ok == true, "body=" .. tostring(mh.body):sub(1, 80))
+check("modeline.host-port-reported", mh.host == "127.0.0.1" and mh.port == port,
+  "host=" .. tostring(mh.host) .. " port=" .. tostring(mh.port))
+
+-- 恢复默认（后面的用例还要用）
+ad.setup({
+  mode = "remote",
+  host = host,
+  port = port,
+  open = "split",
+  focus = false,
+  sync_timeout_ms = 30000,
+  lsp = { enable = false },
+  snippets = { enable = false },
+})
+
 -- ---------------------------------------------------------------- ⑤ health / version
 local h = ad.health({ sync = true })
 check("health.ok", h.ok == true and h.mode == "remote", "mode=" .. tostring(h.mode) .. " body=" .. tostring(h.body):sub(1, 80))
