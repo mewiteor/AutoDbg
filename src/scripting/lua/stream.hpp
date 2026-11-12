@@ -19,6 +19,13 @@
  *   · 一次调用 = 一次执行，严格串行 ⇒ 执行连接**只有一个 reader**（脚本线程）；
  *   · `u16 id` 是**句柄号**，不是请求相关性 id；同一句柄最多一个在途请求；
  *   · 写这条连接的就是执行脚本的那条线程 ⇒ `f:write` 不需要 yield、回调里也能用。
+ *
+ * 握手帧（`stream_frame_handshake`）的字段落点（T2 定稿）：
+ *   `id`   = 协议版本（u16，与 `k_stream_proto_version` 比）；
+ *   `data` = token（utf8 字节；loopback 且未开认证时长度为 0）；
+ *   `json` = `{pid, filename, read_timeout, max_frame, timeout_sec}`（可选；C 侧目前不当场解——
+ *            D28 不写 JSON parser，需要时由执行侧用 `jsonx.decode`）。
+ *   为什么不把 version 也塞进 json：版本不符必须能在**建 `lua_State` 之前**拒绝。
  * ========================================================================== */
 #include <stddef.h>
 
@@ -62,6 +69,21 @@ enum stream_framing
     stream_framing_chunked = 0,  /* HTTP chunked：`<hex>\r\n` + payload + `\r\n`（现行 server） */
     stream_framing_raw     = 1,  /* raw TCP：`u32` 小端 = payload 总长（D42） */
 };
+
+/* `control` 帧（type 12）的命令：放 `flags` 里，**不靠 JSON**——
+ * D28 说 C 侧不写 JSON parser，而控制命令必须能在不建 `lua_State` 的情况下分发（cancel 要
+ * 在脚本抦死的时候也能进）。JSON 只用于**输出**（ack / info）。 */
+enum stream_control_cmd
+{
+    stream_control_cancel   = 0,  /* 硬取消：`lua_sethook` + 等待循环里的 guard（D46） */
+    stream_control_kill     = 1,  /* 软：结束当前 Attach/Run（T4 接 on_wait_timeout） */
+    stream_control_detach   = 2,  /* 软：真 detach（T4；D47） */
+    stream_control_health   = 3,  /* 应答走 `info` 帧（替代 GET /health） */
+    stream_control_version  = 4,  /* 同上（替代 GET /version） */
+    stream_control_shutdown = 5,  /* 停机（e2e 用；等价 POST /shutdown） */
+};
+
+/* `ack` 帧的 `reason`：短 ASCII 串，直接进 JSON（不带引号） */
 
 /* 传输钩子（单连接、串行）。
  *   send：写满为止；false = 客户端断开/超时。

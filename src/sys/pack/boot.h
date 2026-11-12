@@ -35,7 +35,8 @@ typedef struct autodbg_boot
     /* ---- ABI 2（S0，plan_server.md D27）：server / 自测模式 ----
      * 追加而非改写，但 `size` 比较会把旧启动器拦下（这正是要的）。
      * ❗两个模式都**不需要脚本**：`script_a/w` 置 NULL。 */
-    unsigned server_mode;        /* in : 1 = 启动 server（S1 起真正监听） */
+    unsigned server_mode;        /* in : 0 = 不开；**1 = http（待 D41 删除）**；**2 = raw TCP 帧（D42 / T2）**
+                                  * ❗不复用新字段：`--server=tcp` 只改这个值，ABI 不因此 +1 */
     unsigned selftest;           /* in : 1 = 跑纯函数自测后退出（`--selftest`） */
     const char *server_addr;     /* in : "host:port"；NULL = 127.0.0.1:8642 */
     const char *server_token;    /* in : "auto" | "none" | <hex>；NULL = D21 缺省语义 */

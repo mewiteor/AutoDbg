@@ -1,0 +1,307 @@
+# =============================================================================
+# tools/server_test/e2e_tcp.ps1 —— raw TCP 帧服务端的端到端断言（T2 / D42）
+#
+# 来源：新写（plan_cli.md §7 的 e2e_tcp.ps1 骨架；T2 第一段只覆盖握手与 control/ack/info）。
+# 依赖：只需 PowerShell 7 + 已构建的 `.out/AutoDbg_<arch>.exe`；不需要 VM、不需要模型。
+# 用法：
+#   pwsh -File tools/server_test/e2e_tcp.ps1 [-Render 64|86] [-Variant modern|legacy]
+# 退出码：0 = 全通过；1 = 有失败；2 = 前置缺失（产物不存在 / x64+legacy 组合）
+#
+# 帧布局（见 src/common/frame.hpp 与 src/scripting/lua/stream.hpp）：
+#   u32 payload_len | u8 type | u8 flags | u16 id | u32 data_len | [json] | [data]
+#   握手帧：id = 协议版本（1），data = token，json = 其余字段（本篇不用）
+#   control 帧：flags = 命令（0 cancel / 1 kill / 2 detach / 3 health / 4 version / 5 shutdown）
+#   → 应答：ack = 8（json {cmd, applied, reason, pid}）、info = 9、error = 6
+#
+# 覆盖：
+#   ① 握手成功 → info 帧（proto=1、transport=tcp）
+#   ② 版本不符 → error{bad-version} 且连接被关
+#   ③ 第一帧不是握手 → error{handshake-required}
+#   ④ script 帧 → out 帧（stdout/stderr 分桶）+ result + end
+#   ⑤ 语法错误 → result ok=false 且 exit 透传 Lua 错误码（3）
+#   ⑥ control health / version → info（替代 GET /health、/version）
+#   ⑦ control cancel（无执行）→ ack{applied:false, reason:"no-execution"}
+#   ⑧ 未知 control 命令 → ack{applied:false, reason:"unknown-cmd"}
+#   ⑨ 显式 token：错 token → error{unauthorized}；对 token → info
+#   ⑩ control shutdown → ack + 进程退出码 0
+# =============================================================================
+[CmdletBinding()]
+param(
+    [ValidateSet('64', '86')]
+    [string]$Render = '64',
+    [ValidateSet('', 'modern', 'legacy')]
+    [string]$Variant = ''
+)
+
+$ErrorActionPreference = 'Stop'
+
+$Root = Split-Path (Split-Path $PSScriptRoot -Parent) -Parent
+$Exe = Join-Path $Root ".out/AutoDbg_$Render.exe"
+if (-not (Test-Path $Exe))
+{
+    Write-Output "SKIP: 产物不存在：$Exe（先 make.bat a $Render）"
+    exit 2
+}
+if ($Render -eq '64' -and $Variant -eq 'legacy')
+{
+    Write-Output 'SKIP: x64 没有 legacy 变体（AGENTS.md §11.1）；legacy 口径请用 -Render 86 -Variant legacy'
+    exit 2
+}
+
+$script:pass = 0
+$script:fail = 0
+$Port = 18771
+$TmpDir = Join-Path ([System.IO.Path]::GetTempPath()) 'autodbg_tcp_e2e'
+New-Item -ItemType Directory -Force -Path $TmpDir | Out-Null
+
+function Ok([string]$name, [string]$detail = '')
+{
+    $script:pass++
+    if ($detail) { Write-Output ("[ok]   {0}  {1}" -f $name, $detail) } else { Write-Output ("[ok]   {0}" -f $name) }
+}
+function Bad([string]$name, [string]$detail)
+{
+    $script:fail++
+    Write-Output ("[FAIL] {0}  {1}" -f $name, $detail)
+}
+function Check([string]$name, [bool]$cond, [string]$detail = '')
+{
+    if ($cond) { Ok $name $detail } else { Bad $name $detail }
+}
+
+# --- 帧编解码（u32 小端长度前缀 + 8 字节头） ---
+# ❗不用 List.AddRange：PowerShell 把「空数组」绑成缺参，会报 collection 为 null。
+function Send-Frame($s, [int]$Type, [int]$Flags, [int]$Id, [string]$Json, [byte[]]$Data)
+{
+    $jb = if ($Json) { [System.Text.Encoding]::UTF8.GetBytes($Json) } else { [byte[]]@() }
+    if ($null -eq $Data) { $Data = [byte[]]@() }
+    $payload = 8 + $jb.Length + $Data.Length
+    $buf = New-Object System.Collections.Generic.List[byte]
+    foreach ($b in [BitConverter]::GetBytes([uint32]$payload)) { $buf.Add($b) }
+    $buf.Add([byte]$Type)
+    $buf.Add([byte]$Flags)
+    foreach ($b in [BitConverter]::GetBytes([uint16]$Id)) { $buf.Add($b) }
+    foreach ($b in [BitConverter]::GetBytes([uint32]$Data.Length)) { $buf.Add($b) }
+    foreach ($b in $jb) { $buf.Add($b) }
+    foreach ($b in $Data) { $buf.Add($b) }
+    $arr = $buf.ToArray()
+    $s.Write($arr, 0, $arr.Length)
+    $s.Flush()
+}
+function Recv-Exact($s, [byte[]]$Buf)
+{
+    $rd = 0
+    while ($rd -lt $Buf.Length)
+    {
+        $n = $s.Read($Buf, $rd, $Buf.Length - $rd)
+        if ($n -le 0) { return $false }
+        $rd += $n
+    }
+    return $true
+}
+function Recv-Frame($s)
+{
+    $pfx = New-Object byte[] 4
+    if (-not (Recv-Exact $s $pfx)) { return $null }
+    $plen = [BitConverter]::ToUInt32($pfx, 0)
+    if ($plen -lt 8 -or $plen -gt 8388608) { return $null }
+    $body = New-Object byte[] $plen
+    if (-not (Recv-Exact $s $body)) { return $null }
+    $type = [int]$body[0]
+    $flags = [int]$body[1]
+    $id = [int][BitConverter]::ToUInt16($body, 2)
+    $dlen = [int][BitConverter]::ToUInt32($body, 4)
+    $jlen = $plen - 8 - $dlen
+    $json = if ($jlen -gt 0) { [System.Text.Encoding]::UTF8.GetString($body, 8, $jlen) } else { '' }
+    $data = if ($dlen -gt 0) { [System.Text.Encoding]::UTF8.GetString($body, 8 + $jlen, $dlen) } else { '' }
+    return [pscustomobject]@{ type = $type; flags = $flags; id = $id; json = $json; data = $data }
+}
+function Connect-Retry([int]$TimeoutMs = 5000)
+{
+    $deadline = [datetime]::UtcNow.AddMilliseconds($TimeoutMs)
+    while ([datetime]::UtcNow -lt $deadline)
+    {
+        try
+        {
+            $c = New-Object System.Net.Sockets.TcpClient
+            $c.Connect('127.0.0.1', $Port)
+            $c.ReceiveTimeout = 8000
+            return $c
+        }
+        catch { Start-Sleep -Milliseconds 80 }
+    }
+    return $null
+}
+function Start-Server([string[]]$Extra)
+{
+    $out = Join-Path $TmpDir 'srv.out'
+    $err = Join-Path $TmpDir 'srv.err'
+    $args = @('--server=tcp', "--server-port=$Port", '--server-no-echo')
+    if ($Variant) { $args += "--variant=$Variant" }
+    $args += $Extra
+    $script:proc = Start-Process -FilePath $Exe -ArgumentList $args -RedirectStandardOutput $out `
+        -RedirectStandardError $err -PassThru -NoNewWindow
+    $script:outFile = $out
+    $script:errFile = $err
+    $c = Connect-Retry
+    if ($null -eq $c) { return $null }
+    return $c
+}
+function Stop-Server
+{
+    if ($script:proc -and -not $script:proc.HasExited)
+    {
+        $script:proc.Kill()
+        $script:proc.WaitForExit(2000) | Out-Null
+    }
+}
+
+# 一次「开服务 → 跑 body → 关服务」的包装
+function With-Server([string[]]$Extra, [scriptblock]$Body)
+{
+    $c = Start-Server $Extra
+    if ($null -eq $c)
+    {
+        Bad 'server.start' "connect failed; stderr=$(Get-Content $script:errFile -Raw -ErrorAction SilentlyContinue)"
+        return
+    }
+    try { & $Body $c }
+    finally
+    {
+        try { $c.Close() } catch { }
+        Stop-Server
+        Start-Sleep -Milliseconds 120   # 让端口释放
+    }
+}
+
+# ---------------------------------------------------------------- ① 握手成功
+With-Server @() {
+    param($c)
+    $s = $c.GetStream()
+    Send-Frame $s 10 0 1 '' $null                     # handshake：id = proto 1
+    $f = Recv-Frame $s
+    Check 'proto.info' ($f -and $f.type -eq 9) "type=$($f.type)"
+    $j = if ($f.json) { $f.json | ConvertFrom-Json } else { $null }
+    Check 'proto.info-fields' ($j.ok -eq $true -and $j.proto -eq 1 -and $j.transport -eq 'tcp') "json=$($f.json)"
+}
+
+# ------------------------------------------------- ② 版本不符 → error 并断开
+With-Server @() {
+    param($c)
+    $s = $c.GetStream()
+    Send-Frame $s 10 0 99 '' $null                    # id = 99（不存在的版本）
+    $f = Recv-Frame $s
+    $j = if ($f -and $f.json) { $f.json | ConvertFrom-Json } else { $null }
+    Check 'handshake.bad-version' ($f -and $f.type -eq 6 -and $j.error -eq 'bad-version') "frame=$($f.type) json=$($f.json)"
+    Check 'handshake.bad-version-values' ($j.want -eq 1 -and $j.got -eq 99) "want=$($j.want) got=$($j.got)"
+    $next = Recv-Frame $s
+    Check 'handshake.bad-version-closes' ($null -eq $next) "connection should be closed"
+}
+
+# ------------------------------------------- ③ 第一帧不是握手 → handshake-required
+With-Server @() {
+    param($c)
+    $s = $c.GetStream()
+    Send-Frame $s 11 0 0 '' ([System.Text.Encoding]::UTF8.GetBytes('print("x")'))
+    $f = Recv-Frame $s
+    $j = if ($f -and $f.json) { $f.json | ConvertFrom-Json } else { $null }
+    Check 'handshake.required' ($f -and $f.type -eq 6 -and $j.error -eq 'handshake-required') "json=$($f.json)"
+}
+
+# ---------------------------------------- ④⑤ script 帧：out/result/end + 语法错误
+With-Server @() {
+    param($c)
+    $s = $c.GetStream()
+    Send-Frame $s 10 0 1 '' $null
+    $null = Recv-Frame $s                               # info（已在 ① 断言过）
+
+    Send-Frame $s 11 0 0 '' ([System.Text.Encoding]::UTF8.GetBytes('print("hi")'))
+    $outText = ''
+    $result = $null
+    $sawEnd = $false
+    for ($i = 0; $i -lt 8; $i++)
+    {
+        $f = Recv-Frame $s
+        if ($null -eq $f) { break }
+        if ($f.type -eq 4) { $outText += $f.data }
+        elseif ($f.type -eq 5) { $result = $f.json | ConvertFrom-Json }
+        elseif ($f.type -eq 14) { $sawEnd = $true; break }
+    }
+    Check 'script.out-frame' ($outText -eq "hi`n") "stdout=[$outText]"
+    Check 'script.result' ($result -and $result.ok -eq $true -and $result.exit -eq 0) "result=$($result | ConvertTo-Json -Compress)"
+    Check 'script.end' $sawEnd "expected end frame (14)"
+
+    # 语法错误：exit 透传 Lua 错误码（Lua 5.5 的 LUA_ERRSYNTAX = 3），与 --json 的口径一致
+    Send-Frame $s 11 0 0 '' ([System.Text.Encoding]::UTF8.GetBytes('local x = '))
+    $result2 = $null
+    for ($i = 0; $i -lt 8; $i++)
+    {
+        $f = Recv-Frame $s
+        if ($null -eq $f) { break }
+        if ($f.type -eq 5) { $result2 = $f.json | ConvertFrom-Json }
+        elseif ($f.type -eq 14) { break }
+    }
+    Check 'script.syntax-error' ($result2 -and $result2.ok -eq $false -and $result2.exit -eq 3 -and $result2.error.Length -gt 0) `
+        "result=$($result2 | ConvertTo-Json -Compress)"
+}
+
+# ------------------------------------ ⑥⑦⑧⑩ control：health / version / cancel / 未知 / shutdown
+With-Server @() {
+    param($c)
+    $s = $c.GetStream()
+    Send-Frame $s 10 0 1 '' $null
+    $null = Recv-Frame $s
+
+    Send-Frame $s 12 3 0 '' $null                       # health
+    $f = Recv-Frame $s
+    $j = if ($f -and $f.json) { $f.json | ConvertFrom-Json } else { $null }
+    Check 'control.health' ($f.type -eq 9 -and $j.ok -eq $true) "json=$($f.json)"
+
+    Send-Frame $s 12 4 0 '' $null                       # version
+    $f = Recv-Frame $s
+    $j = if ($f -and $f.json) { $f.json | ConvertFrom-Json } else { $null }
+    Check 'control.version' ($f.type -eq 9 -and $j.version.Length -gt 0 -and $j.abi -eq 3 -and $j.arch -match '^(x64|x86)$') "json=$($f.json)"
+
+    Send-Frame $s 12 0 0 '' $null                       # cancel（没有执行在跑）
+    $f = Recv-Frame $s
+    $j = if ($f -and $f.json) { $f.json | ConvertFrom-Json } else { $null }
+    Check 'control.cancel-idle' ($f.type -eq 8 -and $j.applied -eq $false -and $j.reason -eq 'no-execution') "json=$($f.json)"
+
+    Send-Frame $s 12 99 0 '' $null                      # 未知命令
+    $f = Recv-Frame $s
+    $j = if ($f -and $f.json) { $f.json | ConvertFrom-Json } else { $null }
+    Check 'control.unknown-cmd' ($f.type -eq 8 -and $j.applied -eq $false -and $j.reason -eq 'unknown-cmd') "json=$($f.json)"
+
+    Send-Frame $s 12 5 0 '' $null                       # shutdown
+    $f = Recv-Frame $s
+    $j = if ($f -and $f.json) { $f.json | ConvertFrom-Json } else { $null }
+    Check 'control.shutdown-ack' ($f.type -eq 8 -and $j.applied -eq $true -and $j.reason -eq 'shutdown') "json=$($f.json)"
+    $script:proc.WaitForExit(5000) | Out-Null
+    Check 'control.shutdown-exits' ($script:proc.HasExited -and $script:proc.ExitCode -eq 0) `
+        "exited=$($script:proc.HasExited) code=$(if ($script:proc.HasExited) { $script:proc.ExitCode } else { 'n/a' })"
+    $script:proc = $null                                 # 已经退出，别让 finally 再 Kill
+}
+
+# --------------------------------------- ⑨ 显式 token：错的被拒、对的通过（D21）
+$tok = 'deadbeefcafe1234'
+With-Server @("--server-token=$tok") {
+    param($c)
+    $s = $c.GetStream()
+    Send-Frame $s 10 0 1 '' ([System.Text.Encoding]::UTF8.GetBytes('wrong-token'))
+    $f = Recv-Frame $s
+    $j = if ($f -and $f.json) { $f.json | ConvertFrom-Json } else { $null }
+    Check 'auth.bad-token' ($f.type -eq 6 -and $j.error -eq 'unauthorized') "json=$($f.json)"
+}
+
+With-Server @("--server-token=$tok") {
+    param($c)
+    $s = $c.GetStream()
+    Send-Frame $s 10 0 1 '' ([System.Text.Encoding]::UTF8.GetBytes($tok))
+    $f = Recv-Frame $s
+    $j = if ($f -and $f.json) { $f.json | ConvertFrom-Json } else { $null }
+    Check 'auth.good-token' ($f.type -eq 9 -and $j.ok -eq $true -and $j.auth -eq $true) "json=$($f.json)"
+}
+
+Write-Output ''
+Write-Output ("e2e_tcp: variant={0} pass={1} fail={2}" -f $(if ($Variant) { $Variant } else { 'auto' }), $script:pass, $script:fail)
+if ($script:fail -gt 0) { exit 1 } else { exit 0 }

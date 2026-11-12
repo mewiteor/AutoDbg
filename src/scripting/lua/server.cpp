@@ -21,6 +21,7 @@
 #include "file_io.hpp"     /* S7：client 文件 I/O（效果协议） */
 #include "output.hpp"
 #include "stream.hpp"      /* 流式 /run（帧 + chunked）：open_file / f:write 的落点 */
+#include "tcp_server.hpp" /* T2（D42）：`--server=tcp` 的 raw TCP 帧服务端（本文件之外） */
 
 #include "common/http.hpp"
 #include "common/json_writer.hpp"
@@ -1821,6 +1822,10 @@ int server_main(const autodbg_boot *boot)
     using autodbg::core::ErrorS;
     using autodbg::core::PrintF;
     using autodbg::core::PrintS;
+
+    /* T2（D42）：`--server=tcp` 走 raw TCP 帧（新的主契约）；1 = 现行 HTTP（待删）。 */
+    if (boot->server_mode == 2u)
+        return tcp_server_main(boot);
 
     server_config cfg;
     char          err[256];

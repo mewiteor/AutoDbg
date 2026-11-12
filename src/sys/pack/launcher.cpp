@@ -560,7 +560,7 @@ void print_usage()
     out("      --selftest             run built-in pure-function self test\n");
     out("      --json                 print one machine-readable JSON line (D50)\n");
     out("      --out=<path>           write the same JSON to <path>; stdout stays empty\n");
-    out("      --server[=http]        run as HTTP server (see below)\n");
+    out("      --server[=http|tcp]      server mode: http (default, deprecated) or raw tcp frames\n");
     out("      --server-addr=<ip:port>  listen address (default 127.0.0.1:8642)\n");
     out("      --server-port=<port>     only override the port\n");
     out("      --server-token=<hex|auto|none>\n");
@@ -598,6 +598,7 @@ extern "C" int launcher_main(int argc, char **argv)
     /* S0（plan_server.md）：server / 自测模式的选项；字符串拷到静态缓冲，
      * 保证在 `autodbg_run` 调用期间有效。 */
     bool        server_mode    = false;
+    unsigned    server_mode_v  = 1;   /* 1 = http（将被 D41 删除）、2 = raw tcp（D42） */
     bool        selftest_mode  = false;
     const char *server_addr    = nullptr;
     unsigned    server_port    = 0;
@@ -679,12 +680,23 @@ extern "C" int launcher_main(int argc, char **argv)
         else if (str_eq(a, "--server") || starts_with(a, "--server="))
         {
             const char *v = (a[8] == '=') ? (a + 9) : "";
-            if (!str_ieq(v, "") && !str_ieq(v, "http"))
+            /* T2（D42）：`--server=tcp` 选 raw TCP 帧（新口径）；`--server` / `--server=http`
+             * 仍是现行 HTTP（随 D41 删除）。只报错不猜。 */
+            if (str_ieq(v, "tcp"))
             {
-                out_err("launcher: only --server=http is supported (D20)\n");
-                return 1;
+                server_mode   = true;
+                server_mode_v = 2;
             }
-            server_mode = true;
+            else if (str_ieq(v, "") || str_ieq(v, "http"))
+            {
+                server_mode   = true;
+                server_mode_v = 1;
+            }
+            else
+            {
+                out_err("launcher: --server=<http|tcp> only\n");
+                return 2;
+            }
         }
         else if (starts_with(a, "--server-addr="))
         {
@@ -978,7 +990,7 @@ extern "C" int launcher_main(int argc, char **argv)
     boot.variant    = used_variant;
 
     /* ---- S0（D27）：server / 自测模式 ---- */
-    boot.server_mode = server_mode ? 1u : 0u;
+    boot.server_mode = server_mode ? server_mode_v : 0u;
     boot.selftest    = selftest_mode ? 1u : 0u;
     boot.server_addr = nullptr;
     if (server_port != 0)
