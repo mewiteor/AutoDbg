@@ -157,7 +157,7 @@ ad.setup({
 -- ---------------------------------------------------------------- ⑤ health / version
 local h = ad.health({ sync = true })
 check("health.ok", h.ok == true and h.mode == "remote", "mode=" .. tostring(h.mode) .. " body=" .. tostring(h.body):sub(1, 80))
-check("health.proto", type(h.info) == "table" and h.info.proto == 1, "proto=" .. tostring(h.info and h.info.proto))
+check("health.proto", type(h.info) == "table" and h.info.proto == 2, "proto=" .. tostring(h.info and h.info.proto))
 
 local v = ad.version({ sync = true })
 check("version.ok", v.ok == true, "error=" .. tostring(v.error))

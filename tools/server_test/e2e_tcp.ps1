@@ -9,12 +9,13 @@
 #
 # 帧布局（见 src/common/frame.hpp 与 src/scripting/lua/stream.hpp）：
 #   u32 payload_len | u8 type | u8 flags | u16 id | u32 data_len | [json] | [data]
-#   握手帧：id = 协议版本（1），data = token，json = 其余字段（本篇不用）
+#   握手帧：id = 协议版本（2 = T7 D2a），data = token，json = 其余字段（本篇不用）
+#   script 帧：id = 命令号（归因用：out / event 帧的 id 就是它；result 帧的 id 仍是退出码）
 #   control 帧：flags = 命令（0 cancel / 1 kill / 2 detach / 3 health / 4 version / 5 shutdown）
 #   → 应答：ack = 8（flags bit0 = applied）、info = 9、error = 6、result = 5（id = 退出码）
 #
 # 覆盖：
-#   ① 握手成功 → info 帧（proto=1、transport=tcp）
+#   ① 握手成功 → info 帧（proto=2、transport=tcp）
 #   ② 版本不符 → error{bad-version} 且连接被关
 #   ③ 第一帧不是握手 → error{handshake-required}
 #   ④ script 帧 → out 帧（stdout/stderr 分桶）+ result + end
@@ -33,6 +34,9 @@
 #   ⑭ **调试回调里的阻塞读**（T4 收尾）：`Run` 的 callback 里 `f:read`，超时后回调返回、
 #      调试会话不断（下一次 `Run` 照常）；并且**迟到的 read_resp 被丢弃**（D45 规则 3）
 #   ⑮ 绑 `0.0.0.0` 时的启动横幅**列出本机网卡地址**（client 直接挑一条去 `--remote`）
+#   ⑯ T7.3 `dbg` 状态机（`pump.*`，8 条；只在 x86 跑 —— fixture 是 x86-only）
+#   ⑰ T7 D2a（proto 2）：`out` 帧的**命令号归因**（= script 帧的 id）与 `event` 帧（16：命中记录
+#      实时发给执行连接；`id` = 命令号；**不进** `--json` 信封）
 # =============================================================================
 [CmdletBinding()]
 param(
@@ -211,11 +215,11 @@ function Run-Client([string[]]$ClientArgs, [int]$TimeoutMs = 25000)
 With-Server @() {
     param($c)
     $s = $c.GetStream()
-    Send-Frame $s 10 0 1 '' $null
+    Send-Frame $s 10 0 2 '' $null
     $f = Recv-Frame $s
     Check 'proto.info' ($f -and $f.type -eq 9) "type=$($f.type)"
     $j = if ($f.json) { $f.json | ConvertFrom-Json } else { $null }
-    Check 'proto.info-fields' ($j.ok -eq $true -and $j.proto -eq 1 -and $j.transport -eq 'tcp') "json=$($f.json)"
+    Check 'proto.info-fields' ($j.ok -eq $true -and $j.proto -eq 2 -and $j.transport -eq 'tcp') "json=$($f.json)"
 }
 
 # ------------------------------------------------- ② 版本不符 → error 并断开
@@ -226,7 +230,7 @@ With-Server @() {
     $f = Recv-Frame $s
     $j = if ($f -and $f.json) { $f.json | ConvertFrom-Json } else { $null }
     Check 'handshake.bad-version' ($f -and $f.type -eq 6 -and $j.error -eq 'bad-version') "frame=$($f.type) json=$($f.json)"
-    Check 'handshake.bad-version-values' ($j.want -eq 1 -and $j.got -eq 99) "want=$($j.want) got=$($j.got)"
+    Check 'handshake.bad-version-values' ($j.want -eq 2 -and $j.got -eq 99) "want=$($j.want) got=$($j.got)"
     $next = Recv-Frame $s
     Check 'handshake.bad-version-closes' ($null -eq $next) 'connection should be closed'
 }
@@ -245,7 +249,7 @@ With-Server @() {
 With-Server @() {
     param($c)
     $s = $c.GetStream()
-    Send-Frame $s 10 0 1 '' $null
+    Send-Frame $s 10 0 2 '' $null
     $null = Recv-Frame $s
 
     Send-Frame $s 11 0 0 '' ([System.Text.Encoding]::UTF8.GetBytes('print("hi")'))
@@ -281,7 +285,7 @@ With-Server @() {
 With-Server @() {
     param($c)
     $s = $c.GetStream()
-    Send-Frame $s 10 0 1 '' $null
+    Send-Frame $s 10 0 2 '' $null
     $null = Recv-Frame $s
 
     Send-Frame $s 12 3 0 '' $null
@@ -325,7 +329,7 @@ $BusySrc = 'while true do end'   # 纯 Lua 死循环 → 只能靠 lua_sethook �
 With-Server @() {
     param($c)
     $s = $c.GetStream()
-    Send-Frame $s 10 0 1 '' $null
+    Send-Frame $s 10 0 2 '' $null
     $null = Recv-Frame $s
 
     Send-Frame $s 11 0 0 '' ([System.Text.Encoding]::UTF8.GetBytes($BusySrc))
@@ -378,7 +382,7 @@ $tok = 'deadbeefcafe1234'
 With-Server @("--server-token=$tok") {
     param($c)
     $s = $c.GetStream()
-    Send-Frame $s 10 0 1 '' ([System.Text.Encoding]::UTF8.GetBytes('wrong-token'))
+    Send-Frame $s 10 0 2 '' ([System.Text.Encoding]::UTF8.GetBytes('wrong-token'))
     $f = Recv-Frame $s
     $j = if ($f -and $f.json) { $f.json | ConvertFrom-Json } else { $null }
     Check 'auth.bad-token' ($f.type -eq 6 -and $j.error -eq 'unauthorized') "json=$($f.json)"
@@ -386,7 +390,7 @@ With-Server @("--server-token=$tok") {
 With-Server @("--server-token=$tok") {
     param($c)
     $s = $c.GetStream()
-    Send-Frame $s 10 0 1 '' ([System.Text.Encoding]::UTF8.GetBytes($tok))
+    Send-Frame $s 10 0 2 '' ([System.Text.Encoding]::UTF8.GetBytes($tok))
     $f = Recv-Frame $s
     $j = if ($f -and $f.json) { $f.json | ConvertFrom-Json } else { $null }
     Check 'auth.good-token' ($f.type -eq 9 -and $j.ok -eq $true -and $j.auth -eq $true) "json=$($f.json)"
@@ -423,7 +427,7 @@ With-Server @() {
 
     $r = Run-Client @("--remote=127.0.0.1:$Port", '--health')
     $j = if ($r.out) { try { $r.out | ConvertFrom-Json } catch { $null } } else { $null }
-    Check 'client.health' ($r.code -eq 0 -and $j.ok -eq $true -and $j.proto -eq 1) "code=$($r.code) out=[$($r.out)]"
+    Check 'client.health' ($r.code -eq 0 -and $j.ok -eq $true -and $j.proto -eq 2) "code=$($r.code) out=[$($r.out)]"
 
     $r = Run-Client @("--remote=127.0.0.1:$Port", '--version')
     $j = if ($r.out) { try { $r.out | ConvertFrom-Json } catch { $null } } else { $null }
@@ -488,7 +492,7 @@ if ($null -eq $clientRes) {
     Bad 'read.timeout' 'server did not start'
 } else {
     $s = $clientRes.GetStream()
-    Send-Frame $s 10 0 1 '' $null
+    Send-Frame $s 10 0 2 '' $null
     $null = Recv-Frame $s                                   # info
     Send-Frame $s 11 0 0 '' ([System.Text.Encoding]::UTF8.GetBytes($toSrc))
 
@@ -549,7 +553,7 @@ if ($null -eq $cbRes) {
     Bad 'callback.read' 'server did not start'
 } else {
     $s = $cbRes.GetStream()
-    Send-Frame $s 10 0 1 '' $null
+    Send-Frame $s 10 0 2 '' $null
     $null = Recv-Frame $s
     Send-Frame $s 11 0 0 '' ([System.Text.Encoding]::UTF8.GetBytes($cbSrc))
 
@@ -872,7 +876,7 @@ print('after_detach=' .. tostring(select(2, dbg.pump(10, false))))
             {
             $c2.ReceiveTimeout = 12000
             $s = $c2.GetStream()
-            Send-Frame $s 10 0 1 '' $null
+            Send-Frame $s 10 0 2 '' $null
             $null = Recv-Frame $s
             Send-Frame $s 11 0 1 '' ([System.Text.Encoding]::UTF8.GetBytes((Get-Content $s6 -Raw)))
             $first = Recv-Until $s 4 8000
@@ -901,6 +905,108 @@ print('after_detach=' .. tostring(select(2, dbg.pump(10, false))))
         }
     }
 }
+
+Write-Output ''
+
+# ---------------- ⑰ T7 D2a：命令号归因（out.id）+ `event` 帧（2 条） ----------------
+# proto 2 的两条新语义：
+#   ① `out` 帧的 `id` = **产生它的命令号**（最近一次 `script` 帧的 `id`）；0 = 无归属。
+#      `result` 帧的 `id` 仍是**退出码**（已定且另有门禁，这一条一起断掉）。
+#   ② 每条命中记录除进 `hits()` / 用户回调外，还实时发一帧 `event`（16）：json 与 `hits()` 记录同形
+#      （多一个 `dropped`），`id` = 命令号。客户端可以忽略它，`--json` 信封的字段集不变（10 个）。
+# ❗「无归属 = id 0」用「`script` 帧 id = 0」来断：server 自己的启动横幅走控制台、
+#   不在这条执行连接上，拿不到 `out` 帧（真拿不到就只断 id 7 那半边，见本节注释）。
+With-Server @() {
+    param($c)
+    $s = $c.GetStream()
+    Send-Frame $s 10 0 2 '' $null
+    $null = Recv-Frame $s
+
+    # ❗一次 `print` 可能拆成多个 `out` 帧（文本一段、换行一段）⇒ 按帧收集，别只留最后一条。
+    Send-Frame $s 11 0 7 '' ([System.Text.Encoding]::UTF8.GetBytes("print('cmd7')"))
+    $ids7 = New-Object System.Collections.Generic.List[int]
+    $txt7 = ''
+    $res7 = $null
+    for ($i = 0; $i -lt 8; $i++)
+    {
+        $f = Recv-Frame $s
+        if ($null -eq $f) { break }
+        if ($f.type -eq 4) { $ids7.Add($f.id); $txt7 += $f.data }
+        elseif ($f.type -eq 5) { $res7 = $f }
+        elseif ($f.type -eq 14) { break }
+    }
+
+    Send-Frame $s 11 0 0 '' ([System.Text.Encoding]::UTF8.GetBytes("print('cmd0')"))
+    $ids0 = New-Object System.Collections.Generic.List[int]
+    $txt0 = ''
+    for ($i = 0; $i -lt 8; $i++)
+    {
+        $f = Recv-Frame $s
+        if ($null -eq $f) { break }
+        if ($f.type -eq 4) { $ids0.Add($f.id); $txt0 += $f.data }
+        elseif ($f.type -eq 14) { break }
+    }
+
+    $all7 = ($ids7.Count -gt 0) -and (@($ids7 | Where-Object { $_ -ne 7 }).Count -eq 0)
+    $all0 = ($ids0.Count -gt 0) -and (@($ids0 | Where-Object { $_ -ne 0 }).Count -eq 0)
+    Check 'proto.out-id-attribution' ($all7 -and $txt7 -match 'cmd7' -and $all0 -and $txt0 -match 'cmd0' -and `
+        $res7 -and $res7.id -eq 0) `
+        ("out.id(script id 7)=[" + ($ids7 -join ',') + "] out.id(script id 0)=[" + ($ids0 -join ',') +
+         "] result.id(=exit)=" + $(if ($res7) { $res7.id } else { 'none' }))
+}
+
+# `event` 帧：跑一段会**命中断点**的脚本（ntdll 的初始 int 3 —— 与 `pump.*` 段同一个来源），
+# 断言的 `id` 必须是发出它的命令号 3；再用 `--remote --json` 跑同一段，确认事件帧不进信封。
+# 目标进程按位数挑：32 位调试器只能调 32 位目标（ERROR_NOT_SUPPORTED），反之亦然。
+$evDir = if ($Render -eq '86') { 'SysWOW64' } else { 'System32' }
+$evExe = Join-Path $env:WINDIR "$evDir\cmd.exe"
+if (-not (Test-Path $evExe)) { $evExe = Join-Path $env:WINDIR 'system32\cmd.exe' }
+$s8 = Join-Path $TmpDir 'd2a_event.lua'
+[IO.File]::WriteAllText($s8, @"
+local d, err = dbg.create{ imagepath = '$($evExe.Replace('\','/'))', cmdline = '/c exit' }
+if not d then print('create ' .. tostring(err)) return end
+local hits = 0
+for i = 1, 20 do
+    local ev = d:pump(3000)
+    if ev == nil then break end
+    hits = #d:hits()
+    if hits > 0 then break end
+    d:cont(0x00010002)   -- DBG_CONTINUE：放行 CREATE_PROCESS / LOAD_DLL 这些非异常事件
+end
+print('event_hits=' .. hits)
+d:kill()
+"@, (New-Object System.Text.UTF8Encoding($false)))
+
+With-Server @('--server-timeout=20000') {
+    param($c)
+    $s = $c.GetStream()
+    Send-Frame $s 10 0 2 '' $null
+    $null = Recv-Frame $s
+    Send-Frame $s 11 0 3 '' ([System.Text.Encoding]::UTF8.GetBytes((Get-Content $s8 -Raw)))
+    $evf = $null
+    for ($i = 0; $i -lt 200; $i++)
+    {
+        $f = Recv-Frame $s
+        if ($null -eq $f) { break }
+        if ($f.type -eq 16) { if ($null -eq $evf) { $evf = $f } }
+        elseif ($f.type -eq 14) { break }
+    }
+    try { $c.Close() } catch { }
+    Start-Sleep -Milliseconds 300   # 让 worker 收尾（busy 标志复位）再跑下一个客户端
+
+    $rj  = Run-Client @("--remote=127.0.0.1:$Port", '--json', $s8)
+    $ej  = $null
+    try { $ej = $rj.out | ConvertFrom-Json } catch { }
+    # 信封的字段集一字不多、一字不少（排序后比，避免把「字段顺序」也钉进口径）
+    $wantKeys = 'canceled,exit,images,ok,pid,result,stderr,stdout,timed_out,truncated'
+    $keys = if ($ej) { (@($ej.PSObject.Properties.Name | Sort-Object) -join ',') } else { '' }
+    Check 'proto.event-frame' ($evf -and $evf.id -eq 3 -and $evf.json -match '"rva"' -and `
+        $evf.json -match '"type"' -and `
+        $ej -and $keys -eq $wantKeys) `
+        ("event.id=" + $(if ($evf) { $evf.id } else { 'none' }) + " event.json=[" + $(if ($evf) { $evf.json } else { '' }) +
+         "] json.keys=[" + $keys + "]")
+}
+
 Write-Output ("e2e_tcp: variant={0} pass={1} fail={2}" -f $(if ($Variant) { $Variant } else { 'auto' }), $script:pass, $script:fail)
 if ($script:fail -gt 0) { exit 1 } else { exit 0 }
 

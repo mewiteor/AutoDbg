@@ -11,6 +11,10 @@
  *   · 帧由**执行脚本的那条线程**直接写 socket —— `f:write` 因此不需要 yield，回调里也能用；
  *   · 不缓冲整条流、不落盘：每帧发完就走，内存只占调用方给的那一块；
  *   · 背压交给 socket：`net_send_all` 带超时，客户端断了/太慢就返回失败（上层报错，不卡死）。
+ *
+ * T7 切片 D2a：多一个**当前命令号**（`stream_set_command_id` / `stream_command_id`）。
+ *   它只是「最近一次 `script` 帧的 `id`」的存放处（由 `tcp_server.cpp` 在跑每段脚本前后置位/清 0）——
+ *   本文件不解释它，`out` / `event` 帧的归因由各自的发送点读它。
  * ========================================================================== */
 #include "stream.hpp"
 
@@ -30,6 +34,10 @@ unsigned          g_timeout = 8000;
 bool              g_active  = false;
 int               g_framing = stream_framing_chunked;
 stream_transport  g_tp      = {nullptr, nullptr, nullptr, nullptr};
+
+/* 当前命令号（T7 切片 D2a）：最近一次收到的 `script` 帧的 `id`；0 = 无命令。
+ * 执行串行 ⇒ 只有执行脚本的那条线程读写它，不需要锁、也不是 `thread_local`（§11.5）。 */
+unsigned          g_cmd_id  = 0;
 
 /* 执行期 poll 的重组缓冲（D32）：只应付 `control` / `end` 这种小帧。
  * ❗脚本线程是唯一 writer/reader，不需要锁；`stream_begin_ex` / `stream_begin` 时清零。
@@ -197,6 +205,7 @@ bool stream_begin(long long sock, unsigned send_timeout_ms)
     g_tp.ctx  = nullptr;
     g_active  = false;
     g_poll_have = 0;
+    g_cmd_id    = 0;
 
     static const char k_head[] = "HTTP/1.1 200 OK\r\n"
                                  "Content-Type: application/x-autodbg-stream\r\n"
@@ -225,6 +234,7 @@ bool stream_begin_ex(const stream_transport &tp, int framing, unsigned send_time
     g_framing = framing;
     g_tp      = tp;
     g_poll_have = 0;                /* 新的连接：重组缓冲从头算 */
+    g_cmd_id    = 0;                /* 新连接还没有命令 */
     g_active  = true;               /* 分帧层自己起头（raw 没有握手串要发） */
     return true;
 }
@@ -240,11 +250,22 @@ void stream_end()
     g_poll_have = 0;
     g_ctrl_fn   = nullptr;
     g_ctrl_ctx  = nullptr;
+    g_cmd_id    = 0;
 }
 
 bool stream_active()
 {
     return g_active;
+}
+
+void stream_set_command_id(unsigned id)
+{
+    g_cmd_id = id;
+}
+
+unsigned stream_command_id()
+{
+    return g_cmd_id;
 }
 
 bool stream_write_frame(unsigned type,

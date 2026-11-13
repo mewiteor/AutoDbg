@@ -18,6 +18,8 @@
  * 约定（D43/D45）：
  *   · 一次调用 = 一次执行，严格串行 ⇒ 执行连接**只有一个 reader**（脚本线程）；
  *   · `u16 id` 是**句柄号**，不是请求相关性 id；同一句柄最多一个在途请求；
+ *     ❗例外（T7 D2a）：`out` / `event` 帧的 `id` = **命令号**（`script` 帧的 `id`），
+ *     `result` 帧的 `id` = **退出码**；两者都不是句柄号。
  *   · 写这条连接的就是执行脚本的那条线程 ⇒ `f:write` 不需要 yield、回调里也能用。
  *
  * 握手帧（`stream_frame_handshake`）的字段落点（T2 定稿）：
@@ -32,20 +34,24 @@
 namespace autodbg::host
 {
 /* 协议版本：握手帧（`stream_frame_handshake`）里带；不符 → error 帧 + 关连接。
- * T2 定版为 1；改帧类型/字段语义必须 +1（客户端与模块同版本才能通）。 */
+ * T2 定版为 1；改帧类型/字段语义必须 +1（客户端与模块同版本才能通）。
+ * T7 切片 D2a 定版为 **2**：新增 `event` 帧（16）与 `out` 帧的**命令号归因**（见下面
+ * 两条约定）——客户端必须实现归因，而握手帧是唯一的协商手段，所以只能 bump。 */
 enum
 {
-    k_stream_proto_version = 1,
+    k_stream_proto_version = 2,
 };
 
-/* 帧类型：出向 1–9（server → client）、入向 10–14（client → server）、15 = 双向通知 */
+/* 帧类型：出向 1–9 与 16（server → client）、入向 10–14（client → server）、15 = 双向通知 */
 enum stream_frame_type
 {
     /* ---- 出向 ---- */
     stream_frame_open   = 1,  /* json {path, mode}；id = 句柄号 */
     stream_frame_data   = 2,  /* 原始字节（不编码、不转义）；id = 句柄号 */
     stream_frame_close  = 3,  /* id = 句柄号 */
-    stream_frame_out    = 4,  /* flags：0 = stdout / 1 = stderr */
+    stream_frame_out    = 4,  /* flags：0 = stdout / 1 = stderr；❗`id` = 产生它的**命令号**
+                               * （= 最近一次 `script` 帧的 `id`，见 `stream_command_id`）；
+                               * 0 = 无归属（引擎自己打的输出） */
     stream_frame_result = 5,  /* json = `--json` 的同一份信封；❗`id` = 退出码（u16 二补数）、
                                * `flags` 位：0x01 ok / 0x02 canceled / 0x04 timed_out / 0x08 truncated
                                * （客户端要退码与状态但**不得解 JSON**（D28）⇒ 走帧头） */
@@ -64,7 +70,22 @@ enum stream_frame_type
 
     /* ---- 双向 ---- */
     stream_frame_cancel_notify = 15,  /* json {id}：被取消的请求，client 必须丢弃该轮本地 I/O */
+
+    /* ---- 出向（T7 切片 D2a；号段在 15 之后，语义与 1–9 同向） ---- */
+    stream_frame_event = 16,  /* json = 一条命中记录 {type, pid, tid, ea, modname, rva, code,
+                               * first_chance, dropped}（与 `hits()` / 事件表同形，多一个
+                               * `dropped` = 记录时的累计丢弃数）。❗`id` = 产生它的**命令号**
+                               * （`script` 帧的 `id`），0 = 无归属。
+                               * 客户端可以忽略它：`--json` 的信封里**没有**这一帧。 */
 };
+
+/* ---- 命令号归因（T7 切片 D2a）----
+ * 「当前命令号」= 最近一次收到的 `script` 帧的 `id`（❗握手帧的 `id` 是协议版本，不是命令号）。
+ * server 在跑一段脚本前设它、跑完（`result` + `end` 之后）清 0；`out` / `event` 帧据此归因。
+ * 执行严格串行（D43）⇒ 一个模块级变量就够：不加锁、不是 `thread_local`（§11.5）。
+ * ❗`result` 帧的 `id` 仍是**退出码**（u16 二补数），与命令号无关；不要把它挪进 json。 */
+void     stream_set_command_id(unsigned id);
+unsigned stream_command_id();
 
 /* payload 的分帧方式（帧布局本身与传输无关，只有这一层不同） */
 enum stream_framing

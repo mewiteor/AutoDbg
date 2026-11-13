@@ -11,6 +11,8 @@
  *   ③ 缓冲走 `common::alloc/resize/release`；`print` 的 echo 不做（见头文件取舍说明）。
  *   ④ T1（D50）：`images` 登记表 —— 固定 64 条 + 去重 + 丢弃计数，不越界；路径按
  *      UTF-8 存（就是 Lua 字符串原本的字节），`output_begin` 时清空。
+ *   ⑤ T7 切片 D2a：流式请求里的 `out` 帧 `id` = **产生它的命令号**（`stream_command_id()`），
+ *      不再是 0 —— 客户端因此能把一段输出归到它自己那条命令上。
  * ========================================================================== */
 #include "output.hpp"
 
@@ -256,10 +258,11 @@ void output_write(int stream, const char *data, size_t len)
         return;
 
     /* 流式请求（`X-AutoDbg-Stream: 1`）：不攒缓冲，直接当 `out` 帧发出去（长会话也能实时看到）。
-     * 帧由执行脚本的线程写 socket，与 `f:write` 走同一条路径 → 顺序天然一致。 */
+     * 帧由执行脚本的线程写 socket，与 `f:write` 走同一条路径 → 顺序天然一致。
+     * ❗`id` = 产生它的**命令号**（T7 D2a）；0 = 无归属（引擎自己的输出） */
     if (stream_active())
     {
-        stream_write_frame(stream_frame_out, 0, (stream == 2) ? 1u : 0u, nullptr, 0, data, len);
+        stream_write_frame(stream_frame_out, stream_command_id(), (stream == 2) ? 1u : 0u, nullptr, 0, data, len);
         return;
     }
 

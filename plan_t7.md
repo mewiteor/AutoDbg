@@ -192,7 +192,7 @@ hits / dropped / setcap / code / stopped / paused / caps / help`。回调参数�
 | `out` 的 `id` | 改成「产生它的命令号」；0 = 无命令（无归属的输出仍可发，客户端知道是 engine 自己打的） |
 | `result` 的 `id` | ❗保持 = 退出码（u16 二补数）——这条已经定死并有门禁；退出码不能挪进 json，否则 `client.cpp` 与门禁都改 |
 | 命令号来源 | `script` 帧的 `id` = 客户端递增的命令号（现在 `script` 的 id 未被使用 ⇒ 正好腾出来） |
-| 版本 | 因为客户端必须实现归因 ⇒ **proto 1 → 2**（握手帧是唯一协商手段，没有别的办法）。要改的断言：`proto.info-fields`（`proto`）、`handshake.bad-version-values`（`want`）、nvim 的 `health.proto` |
+| 版本 | 因为客户端必须实现归因 ⇒ **proto 1 → 2**（握手帧是唯一协商手段，没有别的办法）。要改的断言：`proto.info-fields`（`proto`）、`handshake.bad-version-values`（`want`）、nvim 的 `health.proto`。**✅ D2a 已落地** |
 | 如果不想 bump | 唯一不 bump 的方案是「REPL 里禁止回调 print + 只做同步命令」——不可接受，所以写清楚：bump 是代价，不是选择 |
 
 ---
@@ -547,14 +547,15 @@ type  pid  tid  ea  modname  rva  code  first_chance  cont_code
 | **C2b** | 进程树：子进程事件归属父会话、按 pid 的句柄表（`read`/`write`/`VirtualProtectEx` 不能只用 `proc().hProcess`）、每 **pid** 的待应答槽、子进程 fixture | ~400 行 | `route.child-process` / `route.child-handle` / `route.other-session-queued` |
 | **C3** | 29 名转薄转发 + `Var` 退出新面（D52） | ~200 行 | `session.default-parity` |
 | **D1** ✅ 已落地 | REPL 本体（`--repl` + `boot.repl_mode` + ABI 4 → 5）：`ReadFile` 优先（管道可跑）/ `ReadConsoleW` 回退、≤250 ms 切片、`=` 简写、多行续行、退出码 = 最后一条命令、EOF → 0 | ~500 行（含门禁） | 新 `e2e_repl.ps1` 8 条（86 / 86 legacy / 64） |
-| **D2** | 协议：`event` 帧 + `out.id` 归因 + proto 1 → 2；`--repl` 与 `--server` 并存（每行一条命令）；外加两件小事：`--repl --remote` 目前**静默忽略**（应报错）、REPL 退出时「N 个会话未关闭」报告（D54 的安全网） | ~300 行 | `repl.event-attribution` / `repl.exit-report` / `repl.remote-exclusive` |
+| **D2a** ✅ 已落地 | 协议 1 → **2**：`stream_frame_event = 16`（json = 命中记录，`id` = 命令号）+ `out` 帧 `id` = 命令号（`stream_set_command_id`）+ `result.id` 仍 = 退出码；客户端认并忽略 `event`；nvim 子模块同步 PROTO 2 | ~240 行 | `e2e_tcp` 56 → 58（`proto.out-id-attribution` / `proto.event-frame`），x64 50 |
+| **D2b** | `--repl` 与 `--server` 并存（每行一条命令、状态跨行存活）；`--repl --remote` 应从「静默忽略」改成报错退 2；REPL 退出时「N 个会话未关闭」报告（D54 的安全网） | ~200 行 | `repl.server-command-ids` / `repl.exit-report` / `repl.remote-exclusive` |
 | **C-remote** | `dbg.remote(host:port, token)` 远端 session 代理（方法面与本地相同，复用 `--server` + `client.cpp`）—— 跨位数 / 强隔离的唯一形态（D56） | ~200 行 | `remote.proxy-parity`（需两个位数） |
 | **sugar（T7.6）** ✅ 已落地 | `lualib/dbglib.lua`（烘焙成全局 `dbglib`）：`wait_all(goals[,opts])`（rendezvous）与 `run_all(params_list[,opts])`（batch/collect），纯 Lua、5.1 语法、只跑在 `dbg.pump`/`stopped()`/`paused()` 上（D58） | ~250 行 | `e2e_dbg` 21 → 23（`sugar.wait-all` / `sugar.run-all`） |
 
 顺序硬约束：**A 必须早于 C**（`detach`/`kill` 就是 Session 对象的方法）；**C 必须早于 D**（REPL 里
 人/AI 都按对象写）。29 个旧名在 C 期间转成对象 API 的薄转发（行为逐字节不变，`session.default-parity`
 守门），退役留给之后的 D 条目。
-### 11.8 切片 A / B / C1a / C1b / C2a / sugar / D1 落地状态（已提交）
+### 11.8 切片 A / B / C1a / C1b / C2a / sugar / D1 / D2a 落地状态（已提交）
 
 - `src/common/platform.{hpp,cpp}`（新文件）：`is_win9x()` / `is_nt()`（`GetVersionExA` 的 `dwPlatformId`，与启动器 `detect_variant()` 同一判据）+ `arch_name` / `variant_name` / `flavor_name`（收拢一处，免得 caps / help / info 各写一份字符串）。❗为什么不用编译开关：`/DAUTODBG_WIN9X` 是「要能在 9x 上跑」的**构建约束**，legacy 产物在 Win11 上也跑；而 caps 报的是**这台机器**。
 - `src/scripting/lua/help_bindings.{hpp,cpp}`（新文件）：`help([topic])` 与 `dbg.help()` 共用 `kHelp[]` 一张表，`help('dbg')` 是**前缀匹配生成的成员列表**（不存在第二份）。输出走 `PrintS` ⇒ server 模式自动进 `out` 帧、本地进控制台/管道，本层不碰句柄。正文是**窄串字面量**（现代变体 UTF-8、legacy CP936，`PrintS` 各自转成 console 需要的形式）；**主题名与签名保持 ASCII**（门禁逐字匹配）。❗legacy 编译警告 **C4566** 的教训：`⇒` / `❗` 这类字符**不能出现在字符串字面量里**（CP936 表示不出），注释里可以 —— 帮助正文里一律用 `->` 与「注意：」。
@@ -608,6 +609,15 @@ type  pid  tid  ea  modname  rva  code  first_chance  cont_code
 - 门禁：新 `tools/server_test/e2e_repl.ps1` **8 条**（`repl.stdin-piped` / `multi-line` / `shorthand` / `exit-code-eof` / `exit-code-syntax-error` / `last-error-code` / `json-exclusive` / `state-shared`），86 modern / 86 legacy / 64 全过（8/8/8）。`repl.state-shared` 用 `=dbg.caps().arch` 证明 REPL 与脚本路径**复用同一个 `lua_State`**。
 - 未做（D2 接管）：`event` 帧 / `out.id` 归因 / proto 2 / `--repl` + `--server`；另有两件小尾巴：**`--repl --remote=` 目前被静默忽略**（应像 `--json` 那样退 2）、**REPL 退出时的「N 个会话未关闭」报告**（D54 的安全网）还没写。
 - 残余风险：真控制台路径（提示符 + `ReadConsoleW`）在没有交互控制台的环境里无法覆盖，非控制台路径已全覆盖；行/块上限 4096 字节（超长行截断 → 语法错 3）。
+**切片 D2a（协议 1 → 2）**：
+
+- `k_stream_proto_version` 1 → 2；新增 `stream_frame_event = 16`（json = 命中记录 `{type,pid,tid,ea,modname,rva,code,first_chance,dropped}`，`id` = **产生它的命令号**，0 = 无归属）。
+- **命令号**：模块级 `g_cmd_id`（无锁、非 TLS），由 `tcp_server` 在 `run_one_script` 开头从 `script` 帧的 `id` 写入（accept 线程经 `job.cmd_id` 交给 worker），`result`+`end` 之后清 0。`out` 帧改带它（原来是 0）；**`result` 帧的 `id` 仍是退出码**（这条不动，有门禁）。
+- `event` 帧的发送点是 `dbg_bindings.cpp` 的 `record_hit()` 漏斗 → `emit_event_frame()`：`stream_active()` 为假立刻返回（无分配、无锁、无副作用），发送失败只打一句 stderr，**绝不 `lua_error`**。`hits()` / 事件表的形状未动。
+- 客户端 `client.cpp` 显式认 `event` 并忽略（不进 `--json` 信封）；**`nvim/` 子模块单独提交**（`PROTO = 2` + `EVENT = 16` 并在插件侧忽略），父仓只更新 gitlink —— 这正是 `AGENTS.md` §8 的分仓口径。
+- 门禁：`e2e_tcp` 56 → **58**（`proto.out-id-attribution`：`script` id 7 ⇒ `out` 帧 id 7、id 0 ⇒ 0、`result.id` 仍是退出码；`proto.event-frame`：`script` id 3 ⇒ 至少一帧 `type == 16` 且 `id == 3`、json 含 `rva`/`type`，且该帧不出现在 `--json` 信封里）。86 / 86 legacy / x64 全过（58/58/50）。
+- 实测两条帧样本（写进断言）：`out.id(script id 7)=[7,7]`；`event.id=3 event.json=[{"type":1,"pid":…,"modname":"ntdll.dll","rva":1151400,"code":2147483651,"first_chance":null,"dropped":0}]`。
+- 未做（D2b）：`--repl` + `--server` 的有状态 REPL（每行一条命令）、`--repl --remote` 报错、REPL 退出会话报告、nvim 侧的事件渲染。
 ### 11.9 多 session 的脚本面（D57 / D58，随切片 C / T7.6）
 
 #### 11.9.1 pump 的两层（D57）

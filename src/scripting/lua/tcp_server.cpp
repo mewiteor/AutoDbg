@@ -16,6 +16,10 @@
  *
  * D28：C 侧**不解析 JSON** —— 控制命令放 `flags`、版本放 `id`、退出码放 `result` 帧的 `id`、
  *   状态位放 `flags`（见 `stream.hpp`）。
+ *
+ * T7 切片 D2a（proto 2）：`script` 帧的 `id` 是**命令号** —— accept 线程把它随作业交给 worker，
+ *   `run_one_script` 在跑这一段前 `stream_set_command_id(id)`、跑完清 0；`out` / `event` 帧
+ *   据此归因。`result` 帧的 `id` 仍是退出码（两套含义不混）。
  * ========================================================================== */
 #include "tcp_server.hpp"
 
@@ -396,6 +400,7 @@ struct job
     long long      sock;
     unsigned char *src;      /* 拥有：worker 执行完 release */
     size_t         src_len;
+    unsigned       cmd_id;   /* `script` 帧的 `id` = 命令号（T7 D2a：`out` / `event` 帧的归因） */
     char           chunk[128]; /* script 帧的 json 段 = chunkname（原文，不是 JSON；D28） */
     bool           used;
 };
@@ -403,10 +408,10 @@ struct job
 CRITICAL_SECTION g_q_lock;
 bool             g_q_lock_init = false;
 HANDLE           g_q_event     = nullptr;
-job              g_job         = {-1, nullptr, 0, {0}, false};
+job              g_job         = {-1, nullptr, 0, 0, {0}, false};
 volatile LONG    g_busy        = 0;
 
-bool enqueue(long long sock, unsigned char *src, size_t src_len, const char *chunk)
+bool enqueue(long long sock, unsigned char *src, size_t src_len, unsigned cmd_id, const char *chunk)
 {
     bool ok = false;
     EnterCriticalSection(&g_q_lock);
@@ -415,6 +420,7 @@ bool enqueue(long long sock, unsigned char *src, size_t src_len, const char *chu
         g_job.sock    = sock;
         g_job.src     = src;
         g_job.src_len = src_len;
+        g_job.cmd_id  = cmd_id;
         for (int k = 0; k < (int)sizeof g_job.chunk; k++)
             g_job.chunk[k] = (k < 127 && chunk != nullptr) ? chunk[k] : '\0';
         g_job.chunk[sizeof g_job.chunk - 1] = '\0';
@@ -476,10 +482,16 @@ void on_stream_control(void *ctx, unsigned cmd, unsigned flags)
 
 /* 跑一次脚本（worker 线程体） */
 /* 跑一段脚本（流已开）：out 由 output 层直发，末尾补 result + end 帧。
- * ❗`end` 只结束**这一段**脚本，连接继续可用（一个连接可以发多个 script 帧）。 */
-void run_one_script(const unsigned char *src, size_t src_len, const char *chunkname, const server_config &cfg)
+ * ❗`end` 只结束**这一段**脚本，连接继续可用（一个连接可以发多个 script 帧）。
+ * ❗T7 D2a：`cmd_id` = 这个 `script` 帧的 `id`（命令号）。它在本段执行期间是 `stream_command_id()`
+ *   的值（`out` / `event` 帧据此归因），帧发完就清 0 —— 空闲期任何输出都是无归属的。
+ *   `result` 帧的 `id` **仍是退出码**（u16 二补数），与命令号无关。 */
+void run_one_script(const unsigned char *src, size_t src_len, const char *chunkname, unsigned cmd_id,
+                    const server_config &cfg)
 {
     using namespace autodbg::host;
+
+    stream_set_command_id(cmd_id);
 
     exec_request er;
     er.src       = (const char *)src;
@@ -553,6 +565,7 @@ void run_one_script(const unsigned char *src, size_t src_len, const char *chunkn
     if (w.data() != nullptr)
         stream_write_frame(stream_frame_result, (unsigned)(unsigned short)(int)r.code, flags, w.data(), w.size(), nullptr, 0);
     stream_write_frame(stream_frame_end, 0, 0, nullptr, 0, nullptr, 0);
+    stream_set_command_id(0);   /* 本段命令结束：之后的输出 / 事件都是无归属的（id = 0） */
 }
 
 /* worker 线程服务一条连接（即 plan_cli.md §2.2 的「执行连接」）：
@@ -579,7 +592,7 @@ void worker_serve(const job &j, const autodbg_boot *boot, const server_config &c
     stream_set_control_handler(on_stream_control, nullptr);
 
     /* 首帧（accept 线程已经确认它是 script） */
-    run_one_script(j.src, j.src_len, (j.chunk[0] != '\0') ? j.chunk : nullptr, cfg);
+    run_one_script(j.src, j.src_len, (j.chunk[0] != '\0') ? j.chunk : nullptr, j.cmd_id, cfg);
 
     /* 后续帧 */
     size_t         cap = (size_t)cfg.max_body + (size_t)autodbg::common::k_frame_header_size;
@@ -603,7 +616,7 @@ void worker_serve(const job &j, const autodbg_boot *boot, const server_config &c
                 for (size_t i = 0; i < cn; i++)
                     chunk[i] = (char)buf[i];
                 chunk[cn] = '\0';
-                run_one_script(buf + json_len, dl, chunk, cfg);
+                run_one_script(buf + json_len, dl, chunk, (unsigned)hdr[2] | ((unsigned)hdr[3] << 8), cfg);
                 continue;
             }
             if (type == stream_frame_control)
@@ -761,7 +774,7 @@ int serve_connection(long long sock, unsigned char *hdr, unsigned char *buf, siz
             for (size_t i = 0; i < cn; i++)
                 chunk[i] = (char)buf[i];
             chunk[cn] = '\0';
-            if (!enqueue(sock, src, data_len, chunk))
+            if (!enqueue(sock, src, data_len, (unsigned)hdr[2] | ((unsigned)hdr[3] << 8), chunk))
             {
                 autodbg::common::release(src);
                 fail_conn(sock, "busy");

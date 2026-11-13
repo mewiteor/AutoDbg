@@ -669,6 +669,8 @@ int client_main(const autodbg_boot *boot)
         }
         if (type == stream_frame_end)
             break;
+        if (type == stream_frame_event)
+            continue;   /* T7 D2a：命中记录（`event` 帧）—— 只用于归因，不进 `--json` 信封，也不打 stdout */
         /* info / 其它：忽略（握手时已经用过 info） */
     }
 

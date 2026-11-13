@@ -58,6 +58,11 @@
  *   · 一次执行可以同时有多个会话（每棵树一个）；`dbg.*` 作用在默认会话上，`dbg.detach(pid)` /
  *     `dbg.kill(pid)` 指名会话（C2a）。
  *
+ * 切片 D2a（proto 2）只加了一件向外的事：每条命中记录除了进窗口（`hits()`）与用户回调，
+ *   还向**当前执行连接**发一帧 `event`（`emit_event_frame`：json 与 `hits()` 记录同形，
+ *   多一个 `dropped` 累计值；`id` = 产生它的命令号）。没有执行连接时它一个分支就返回，
+ *   所以本地模式与 `--server` 的回显零副作用；发送失败只报 stderr，**绝不** `lua_error`。
+ *
  * 命中记录缓冲在**宿主层**（core 不认识队列）：环形、满则丢最旧、`dropped()` 可数、`setcap(1..64)` 可调。
  *   记录只在四个事件通道产生（`on_breakpoint` / `on_exception` / `on_user_exception` / `on_single_step`）；
  *   断点**自带**的回调（`on_breakpoint_callback`）只转交用户，不另记 —— 否则同一个命中会被记两次。
@@ -89,6 +94,7 @@
 
 #include "common/allocator.hpp"   /* free_from_tchar → common::release（UNICODE 下才真释放） */
 #include "common/dynapi.hpp"      /* get_proc_as：DebugActiveProcessStop 的能力探测（D51） */
+#include "common/json_writer.hpp" /* `event` 帧的 json（T7 D2a） */
 #include "common/platform.hpp"    /* is_win9x / arch_name / variant_name / flavor_name（caps） */
 #include "core/context.hpp"       /* context_fields / ctx_kind：`d:context` 的键与 `GetContext` 同源 */
 #include "core/core.hpp"
@@ -98,6 +104,7 @@
 #include "bindings.hpp"           /* lua_stack_trace：`d:stack` 复用同一个栈回溯迭代器（不写第二套） */
 #include "exec_guard.hpp"         /* D32：pump 空闲片里的那一个 poll 点 */
 #include "help_bindings.hpp"      /* `dbg.help()` = `help('dbg')`（同一张文本表，不是第二真相源） */
+#include "stream.hpp"             /* T7 D2a：`event` 帧发给当前执行连接 */
 #include "variant.hpp"            /* lv_push / lv_check：契约名的参数形状是 LuaVariant（`StackTrace` 要它） */
 
 namespace autodbg::host
@@ -395,6 +402,41 @@ static void copy_name(char *out, size_t cap, LPCTSTR name)
 
 /* ---------------- 命中窗口 ---------------- */
 
+/* T7 切片 D2a：把一条命中记录作为 `event` 帧（16）发给**当前执行连接**。
+ * 字段与 `hits()` 的记录同形（AI 侧只学一套字段），另多一个 `dropped` = 记录时的累计丢弃数
+ * （告诉客户端「你看的是一个窗口」，plan_t7.md §7）。
+ * 三条口径：
+ *   ① **只在有执行连接时发**：`stream_active()` 为假（本地模式、`--server` 的命令行回显）就
+ *      直接返回 —— 不分配、不加锁、零副作用（这是回调路径，绝不能乱花时间）；
+ *   ② 发送失败**不中断调试**：只往 stderr 报一句（不能 `lua_error`，否则一次网络抖动就会毁掉
+ *      整次调试会话）；
+ *   ③ 不进 `hits()` 的形状（历史窗口按原样），也不进 `--json` 的信封。 */
+static void emit_event_frame(const HitRecord &r, int dropped)
+{
+    if (!stream_active())
+        return;
+
+    autodbg::common::json_writer w;
+    w.begin_object();
+    w.key("type");         w.number((long long)r.type);
+    w.key("pid");          w.number((long long)r.pid);
+    w.key("tid");          w.number((long long)r.tid);
+    w.key("ea");           w.number((unsigned long long)r.ea);
+    w.key("modname");      w.string(r.modname);
+    w.key("rva");          w.number((long long)r.rva);
+    w.key("code");         w.number((long long)r.code);
+    w.key("first_chance");
+    if (r.first_chance < 0) w.null_value();
+    else                    w.boolean(r.first_chance != 0);
+    w.key("dropped");      w.number((long long)dropped);
+    w.end_object();
+
+    if (w.data() == nullptr)
+        return;   /* 分配失败：不发（诊断信息，不打断调试） */
+    if (!stream_write_frame(stream_frame_event, stream_command_id(), 0, w.data(), w.size(), nullptr, 0))
+        autodbg::core::ErrorS("dbg: event frame send failed\n");
+}
+
 static void record_hit(SessionState *st, int type, DWORD pid, DWORD tid, size_t ea, DWORD code,
                        int first_chance, LPCTSTR modname, DWORD rva)
 {
@@ -420,6 +462,9 @@ static void record_hit(SessionState *st, int type, DWORD pid, DWORD tid, size_t 
     r->first_chance = first_chance;
     r->cont_code    = 0;      /* core 在 pump 末尾才算得出来（fill_cont_code 补） */
     copy_name(r->modname, sizeof(r->modname), modname);
+
+    /* T7 D2a：同一条记录也发一帧 `event` 给执行连接（`hits()` 的形状不动）。 */
+    emit_event_frame(*r, st->dropped);
 }
 
 /* `pump` 之后：给这一轮（`seq >= from_seq`）新产生的记录补上默认应答码。
