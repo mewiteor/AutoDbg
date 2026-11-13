@@ -105,7 +105,7 @@ make.bat i <dir>         :: 指定输出目录（默认 .out）
 | `dbg` 本地门禁（切片 A/B/C1a） | `pwsh tools/server_test/e2e_dbg.ps1 -Render <64\|86> [-Variant legacy]` | 本地模式（不起 server）：`caps.*` 与本 build 一致、**`dbg.detach ~= nil` 且 `dbg.close == nil`**（D51）、`help.*`（含管道下**无 ESC**）、`kill.*`（真终止 + 状态复位）、**`session.*`**（D55：`dbg.last() == dbg.session(pid)`、`d:pump` 缓存优先返回同一张表、事件表字段与 `d.stop`、`read`/`read_u32`/`write` 往返、**partial read 的真实长度**、`context()` 的 `Cip` 与部分更新、`mods()`/`threads()`）。36 条断言（含 `session.*` / `pump.dispatch-attribution` / `route.same-name-two-processes` / `route.child-process` / `route.child-handle` / `d:current-pid` / `d:v-child` / `run.refused-with-session` / **`session.default-parity`**（契约名与会话方法逐字节一致）/ **`session.lv-types`** / **`context.all-variant`** / **`var.callback-only`** / **`var.d-v-bound`**/ `sugar.*` / **`remote.*`：86 宿主经 `--repl --server` 驱动 64 位目标**；x64 无 fixture ⇒ 8 条），legacy 同样必须真过 |
 | JSON 信封（T1/D50） | `pwsh tools/server_test/e2e_json.ps1 -Render <64\|86> [-Variant legacy]` | 本地模式 `--json` / `--out=<path>`：那一行 JSON 独占 stdout、字段齐全、`result` / `pid` / `detached` / `images` 口径、`--json` 与 `--server` 互斥（退出码 2）、退出码口径不变；那一行必须**纯 ASCII**（CP936 → UTF-8 或逐字节降级）。`-Variant legacy` **必须真过**（这段就是用来暴露 GBK 的） |
 | agent 技能包（T6） | `pwsh tools/agent/check_skill.ps1 -Render <64\|86>` | `tools/agent/autodbg-skill/` 是 CLI 口径下的**唯一对外契约文档**：检查 `SKILL.md` 的 frontmatter（`name` / `description`）并把每个 `.md` 里的 ` ```lua ` 片段交给产物做语法检查（只解析不执行）。17 条断言（6 条静态 + 11 个含 lua 块的 md）/ 58 个 Lua 片段（第 11 个是新增的 `recipes/child-process.md`） |
-| nvim 客户端（T5） | `pwsh tools/server_test/nvim_smoke.ps1 -Render <64\|86> [-Variant legacy]` | 起 `--server=tcp` → headless nvim 跑 `nvim_smoke.lua`：远程执行 + 结果 buffer、异步路径不出 `E5560`、语法错误 → chunkname + quickfix、`M.cancel`（控制帧）、health/version（`info`）、`open_file` 写/读回（帧上的 `open`/`data`/`close`/`read_req`）。32 条断言（实测）；**nvim 不在 PATH 时 SKIP** |
+| nvim 客户端（T5） | `pwsh tools/server_test/nvim_smoke.ps1 -Render <64\|86> [-Variant legacy]` | 起三台 `--server=tcp`（主 / 带 token / `--repl`）→ headless nvim 跑 `nvim_smoke.lua`：远程执行 + 结果 buffer、异步路径不出 `E5560`、语法错误 → chunkname + quickfix、`M.cancel`（控制帧）、health/version（`info`）、`open_file` 写/读回（帧上的 `open`/`data`/`close`/`read_req`）；REPL 三条连的是第三台 `--repl --server` —— `repl.cross-command-state`（同一连接两帧 ⇒ 跨命令 `lua_State` 存活 + `out.id` = 命令号）、`repl.error-code`（`result.id` 仍是该行的 Lua 错误码 3，且与命令号错开）、`repl.event-render`（`event` 帧渲染进 buffer 且 `id` = 命令号）。**35** 条断言（实测）；**nvim 不在 PATH 时 SKIP** |
 | Win9x 实机 | `pwsh tools/w9x_test/w9x.ps1 -Action check\|run\|record` | 需要 VMware 的 Win98 guest 与凭据（`tools/w9x_test/config.local.ps1`，已 gitignore）；**没有 VM / 凭据时 SKIP（exit 0）**。矩阵与剩余项见 `plan.md` §1.3 |
 
 - 黄金输出在本仓库 `tests/golden/w9x/`（Win98 guest 的输出），行尾与比较口径见 D15（golden 统一 LF，比较走「CRLF→LF + 去末尾空行」归一化）。
@@ -463,12 +463,16 @@ payload              // 单条 LZMA 流：各模块原始字节按 entry 顺序�
 
 ### 12.5 neovim 插件（`nvim/`，子模块）
 
-- 命令：`:AutoDbgRun`（当前 buffer / 选区 / 文件）、`:AutoDbgCancel`、`:AutoDbgHealth`（报本次的模式与地址）、`:AutoDbgHeader [remote|local]`（插入脚本头标记）、`:AutoDbgLsp [on|off]`（挂/摘注解库）。
+- 命令：`:AutoDbgRun`（当前 buffer / 选区 / 文件）、`:AutoDbgCancel`、`:AutoDbgHealth`（报本次的模式与地址）、`:AutoDbgVersion`（查 server 版本 / ABI）、`:AutoDbgKill`、`:AutoDbgDetach`（真 detach，NT+）、`:AutoDbgRepl`（连已经在跑的 `--repl --server`，只走远程）、`:AutoDbgHeader [remote|local]`（插入脚本头标记）、`:AutoDbgLsp [on|off]`（挂/摘注解库）。
 - **两种运行模式（D39）**：能拿到 exe（标记 `exe=` > `setup.exe` > PATH 里的 `AutoDbg_{64,86}.exe`）→ **本地模式**直接跑 exe；否则 → **远程模式**（HTTP `/run`）。标记的 exe 不存在时**回落远程**并提示一次；`setup{ mode = "remote" }` 强制远程，`mode = "local"` 则必须本地（找不到就报错）。
 - 本地模式：buffer 写到临时文件跑完即删（AutoDbg 只接受脚本路径），临时路径在输出里被换回 buffer 名（quickfix 仍可用）；默认带 `--quiet`（免 headless 被 MessageBox 挂住）；flavor 由脚本自己的 `--!lua`/`--!luajit` 决定。
 - 远程模式：`vim.system` + `curl`（非流式）或 `vim.uv` TCP（**流式，默认**）；结果落 scratch buffer，`<file>:<line>:` 进 quickfix；默认响应格式 **JSON**（D33）。
   ❗uv 回调是 **fast event context**：里面不能调 nvim API，`on_done` 一律 `vim.schedule`（`PITFALLS.md` N12）。
 - 客户端只剩 raw TCP 帧（`nvim/lua/autodbg/tcp.lua`）：`open_file` 的读写都走帧；效果循环与 `http.lua` 已随 D41/D44 删除。
+- **`:AutoDbgRepl`（`nvim/lua/autodbg/repl.lua`）只走远程**：连一条**已经在跑的** `--repl --server`（协议 2），插件**不 spawn 进程**，也不静默回落到本地 exe —— **D39 的「本地优先」不适用于 REPL**（D39 本身不改，只是 REPL 是它的例外）。地址只有两个来源：脚本头标记或 `setup{}`，拿不到就明确报错。每轮渲染顺序 = 回显 → `out`（带 `cmd=`）→ `event` 一行摘要 → `result`。
+  - headless 没有真 TUI ⇒ 门禁走可编程面 `M.repl_open` / `M.repl_eval(line)` / `M.repl_close()`；`:AutoDbgRepl` 只是交互外壳（`M.repl` 的 `vim.fn.input()` 循环 —— nvim 的 Lua 没有全局 `input()`），headless 里明确报错、不 hang。
+  - `config.repl` 的默认值：`buffer = "autodbg:repl"`（与 run 的结果 buffer 是两块）、`read_timeout_ms = 5000`（一行命令等回包的上限）、`event_summary = true`（`event` 帧渲染成一行摘要；`false` 只是不渲染，仍计数）。
+  - 三条已知限制（不是 bug）：① `open_file` 在 REPL 里不可用 —— `open` / `read_req` 需要客户端应答，REPL 这层不接（D45 的阻塞读只属于 run 路径的 `tcp.lua`），调它会等到 `read_timeout_ms` 超时；② 执行连接空闲 **2 s**（`tcp_server.cpp` 的 `k_conn_idle_ms`）就关 ⇒ 交互式 REPL 两行之间不能超过它，没有客户端保活，也没有 `--server-idle` 可调；③ 握手 `info` 里没有「是不是 REPL」的字段 ⇒ 连到非 `--repl` 的 server 时跨命令 state 不成立。
 - **脚本头标记（modeline）**：`nvim/lua/autodbg/modeline.lua` 解析前/后 5 行里的
   `--!autodbg url=… token=… / host=… port=… / exe=… / arch=x86|x64`（也认 `-- autodbg:` / `-- adbg:`），
   **覆盖 `setup{}` 的默认值**；裸 `--!autodbg` 只做标记。

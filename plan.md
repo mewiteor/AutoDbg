@@ -23,7 +23,7 @@
 | T4 `open_file` 读向 + 阻塞读 + `gui.pick()`（D45/D49/D48） | `file_stream.cpp`（4096 缓冲、逻辑 `tell`、往返 `seek`、`lines`、`stream_wait_frame` 切片 25 ms + stale 丢弃 + `cancel_notify`）；`core/gui.cpp:747 window_pick` + `gui_bindings.cpp:832` | `e2e_tcp.ps1` 的 `open.*` / `read.timeout-*` / `callback.read-*` 段 |
 | T5 删除 HTTP / MCP / effects / base64 / 协程执行器 / 会话表（D41/D43/D44） | `--server=http` → 报错退 2；`registry.cpp` 不再有 `read_file`/`write_file`；`lualib` 只剩 `inspect`/`jsonx`/`moses` | `--selftest` 101 → 67；门禁脚本只剩 `e2e_tcp` / `e2e_json` / `e2e_gui` / `nvim_smoke` / `check_skill` |
 | T6 agent 技能包 | `tools/agent/autodbg-skill/`（`SKILL.md` + `references/{cli,lua-api,pitfalls}.md` + 5 个 recipe） | `check_skill.ps1`（14 条 = 6 静态 + 8 个含 lua 块的 md；39 个片段） |
-| nvim 客户端（独立仓 `AutoDbg.nvim`） | 远程改成 raw TCP（`nvim/lua/autodbg/tcp.lua`），`curl` 依赖消失（子模块 `04bbae4`）；`:AutoDbgKill` / `:AutoDbgDetach` 已加 | `nvim_smoke.ps1`（恢复后的等价门禁，31 条 Check） |
+| nvim 客户端（独立仓 `AutoDbg.nvim`） | 远程改成 raw TCP（`nvim/lua/autodbg/tcp.lua`），`curl` 依赖消失（子模块 `04bbae4`）；`:AutoDbgKill` / `:AutoDbgDetach` 已加 | `nvim_smoke.ps1`（恢复后的等价门禁，35 条 Check（含 `repl.*` 三条）） |
 
 仍然成立的不变量（D43 之后）：执行串行（并发 1）；`Run`/`Attach` 阻塞到目标退出或 `Detach()`；没有「已停止的目标」这个可对外暴露的状态（`PITFALLS.md` S12）；跨调用唯一的状态是**被调试进程本身，靠 pid 显式指认**（D48）；执行连接的唯一 reader 是脚本线程（三个消费点：`f:read()` 等待循环、`on_wait_timeout` 的非阻塞 poll、`lua_sethook` tick）；`f:write` 在回调里可用是因为它只是一次带超时的 `net_send_all`。
 

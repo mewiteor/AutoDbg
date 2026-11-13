@@ -2,7 +2,7 @@
 
 > 分支：`feat/t7-low-level-api`。本文件是 T7 的独立计划（`plan.md` §1.1 第 6 条是它的出处，`plan.md` 不动）。
 > 决策仍归 `AGENTS.md` §13；坑归 `PITFALLS.md`；对外契约文档归 `tools/agent/autodbg-skill/`。
-> 门禁基线（当前，详见 §12.2）：import **14 产物** / selftest **73** / e2e_tcp **59**（x64 51）/ e2e_json 32 / e2e_gui 21（26）/ nvim_smoke 32 / check_skill **17（58 片段）** / e2e_dbg **36** / e2e_repl **11**。
+> 门禁基线（当前，详见 §12.2）：import **14 产物** / selftest **73** / e2e_tcp **59**（x64 51）/ e2e_json 32 / e2e_gui 21（26）/ nvim_smoke 35 / check_skill **17（58 片段）** / e2e_dbg **36** / e2e_repl **11**。
 > 本文件里所有「已核实的落点」都带文件:行号，便于改之前先验证。
 
 ---
@@ -790,23 +790,25 @@ context；两个会话都要显式收尾；命中武装断点时引擎已 EIP-- 
 | JSON 信封 | `e2e_json.ps1 -Render 86` | 32 |
 | GUI | `e2e_gui.ps1 -Render 86` | 21（`-AllowInput` 26） |
 | skill 包 | `tools/agent/check_skill.ps1 -Render 86`（+64） | **17 断言 / 58 片段** |
-| nvim | `nvim_smoke.ps1 -Render 86` | 32 |
+| nvim | `nvim_smoke.ps1 -Render 86` | **35**（`repl.*` 三条已补） |
 
-### 12.3 剩余任务（只剩 **②**：③、④ 已落地，① 已拍板不做）
+### 12.3 剩余任务 —— 全部完成（① 已拍板不做）
 
 #### ① ~~C3 —— 29 名转薄转发 + `Var` 退出新面~~ —— **已拍板不做**（纯内部整理）
 
-- **状态**：本轮拍板**不做** —— 它不改变对外契约，行为一致已由 `session.default-parity`（`e2e_dbg` 第 28 条）守住；D52 的 29 名退役仍留给后续 D 条目。所以 **T7 的代码切片到此收尾**，剩余是文档与 nvim 尾巴（③、④ 已落地；只剩 nvim 的 ②）。下面的内容 / 入口 / 风险只是万一要再做时的依据。
+- **状态**：本轮拍板**不做** —— 它不改变对外契约，行为一致已由 `session.default-parity`（`e2e_dbg` 第 28 条）守住；D52 的 29 名退役仍留给后续 D 条目。所以 **T7 的代码切片到此收尾**，文档与 nvim 尾巴（②、③、④）也已落地，只剩 ① 这一项已拍板不做。下面的内容 / 入口 / 风险只是万一要再做时的依据。
 - **内容**：把 `bindings.cpp` 里 29 个 `lua_*` 改成「转发到 session 对象的那份实现」，删除重复逻辑（数据面已经在 `dbg_bindings.cpp` 里有一份）。`Var`（`V`/`U32`…）继续只在 29 名里存活，新面不新增。
 - **硬约束**：**行为逐字节不变** —— 门禁是 `session.default-parity`（`e2e_dbg` 第 28 条）+ `e2e_tcp` 59 条 + `e2e_json` 32 条。改完必须逐条比对文案与错误码。
 - **入口**：`src/scripting/lua/bindings.cpp`（29 个 `lua_*`）、`src/scripting/lua/dbg_bindings.cpp`（`session_*` 实现、`kProcMethods`）、`registry.cpp`（注册点）。
 - **风险**：`GetContext`/`SetContext` 的 kind 映射、`LoadStr` 的缓冲释放、`FindMemory` 的上下文生命周期——这三处是最容易改出差异的。
 
-#### ② nvim `:AutoDbgRepl`（子模块，独立仓提交）
+#### ② nvim `:AutoDbgRepl`（子模块，独立仓提交）—— ✅ 已完成
 
-- **内容**：在 `nvim/`（子模块 `AutoDbg.nvim`）里加 `:AutoDbgRepl`：连 `--repl --server`（协议 2、每条命令一个 `id`、`result.id` = 该行错误码），把 `out`/`event` 帧渲染进一个 scratch buffer；`M.cancel()` 走 `control` 帧；`config` 里补 `repl = { … }` 的默认值。
-- **入口**：`nvim/lua/autodbg/tcp.lua`（`PROTO = 2`、`EVENT = 16` 已经在 D2a 里加好了）、`nvim/lua/autodbg/init.lua`（命令注册）、`nvim/README.md`（用法）。
-- **注意**：`docker`/`nvim` 侧的回调是 **fast event context** ⇒ 一切 nvim API 要 `vim.schedule`（PITFALLS N12）；`nvim_smoke.ps1` 必须仍过 32 条。
+- **交付物**：新文件 `nvim/lua/autodbg/repl.lua`（会话层 `M.open` / `M.eval(line)` / `M.close` / `M.shell`）+ `init.lua` 的 `M.repl_open` / `M.repl_eval` / `M.repl_close` / `M.repl` 与 `config.repl` 默认值（`buffer` / `read_timeout_ms` / `event_summary`）+ `event` 帧渲染进 buffer + `nvim/README.md` 的用法段；`:AutoDbgRepl` 命令在 `nvim/plugin/autodbg.lua`。
+- **口径**：只走远程 —— 连**已经在跑的** `--repl --server`（协议 2），不 spawn 进程；`out.id` = 命令号（渲染按它归因），`result.id` 仍是该行的 Lua 错误码；每轮 = 回显 → `out`（带 `cmd=`）→ `event` 摘要 → `result`。headless 下 `input()` 不可用 ⇒ 门禁走 `M.repl_open/eval/close`，`:AutoDbgRepl` 只是交互外壳且明确报错不 hang（D39 的「本地优先」不适用于 REPL）。
+- **入口**：`nvim/lua/autodbg/repl.lua`（新）、`nvim/lua/autodbg/init.lua`、`nvim/plugin/autodbg.lua`、`nvim/lua/autodbg/tcp.lua`（`PROTO = 2`、`EVENT = 16` 已在 D2a 加好，`repl.lua` 复用它的 `endpoint` / `handshake` / `pack_frame` / `take_frames` / `decode_json` / `wait_until`）。
+- **门禁**：`nvim_smoke` 32 → **35**（新增 `repl.cross-command-state` / `repl.error-code` / `repl.event-render`）；`nvim_smoke.ps1` 因此起第三台 server（`--repl --server`），三条连的是它。
+- **注意**：uv 回调是 **fast event context** ⇒ `repl.lua` 的回调只填普通 Lua 表，一切 nvim API 都在 `vim.schedule` 里（PITFALLS N12）；`repl.lua` 只用 LuaJIT 语法（没有 `string.pack` / 位运算符，位运算走 `bit`）。
 - **提交**：`nvim/` 是独立仓，**在子模块里单独提交**，父仓只更新 gitlink（AGENTS §8）。
 
 #### ③ skill 包补 C2b 一节（文档）—— ✅ 已完成
