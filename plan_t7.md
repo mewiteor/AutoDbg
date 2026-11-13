@@ -789,13 +789,14 @@ context；两个会话都要显式收尾；命中武装断点时引擎已 EIP-- 
 | REPL | `e2e_repl.ps1 -Render 86`（+legacy、64） | **11 / 11 / 10** |
 | JSON 信封 | `e2e_json.ps1 -Render 86` | 32 |
 | GUI | `e2e_gui.ps1 -Render 86` | 21（`-AllowInput` 26） |
-| skill 包 | `tools/agent/check_skill.ps1 -Render 86`（+64） | **16 断言 / 55 片段** |
+| skill 包 | `tools/agent/check_skill.ps1 -Render 86`（+64） | **17 断言 / 58 片段** |
 | nvim | `nvim_smoke.ps1 -Render 86` | 32 |
 
-### 12.3 剩余任务
+### 12.3 剩余任务（只剩 **②** 与 **④**：③ 已落地，① 已拍板不做）
 
-#### ① C3 —— 29 名转薄转发 + `Var` 退出新面（可做可不做，纯内部整理）
+#### ① ~~C3 —— 29 名转薄转发 + `Var` 退出新面~~ —— **已拍板不做**（纯内部整理）
 
+- **状态**：本轮拍板**不做** —— 它不改变对外契约，行为一致已由 `session.default-parity`（`e2e_dbg` 第 28 条）守住；D52 的 29 名退役仍留给后续 D 条目。所以 **T7 的代码切片到此收尾**，剩余是文档与 nvim 尾巴（②、③ 已落地、④ 待写）。下面的内容 / 入口 / 风险只是万一要再做时的依据。
 - **内容**：把 `bindings.cpp` 里 29 个 `lua_*` 改成「转发到 session 对象的那份实现」，删除重复逻辑（数据面已经在 `dbg_bindings.cpp` 里有一份）。`Var`（`V`/`U32`…）继续只在 29 名里存活，新面不新增。
 - **硬约束**：**行为逐字节不变** —— 门禁是 `session.default-parity`（`e2e_dbg` 第 28 条）+ `e2e_tcp` 59 条 + `e2e_json` 32 条。改完必须逐条比对文案与错误码。
 - **入口**：`src/scripting/lua/bindings.cpp`（29 个 `lua_*`）、`src/scripting/lua/dbg_bindings.cpp`（`session_*` 实现、`kProcMethods`）、`registry.cpp`（注册点）。
@@ -808,11 +809,11 @@ context；两个会话都要显式收尾；命中武装断点时引擎已 EIP-- 
 - **注意**：`docker`/`nvim` 侧的回调是 **fast event context** ⇒ 一切 nvim API 要 `vim.schedule`（PITFALLS N12）；`nvim_smoke.ps1` 必须仍过 32 条。
 - **提交**：`nvim/` 是独立仓，**在子模块里单独提交**，父仓只更新 gitlink（AGENTS §8）。
 
-#### ③ skill 包补 C2b 一节（文档）
+#### ③ skill 包补 C2b 一节（文档）—— ✅ 已完成
 
-- `tools/agent/autodbg-skill/references/lua-api.md` 加「进程树与进程对象」：`d:procs()`、`d:proc(pid)`（`pid` + `read*/write/v/context/stack/mods`）、`d:current_pid()`、`d:threads()` 的 `pid` 字段、**两个限制**（`d:arm` 只打第一个进程；`CREATE_PROCESS` 归属靠「谁在 pump」）。
-- 顺手给 `recipes/` 加一个 `child-process.md`（父起子、`d:procs()` 找子、`p:read` 读子、`d:current_pid()` 在回调里定位）。
-- 门禁：`check_skill`（脚本片段会做语法检查，不执行）。
+- ✅ 已落地：`tools/agent/autodbg-skill/references/lua-api.md` 的「进程树与进程对象（`d:procs()` / `d:proc(pid)` / `d:current_pid()`，切片 C2b / D61）」一节（252-367）——除上面列的四项外还写了「会话上的同名方法 = 根进程语义」、`p:v` 按 pid 绑定（`var_pid`，`bindings.cpp:1996-2001`）与 `dbg.remote` 的白名单不含 `proc` / `procs` / `current_pid`（361-362），两个限制照 S27 / S28 逐条写全（346-359）。
+- ✅ 已落地：`recipes/child-process.md`（2 个 lua 片段）—— 扫 6 字节模式定位命中点、`d:procs()` 找子、`p:read_u32` 对照父子标记（父 42 / 子 7）、回调里用 `d:current_pid()` 归属。
+- 门禁：`check_skill`（脚本片段会做语法检查，不执行）。计数因此从 **16 断言 / 55 片段** 涨到 **17 / 58**（含 lua 块的 md 从 10 个到 11 个）。
 
 #### ④ `AGENTS.md` §12 的 REPL / 进程树口径（文档尾巴）
 

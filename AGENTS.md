@@ -97,14 +97,14 @@ make.bat i <dir>         :: 指定输出目录（默认 .out）
 
 | 链 | 入口 | 说明 |
 | --- | --- | --- |
-| 导入表门禁 | `uv --directory tools/api_check run scan_dir.py` | 扫 `.out` 下全部产物，按产物自动选口径（`AutoDbgLegacy_*` 与启动器 → `w95`、`.out/fixtures/` 下的 fixture → `w95`（fixture 里禁止 NT-only 调用）、其余 x86 → `wxp`、x64 → `w7`），有目标系统不可用的导入就打印并返回 1。单文件用法：`uv --directory tools/api_check run main.py <exe\|dll> <w95\|w98\|w982\|wxp>`（x64 免第二个参数） |
+| 导入表门禁 | `uv --directory tools/api_check run scan_dir.py` | 扫 `.out` 下全部产物，按产物自动选口径（`AutoDbgLegacy_*` 与启动器 → `w95`、`.out/fixtures/` 下的 fixture → `w95`（fixture 里禁止 NT-only 调用）、其余 x86 → `wxp`、x64 → `w7`），有目标系统不可用的导入就打印并返回 1。单文件用法：`uv --directory tools/api_check run main.py <exe\|dll> <w95\|w98\|w982\|wxp>`（x64 免第二个参数）。当前实测 **14 产物**（12 个产物 + `.out/fixtures/` 的 `x86_loop`、`x86_spawn`，两个 fixture 都走 w95） |
 | 纯函数自测 | `.out\AutoDbg_<arch>.exe --selftest` | 覆盖 `json_writer` / `png_writer` / `dbl2str` / **帧编解码** / **`decide_console_action`**（T7.1）等纯计算层（基线 70 → T1/D50 转义 +11 = 81 → T2 帧编解码 +20 = 101 → T5 删 `http`/`base64` 两段后 = 67 → **T7.1 补 `decide_console_action` 三条 = 70** → **T7.3 切片 B 补 `console_style_enabled` 三条 = 73**） |
 | GUI 自动化（本地） | `pwsh tools/server_test/e2e_gui.ps1 -Render <64\|86> [-Variant legacy]` | 起一个 `gui_target.ps1` 靶子窗口，用**本地 CLI** 跑 `gui.*` 脚本断言（屏幕/窗口/控件/截图/`gui.pick`）；`-AllowInput` 才跑会动真鼠标/键盘的用例。T5 之前它走 HTTP `/run`，现已改成本地（`gui.*` 与传输无关，21 条断言；带 `-AllowInput` 是 26 条） |
 | raw TCP 帧（T2/T3/T4/D42/D2a） | `pwsh tools/server_test/e2e_tcp.ps1 -Render <64\|86> [-Variant legacy]` | `--server=tcp`：握手帧（`id` = 协议版本、`data` = token）→ `info`；版本不符 / 首帧非握手 / 错 token 的 `error` 帧；`script` → `out`+`result`+`end`；`control` 的 health / version / cancel / 未知 / shutdown；**执行期的 control**（Lua 死循环 + 引擎空转）；**`dbg` 状态机**（T7.3：`pump.*` 八条 —— 停住不放行 / 默认 code 对齐 / step / 重入拒绝 / record-and-continue + dropped / 空转期 cancel / attach + close 只分离 / attach 参数错）；**`--remote` 客户端**（跑脚本 / `--json` 信封 / 语法错误 / health / version / 另一个进程的 `--cancel`）；**`open_file` 读向**（远程 open 应答、read/tell/seek/lines 字节与位置语义、等回包超时 → `nil,"timeout"` 且脚本继续）、**调试回调里的阻塞读**（超时后回调返回、下一次 `Run` 照常；迟到的 `read_resp` 被丢弃）；**`0.0.0.0` 横幅列出网卡地址**；**协议 2 的归因**（`out.id` = 命令号、`event` 帧带命中记录且 `id` = 命令号、`result.id` 仍是退出码）。59 条断言（`pump.*`/`event.*` 只在 x86 跑，x64 51 条），legacy 同样必须真过 |
 | 本地 REPL（T7 切片 D1） | `pwsh tools/server_test/e2e_repl.ps1 -Render <64\|86> [-Variant legacy]` | 管道喂 stdin 跑 `--repl`：`print(1+1)` → `2`（**管道下零提示符**）、多行续行（`for`/`body`/`end`）、`=` 简写（`=1+1`）、EOF → 退出码 **0**、语法错 → **3**、最后一条命令的错 → **2**、`--repl`+`--json` → 启动器退 **2**、`dbg.caps()` 可用（证明复用同一个 `lua_State`）。11 条断言（`repl.remote-exclusive` / `repl.exit-report` / `repl.no-v`；x64 无 fixture ⇒ 10 + 1 SKIP），86 / 86 legacy / 64 都要过 |
 | `dbg` 本地门禁（切片 A/B/C1a） | `pwsh tools/server_test/e2e_dbg.ps1 -Render <64\|86> [-Variant legacy]` | 本地模式（不起 server）：`caps.*` 与本 build 一致、**`dbg.detach ~= nil` 且 `dbg.close == nil`**（D51）、`help.*`（含管道下**无 ESC**）、`kill.*`（真终止 + 状态复位）、**`session.*`**（D55：`dbg.last() == dbg.session(pid)`、`d:pump` 缓存优先返回同一张表、事件表字段与 `d.stop`、`read`/`read_u32`/`write` 往返、**partial read 的真实长度**、`context()` 的 `Cip` 与部分更新、`mods()`/`threads()`）。36 条断言（含 `session.*` / `pump.dispatch-attribution` / `route.same-name-two-processes` / `route.child-process` / `route.child-handle` / `d:current-pid` / `d:v-child` / `run.refused-with-session` / **`session.default-parity`**（契约名与会话方法逐字节一致）/ **`session.lv-types`** / **`context.all-variant`** / **`var.callback-only`** / **`var.d-v-bound`**/ `sugar.*` / **`remote.*`：86 宿主经 `--repl --server` 驱动 64 位目标**；x64 无 fixture ⇒ 8 条），legacy 同样必须真过 |
 | JSON 信封（T1/D50） | `pwsh tools/server_test/e2e_json.ps1 -Render <64\|86> [-Variant legacy]` | 本地模式 `--json` / `--out=<path>`：那一行 JSON 独占 stdout、字段齐全、`result` / `pid` / `detached` / `images` 口径、`--json` 与 `--server` 互斥（退出码 2）、退出码口径不变；那一行必须**纯 ASCII**（CP936 → UTF-8 或逐字节降级）。`-Variant legacy` **必须真过**（这段就是用来暴露 GBK 的） |
-| agent 技能包（T6） | `pwsh tools/agent/check_skill.ps1 -Render <64\|86>` | `tools/agent/autodbg-skill/` 是 CLI 口径下的**唯一对外契约文档**：检查 `SKILL.md` 的 frontmatter（`name` / `description`）并把每个 `.md` 里的 ` ```lua ` 片段交给产物做语法检查（只解析不执行）。16 条断言（6 条静态 + 10 个含 lua 块的 md）/ 55 个 Lua 片段 |
+| agent 技能包（T6） | `pwsh tools/agent/check_skill.ps1 -Render <64\|86>` | `tools/agent/autodbg-skill/` 是 CLI 口径下的**唯一对外契约文档**：检查 `SKILL.md` 的 frontmatter（`name` / `description`）并把每个 `.md` 里的 ` ```lua ` 片段交给产物做语法检查（只解析不执行）。17 条断言（6 条静态 + 11 个含 lua 块的 md）/ 58 个 Lua 片段（第 11 个是新增的 `recipes/child-process.md`） |
 | nvim 客户端（T5） | `pwsh tools/server_test/nvim_smoke.ps1 -Render <64\|86> [-Variant legacy]` | 起 `--server=tcp` → headless nvim 跑 `nvim_smoke.lua`：远程执行 + 结果 buffer、异步路径不出 `E5560`、语法错误 → chunkname + quickfix、`M.cancel`（控制帧）、health/version（`info`）、`open_file` 写/读回（帧上的 `open`/`data`/`close`/`read_req`）。32 条断言（实测）；**nvim 不在 PATH 时 SKIP** |
 | Win9x 实机 | `pwsh tools/w9x_test/w9x.ps1 -Action check\|run\|record` | 需要 VMware 的 Win98 guest 与凭据（`tools/w9x_test/config.local.ps1`，已 gitignore）；**没有 VM / 凭据时 SKIP（exit 0）**。矩阵与剩余项见 `plan.md` §1.3 |
 
@@ -384,7 +384,7 @@ payload              // 单条 LZMA 流：各模块原始字节按 entry 顺序�
 
 见 `PITFALLS.md` 的 O 节（输出与排障）与 M 节（映射器）。速记：模块里的 `Print*` / `Error*` 在非控制台下走 `WriteFile`、控制台里走 `WriteConsole`（重定向才能看到）；怀疑寄存器被写坏时用 `RtlCaptureContext` 抓 callee-saved 快照；回退链要带 `load_error.text`；负例判据用「已提交字节的双窗口增量」。
 
-## 12. 已实现的扩展面（server / GUI / client 文件 I/O）
+## 12. 已实现的扩展面（server / GUI / client 文件 I/O / REPL / 进程树）
 
 > 这一段只记**现行接口约定**（改之前要知道的事实）；剩余工作与设计取舍见 `plan.md`。
 > ❗D41–D50（原 `plan_cli.md`，现 `plan.md`）已全部落地：MCP 与 HTTP 已整体删除，对外只剩 CLI + raw TCP 帧。下面被取代的条目（§12.1 的端点、§12.3 整节、§12.4 的效果协议）只在原地留历史标注。
@@ -502,10 +502,59 @@ payload              // 单条 LZMA 流：各模块原始字节按 entry 顺序�
 - `--json` / `--out` 与 `--server` **互斥**（同时给 → 启动器报错、退出码 2）；JSON 模式不弹文件对话框。
 - 门禁：`tools/server_test/e2e_json.ps1`（见 §4）。
 
+### 12.7 `--repl`（本地 REPL 与 `--repl --server`）
+
+> 落点：`src/scripting/lua/repl.{hpp,cpp}` + 启动器解析 `--repl` → `boot.repl_mode`（ABI **5**，§11.3）。
+> REPL **不建状态、不注册 API、不 `lua_close`**：它复用脚本路径同一个 `lua_State`（`create_state_with_libs()`），
+> 所以 `dbg` / `gui` / `open_file` / `help` / 烘焙的 `dbglib` 全都现成可用（`repl.hpp:6-9`；门禁 `repl.state-shared` 就是这条）。
+
+| 口径 | 现在的做法 | 代码 |
+| --- | --- | --- |
+| 启动器 | `--repl` **不需要脚本**（输入是 stdin）；与 `--json` / `--out` / `--remote` **互斥 → 退 2**；与 `--server` **可并存** | `launcher.cpp:975`（不需要脚本）、`927-938`、`634` |
+| 输入 | 先 `ReadFile(GetStdHandle(STD_INPUT_HANDLE))`（**管道可跑，门禁靠它**），失败且是真控制台才回退 `ReadConsoleW`；等待按 **100 ms** 切片（满足 S13 的 ≤250 ms），片间 `guard_poll_control()` | `repl.cpp:96-107`、`122`、`48`、`84-88` |
+| 求值 | `=` 简写 = `return expr`（只在 chunk 为空时生效）；本地多行续行的**判据是 `<eof>` 标记**（`near <eof>` / `near '<eof>'`），不是 `end of input` —— Lua 5.5 与 LuaJIT 都是这个文案（PITFALLS **S20**） | `repl.cpp:313-320`、`232-247` |
+| EOF | 文件/重定向读到结尾是 `TRUE` + 0 字节；❗**管道写端关闭是 `FALSE` + `ERROR_BROKEN_PIPE`**（也认 `ERROR_HANDLE_EOF`）—— 只认「0 字节」会把正常 EOF 当读错误 | `repl.cpp:102-107` |
+| 退出码 | = **最后一条命令的码**（0 / 2 / 3），干净的 EOF → 0、读输入失败 → -1；失败一律打 **stderr**、不 `exit()` | `repl.cpp:364-423`、`repl.hpp:21-22` |
+| server 形态 | 一个帧 = **一个完整块**（`allow_continue = false` ⇒ 不完整输入直接是语法错 3）；`result` 帧的 `id` = 这一行的 Lua 错误码；同一连接内 `lua_State` 与引擎会话**跨命令存活**；非 `--repl` 的 server 一个字节不改 ⇒ **D43（跨执行无状态）没破** | `repl.cpp:477-486`、`tcp_server.cpp:499-501`、`88-91`、`639-644` |
+| 中断 | **本地 REPL 不提供中断**（已定，不是 bug）：`dbg` 的 `on_wait_timeout` 有意不读控制台，所以本地 REPL 里长 `pump` 无法 Ctrl+C；`--server` 口径的 `control cancel` 仍生效。历史记录 / 箭头键 / Tab 补全明确不做 | `dbg_bindings.cpp:836`、`repl.hpp:23-26` |
+| 退出安全网（D54） | `lua_close` **之前**查 registry，非空就往 **stderr** 报 `repl: N unclosed session(s) - detaching` 并逐个按归属收尾（有 `DebugActiveProcessStop` 就 detach、没有就 kill），**不改退出码**；与 `d:detach()` / `d:kill()` 共用同一对 C 助手 `end_session_by_detach` / `end_session_by_kill`，两条路径不会分叉 | `repl.cpp:297-305`、`dbg_bindings.cpp:2615-2651`、`1931` / `1958` |
+| `V` | REPL 里**不注册** `V`：`create_state_with_libs(repl=true)` → `register_lua_api(L, repl)`，`registry.cpp:79` 跳过它 | `registry.cpp:79`、`repl.cpp:436`、`main.cpp:453` |
+
+`ReadConsoleW` 的导入表全 w95 可 ⇒ **不需要 dynapi**（`plan_t7.md` §9 第 5 条）。门禁：`tools/server_test/e2e_repl.ps1`（11 条，86 / 86 legacy / 64）。
+
+### 12.8 进程树（一个会话 = 一棵树，切片 C2b / D61）
+
+> 落点：`src/core/process.cpp`（pid 集合 + 按 pid 的句柄缓存）+ `src/scripting/lua/dbg_bindings.cpp`（按 pid 的路由与进程对象）。
+> 会话的键从「一个 pid」变成**一棵树**：根 pid + 调试期间出现的全部 `CREATE_PROCESS` 的 pid（一棵树只有一个
+> 调试器 ⇒ 那些 pid 一定归本会话；`registry_find()` 按 `owns_pid(pid)`，`dbg_bindings.cpp:380-386`）。
+
+| 事实 | 口径 | 代码 |
+| --- | --- | --- |
+| pid 集合 | `kMaxPids = 16`：满了 `add_pid` 直接忽略、`handle_for_pid` 会拒（多出来的 pid 既不进树也不给句柄） | `core.hpp:232`、`process.cpp:95` / `120` |
+| 维护点（两处） | `begin()`：先 `close_pid_handles()` 清掉上一轮，再 `add_pid(根)`；`dispatch()` 的 `CREATE_PROCESS` 分支 `add_pid(事件 pid)` | `debug_loop.cpp:225-226`、`595` |
+| 句柄 | 根（或 `pid == 0`）用 `proc().hProcess`（调试事件换来的，不进缓存）；其它走 `OpenProcess(VM_READ\|VM_WRITE\|VM_OPERATION\|QUERY_INFORMATION)`，9x 不认 `PROCESS_QUERY_INFORMATION` 时去掉它重试；成功后**缓存** | `process.cpp:118`、`129-135`、`138-144` |
+| 关闭点（三处） | `EXIT_PROCESS`（`close_pid_handle`；pid 仍留在树里）、`run_shutdown` / 析构（`close_pid_handles`，连树一起作废）、缓存表满时立即关 | `debug_loop.cpp:681`、`debug_loop.cpp:122` + `process.cpp:166-175`、`process.cpp:147-149` |
+| 内存原语 | `(DWORD pid, …)` 重载 + **旧签名转发给根**（`pid == 0` = 根）⇒ 29 个契约名与既有调用点零改动；内存搜索与区域遍历仍只认根进程 | `memory.cpp:12-17`、`66` / `104` / `125` / `185` |
+| 断点补丁 | 按 `peinfo->dwProcessId` 选句柄（否则子进程的补丁打到根进程）；顺带修了 `LOAD_DLL` 从不填 `dwProcessId` 的旧缺陷（`create_front` 给 0） | `breakpoints.cpp:104` / `141` / `156`、`debug_loop.cpp:724-727` |
+| 对外面 | `d:procs()`（pid 数组、插入序、根在第一个）、`d:proc(pid)` → **普通表**（`pid` + `read*` / `write` / `v` / `context` / `stack` / `mods`，方法是绑 `(会话, pid)` 的闭包，只收本树里的 pid）、`d:current_pid()`（回调里 = 事件 pid、顶层 = `root_pid`）、`d:threads()` 每项带 `pid`；**会话上的同名方法是根进程语义** | `dbg_bindings.cpp:2424-2429`、`2431-2448`、`2450-2465`、`2467-2482`、`2484-2498`、`1405-1408` |
+
+两个已知限制（照 PITFALLS **S27** / **S28**，不是 bug）：
+
+1. `d:arm` 在进程树里**只能打到第一个进程**：`BreakpointInfo.orignal_byte` 只有一个字节且布局不可动（§5 第 7 条），
+   `apply_breakpoints_for_module` 遇到 `has_orignal_byte` 已置位就跳过（`breakpoints.cpp:127`）⇒ 子进程拿不到 `0xCC`
+   （记录有、补丁打不上）。现在的做法：子进程用**它自己的** `int 3` / 异常 + `d:current_pid()` + `d:proc(pid)` 定位，
+   命中后显式 `cont`；按 pid 的记录层（`plan_t7.md` §10 第 4 条）留给后续。
+2. `DEBUG_EVENT` 不带 parent pid ⇒ 新树的第一个 `CREATE_PROCESS` 归「发起这次 pump 的会话」（`pump_once` 的 `hint`，
+   `dbg_bindings.cpp:1629-1637`）；两个会话都在等时先 pump 的那个认领 ⇒ 一个执行里**串行**驱动。同一个 pid 的后续
+   事件按 `owns_pid` 精确归属（`process.cpp:99-105`）。
+
+门禁：`e2e_dbg.ps1` 的 `route.child-process` / `route.child-handle` / `d:current-pid` / `d:v-child`
+（fixture `tests/fixtures/bin/x86_spawn.c`）。
+
 ## 13. 已定决策（不要再讨论/推翻；改之前先在 `PITFALLS.md` 查有没有相关坑）
 
 > **D51–D58 是 T7 余下切片的已定方向**：D51 / D53 的**切片 A 已落地**（`dbg.detach`/`dbg.kill`/`dbg.caps`/`help`，
-> `dbg.close` 已删）；**D55 / D57 / D58 的 C1a + C1b + C2a + sugar + D56 的 C-remote 已落地**（会话对象 + registry + 事件表 + `d:pump` 缓存优先 + 延迟武装 + 数据面 + 多会话路由 + `dbglib` + 跨位数代理；多会话仍限单进程树），余下在 C2b / C3。进度以 `plan_t7.md` §11.7–§11.9 为准。
+> `dbg.close` 已删）；**D55 / D57 / D58 的 C1a + C1b + C2a + sugar + D56 的 C-remote 已落地**（会话对象 + registry + 事件表 + `d:pump` 缓存优先 + 延迟武装 + 数据面 + 多会话路由 + `dbglib` + 跨位数代理），**C2b（进程树 + 按 pid 的句柄 + 进程对象，D61 / §12.8）也已落地**；**C3（29 名转薄转发 + `Var` 退出新面）按本轮拍板不做** —— T7 的代码切片到此收尾，剩余是文档与 nvim 尾巴。进度以 `plan_t7.md` §11.7–§12 为准。
 
 | # | 议题 | 决策 |
 | --- | --- | --- |
@@ -568,5 +617,5 @@ payload              // 单条 LZMA 流：各模块原始字节按 entry 顺序�
 | D57 | pump 的两层与「停住」 | `dbg.pump([timeout])`（模块级、**进程级**）= 读一条事件 -> **按归属分派**（记录 + 回调 + 引擎记账）-> 返回带 `ev.session` 的事件表；`d:pump([timeout])` = **缓存优先**（`d.stop` 非空立即返回）+ 过滤（别人的照常分派，只是不返回）。**分派不能推迟**（`cont` 必须作用在已 EIP--/已 re-arm/已记录的事件上），所以 §10.5 的「不跑 B 的 callback」收紧为「不**返回**别人的事件」。**停住 = `d.stop` 非空**，不引入 flag；每个 session 最多一个未应答事件（OS 挂起该进程线程）=> 缓存深度 1，存一个原始 `DEBUG_EVENT` 即可。`d:bp` **允许延迟武装**（模块未加载只登记，`CREATE_PROCESS`/`LOAD_DLL` 时补 `0xCC`），「始终没加载」改在收尾/`bps()` 报告 |
 | D58 | 多 session 的脚本糖 | 三种模型别混：**batch** `dbglib.run_all{...}`（并行跑到结束 + 每 session 结果表；autocont => **不能**在命中处检查）、**rendezvous** `dbglib.wait_all(pred, timeout)`（跑在 `dbg.pump` + `paused()` 上）、**step**（REPL 原语）。名字不用 `run`（与契约名 `Run` 撞概念）。共享状态：**脚本里用 upvalue 表**（全局会撞 29 个契约名与烘焙的 `inspect/jsonx/moses`，且数据流看不见），**REPL 里用全局**（跨行存活） |
 | D59 | 数字类型口径（新面） | **地址 / 指针 / 指针宽的寄存器值 ⇒ LuaVariant**（`LV_UZ`；`d:read_u64` 用 `LV_U64`，因为 x86 上 `LV_UZ` 是 4 字节）：`ev.ea`、`hits().ea`、`mods().base`、`stack().ea`、`context()` 里 `ctx_kind::UPTR` 的字段、`eip()`、`read_u64`。**小整数 ⇒ 普通 number**：`pid/tid/type/code/cont_code/rva/hits/dropped/size/index`、`read_u8` / `read_u16` / `read_u32`、`context()` 的 `U32/U64/M128` 字段（`EFlags`/`Seg*`/`MxCsr`/`VectorControl`/`DebugControl`/`Xmm*`）。**`d:arm` 的 rva 与 `ev.rva` 仍是 number**（D57）。入参地址 number 与 LuaVariant **都收**（`arg_num_or_lv`），但 `lv_check` 本身不动（29 名依赖严格语义）。理由：① 与 29 名天然互通（`ReadMemory(ev.ea)` 直接可用）；② `jsonx` 的 userdata 分支吐 `x.val`（十进制精确）⇒ `--json` 的 `result` 对 x64 地址不再丢低位；③ `dbg.remote` 的 `{"__i":…}` 退役、改 `{"__u64":…}`。❗跨类型/跨宽度比较不要赌 `__eq`（`U32(5) == 5` 为 false），比 `.val` 或 `tostring` |
-| D60 | `V` 的进程归属 | **`V()` 只在调试回调上下文可用**（回调派发处用 `CallbackScope` 设 `cb_session`/`cb_pid`，`V`/`Var` 解引用取它；顶层与 REPL 报固定文案 `"V() is only usable inside a debug callback; use d:v(addr) or d:read*/d:write instead"`，**不猜 `current_session()`**）；**REPL 里根本不注册 `V`**（`create_state_with_libs(repl=true)` 时跳过）；顶层读内存用 **`d:v(addr)`** —— 会话绑定的 Var（载荷 `{addr, sess}`，解引用全走该会话的引擎，会话被收尾后报 `Var: the session bound by d:v() is closed`）。**`d:context()` 与契约名 `GetContext` 对齐：所有字段都是 LuaVariant**（`U32→LV_U32`、`U64→LV_U64`、`UPTR→LV_UZ`、`Xmm→{Low,High}` 的两个 variant），setter 仍接受 number 与 variant。❗进程树（一个 session 多进程）下 `V`/`d:v` 的**按 pid** 句柄仍待 C2b；`dbg.remote` 下的 `d:v` 不在白名单（代理上不可用） |
+| D60 | `V` 的进程归属 | **`V()` 只在调试回调上下文可用**（回调派发处用 `CallbackScope` 设 `cb_session`/`cb_pid`，`V`/`Var` 解引用取它；顶层与 REPL 报固定文案 `"V() is only usable inside a debug callback; use d:v(addr) or d:read*/d:write instead"`，**不猜 `current_session()`**）；**REPL 里根本不注册 `V`**（`create_state_with_libs(repl=true)` 时跳过）；顶层读内存用 **`d:v(addr)`** —— 会话绑定的 Var（载荷 `{addr, sess}`，解引用全走该会话的引擎，会话被收尾后报 `Var: the session bound by d:v() is closed`）。**`d:context()` 与契约名 `GetContext` 对齐：所有字段都是 LuaVariant**（`U32→LV_U32`、`U64→LV_U64`、`UPTR→LV_UZ`、`Xmm→{Low,High}` 的两个 variant），setter 仍接受 number 与 variant。**进程树的按 pid 句柄已由 C2b 实现**（`Var` 载荷是 `{base, sess, pid}`：`V()` 的 pid = 0 ⇒ 解引用时取回调事件那个进程，`d:v` 绑根、`p:v` 绑 `d:proc(pid)` 那个进程；`bindings.cpp:1967-1972` / `var_pid` `bindings.cpp:1996-2001` / `handle_for_pid` `process.cpp:116-151`）；`dbg.remote` 的白名单不含 `v` / `proc`（代理上不可用） |
 | D61 | 进程树与进程对象 | 一个会话的键是**一棵进程树**（根 pid + 调试期间出现的全部 `CREATE_PROCESS` 的 pid，`owns_pid()`）；内存/断点补丁必须走**按 pid 的句柄**（`handle_for_pid()`：根用 `proc().hProcess`，其它 `OpenProcess` + 9x 降级、缓存并在进程退出/`run_shutdown` 关闭）——否则子进程的补丁会写到根进程。内存原语加 `(DWORD pid, …)` 重载，旧签名转发给根（29 名零改动）。对外：`d:procs()`（插入序、根在前）、`d:proc(pid)` → **普通表**（`pid` + `read*/write/v/context/stack/mods`，方法 upvalue 绑 (会话, pid)）、`d:current_pid()`（回调里 = 事件 pid、顶层 = `root_pid`）、`d:threads()` 每项加 `pid`。**两个已知限制**：① `d:arm` 在进程树里**只能打到第一个进程**（`BreakpointInfo.orignal_byte` 是单字节且布局不可动 ⇒ 子进程拿不到 `0xCC`；按 §10 第 4 条要落到新记录层才行）；② `DEBUG_EVENT` 不带 parent pid ⇒ 新树的第一个 `CREATE_PROCESS` 归给「发起这次 pump 的会话」（`pump_once` 的 hint），多会话同时派生时是「谁在等就归谁」 |
