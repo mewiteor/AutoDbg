@@ -20,6 +20,11 @@
  * T8 切片 a1（D63）：`--list` 要能区分「可映射的模块」与「blob 条目」→ 每条 entry 打 `kind=`
  *   （`module` / `exec`）。`-h` / `--list` / `--version` / `--selftest` 仍归主 exe，**不触发 handoff**
  *   （判定本身在 `src/common/handoff_decision.*` 的纯函数里；落盘与 CreateProcess 属于 `handoff.cpp`）。
+ * T8 切片 a2：本文件仍然**只解析选项** —— 判定 + I/O 在 `handoff.cpp`（进程边界，不占 boot 字段
+ *   ⇒ ABI 保持 5）。`arch` 按 **host** 算（`host_arch_name()`）：主 exe 是 x86，但 64 位 host 上真正
+ *   执行脚本的是 child（x64），`--version` 报的必须是执行者的位数，否则 `version.parity.main-vs-exec`
+ *   会分叉。对话框（D7）归主 exe：handoff 时把对话框选定的脚本**追加**进 child 的 argv[1]，
+ *   命令行本来就有脚本参数则原样透传；child 绝不弹对话框。
  *
  * ❗启动器是 **ANSI 编译**（要能在 Win9x 上跑）：所有 API 显式带 A/W 后缀；
  *   `GetCommandLineW` / `GetOpenFileNameW` 一律走 `GetProcAddress`（9x 的 kernel32/comdlg32 没有 W 版）。
@@ -30,9 +35,11 @@
 
 #include "../../common/allocator.hpp"
 #include "../../common/cmdline.h"
+#include "../../common/handoff_decision.hpp"   /* T8 切片 a2（D63）：handoff 的纯判定 */
 #include "../version.h" /* AUTODBG_VERSION（构建期生成，见 make.bat :genversion） */
 #include "boot.h"
 #include "error.hpp"
+#include "handoff.hpp"                          /* T8 切片 a2：落盘 + CreateProcess + job + 透传退出码 */
 #include "module_loader.hpp"
 #include "payload.hpp"
 
@@ -598,7 +605,7 @@ void print_version()
     out(", abi ");
     out_u32((unsigned)AUTODBG_ABI_VERSION);
     out(", ");
-    out(AUTODBG_VERSION_ARCH);
+    out(autodbg::sys::pack::host_arch_name());   /* 按 host：T8 切片 a2（D63）；不再是编译期的 _WIN64 */
     out(")\n");
 }
 
@@ -607,7 +614,7 @@ void print_usage()
     out("AutoDbg ");
     out(AUTODBG_VERSION);
     out(" (");
-    out(AUTODBG_VERSION_ARCH);
+    out(autodbg::sys::pack::host_arch_name());   /* 同上（`version.parity.main-vs-exec` 的判据）*/
     out(", abi ");
     out_u32((unsigned)AUTODBG_ABI_VERSION);
     out(")\n\n");
@@ -621,6 +628,7 @@ void print_usage()
     out("      --list                 list payload entries (module / exec blob)\n");
     out("      --module-dir=<dir>     load module DLLs from <dir> (still memory-mapped)\n");
     out("      --quiet                do not show error message boxes\n");
+    out("      --no-handoff            run the x86 half itself, skip the exec blob (gate / debug switch)\n");
     out("      --selftest             run built-in pure-function self test\n");
     out("      --repl                 read Lua statements from stdin (piped or console)\n");
     out("      --json                 print one machine-readable JSON line (D50)\n");
@@ -658,10 +666,16 @@ extern "C" int launcher_main(int argc, char **argv)
     bool        variant_forced = false;
     bool        list_only      = false;
     bool        quiet          = false;
+    /* T8 切片 a2（拍板 A）：`--no-handoff` —— 排障 / 门禁开关，只在这里解析，不占 boot 字段。
+     * (c) 的四件做完之前，x64 半份调不了 32 位目标（`parse_pe` 按编译期 `_WIN64`、`GetThreadContext`
+     * 对 WOW64 线程无效），所以跑 32 位 fixture 的门禁必须带它，才能继续测 x86 半份那条路径。 */
+    bool        no_handoff     = false;
     bool        help_requested = false;
     bool        version_only   = false;
     const char *module_dir     = nullptr;
     const char *script         = nullptr;
+    /* T8 切片 a2：脚本是 argv 里的那一份（原样透传）还是对话框选定的（需要追加进 child 的 argv[1]）*/
+    bool        script_from_dialog = false;
 
     /* T1（D50）：`--json` / `--out=<path>`（机器可读结果信封）。`--out` 单独给也算 JSON 模式。
      * ❗与 `--server` 互斥（同时给 → 启动器报错、退出码 2）；JSON 模式下不弹文件对话框，
@@ -742,6 +756,10 @@ extern "C" int launcher_main(int argc, char **argv)
         else if (str_eq(a, "--quiet"))
         {
             quiet = true;
+        }
+        else if (str_eq(a, "--no-handoff"))
+        {
+            no_handoff = true;
         }
         else if (str_eq(a, "--help") || str_eq(a, "-h") || str_eq(a, "-?"))
         {
@@ -982,8 +1000,15 @@ extern "C" int launcher_main(int argc, char **argv)
          * 客户端的控制命令（cancel/kill/detach/health/version）也不需要脚本；
          * `--repl` 同理 —— 它的输入是 stdin，没有脚本。 */
         if (!ask_script())
-            return (GetLastError() == 0) ? 0 : -1;   /* 取消 = 正常退出 */
+        {
+            /* T8 切片 a2（D7 归主 exe）：拿不到脚本就**在主 exe 这里**明确报错，绝不把「需要对话框」
+             *   的状态交给 child（child 不弹对话框）。退出码口径不变（取消 = 正常退出 0）。 */
+            unsigned last = (unsigned)GetLastError();   /* ❗先取：下面的 WriteFile 会洗掉 last error */
+            out_err("launcher: no script (dialog unavailable or cancelled)\n");
+            return (last == 0) ? 0 : -1;
+        }
         script = g_script_a;
+        script_from_dialog = true;
     }
 
     /* ---- 定 flavor：CLI > 脚本标记 > 默认（D10） ---- */
@@ -1023,6 +1048,43 @@ extern "C" int launcher_main(int argc, char **argv)
     {
         report("launcher: payload extract failed", err);
         return 2;
+    }
+
+    /* ---- T8 切片 a2（D63）：handoff ----
+     * 四条已定规则全在纯函数里（`decide_handoff_action`），这里的三个输入是解析/探测出来的：
+     *   · `has_exec_entry`：载荷里有 `kind = exec` 的条目（单架构 `make.bat a 86` 没有）；
+     *   · `main_exe_only_option`：-h / --list / --version / --selftest 归主 exe（`--version` 因此
+     *     能在只读目录上跑 —— `version.no-extract`）；
+     *   · `explicit_legacy`：排障开关优先 —— 落盘的 x64 半份恒是 modern（D10 / D63），x64 host 上
+     *     唯一能跑到 legacy 的路径就是主 exe（x86）自己跑，所以 `e2e_*` 的 `-Variant legacy` 靠它；
+     *   · `no_handoff`（拍板 A）：显式 `--no-handoff` → 不 handoff。门禁跑 32 位 fixture 时带它，因为
+     *     (c) 之前 x64 半份调不了 32 位目标（PITFALLS M14）。
+     * `host_is_64` 走 `IsWow64Process`（只有 wxp 有 → dynapi），取不到算「不是 64」。 */
+    int  exec_idx = pack.find_exec();
+    bool main_exe_only_option = help_requested || version_only || list_only || selftest_mode;
+    bool explicit_legacy      = variant_forced && variant == k_variant_legacy;
+
+    if (exec_idx >= 0 &&
+        autodbg::common::decide_handoff_action(autodbg::sys::pack::probe_host_is_64(), true,
+                                               main_exe_only_option, explicit_legacy, no_handoff))
+    {
+        char blob_name[64];   /* manifest 里的名字不保证 NUL 结尾 → 拷成 C 串（同一份 lower_copy）*/
+        lower_copy(blob_name, sizeof blob_name, pack.name((unsigned)exec_idx), pack.name_len((unsigned)exec_idx));
+
+        autodbg::sys::pack::handoff_request req;
+        req.blob_name      = blob_name;
+        req.blob_data      = raw + pack.raw_offset((unsigned)exec_idx);
+        req.blob_size      = pack.raw_size((unsigned)exec_idx);
+        req.cmdline_a      = GetCommandLineA();
+        req.cmdline_w      = query_cmdline_w();
+        /* 命令行本来就有脚本参数 → argv 原样透传；只有对话框选定的那份需要追加进 child 的 argv[1]。
+         * 走到这里说明主 exe 已经自己处理过对话框（D7 归主 exe）⇒ child 永远不会弹对话框。 */
+        req.append_script  = script_from_dialog ? g_script_a : nullptr;
+        /* 弹窗与 stderr 的口径归 --quiet（与 launcher 其余错误路径一致，已定）：
+         * handoff 的错误出口只有一个包装，这里只把开关传过去。 */
+        req.quiet          = quiet;
+
+        return autodbg::sys::pack::run_handoff(req);
     }
 
     if (list_only)

@@ -8,7 +8,9 @@
  *   `decide_console_action`（T7.1 补上 plan.md §1.1 第 1 条欠着的三条：67 → 70；T7.3 从
  *   `scripting/lua/console_input.*` 搬进 `common/console_action.*`，消除 `common → scripting` 的反向依赖）、
  *   `console_style_enabled`（T7.3 切片 B：`help` 上色的三条判定，70 → 73）、
- *   `decide_handoff_action`（T8 切片 a1 / D63：handoff 判定的四条 `handoff.decision-*`，73 → 77）。
+ *   `decide_handoff_action`（T8 切片 a1 / D63：handoff 判定的四条 `handoff.decision-*`，73 → 77；
+ *   规则 ⑤ `--no-handoff` 再补一条 → 82）。
+ *   `base_dir` 的拼接口径（T8 切片 a2 / D63：三个名字、四条断言，77 → 81；`base_dir()` 本身要读 env，不可单测）。
  * ❗T5（D41/D44）删除了 HTTP 与 base64 两段：它们跟着 http.* / ase64.* 一起消失。
  * 说明：断言用 `strcmp`/`memcmp` 逐字节比较（跨架构/跨编译器稳定）；
  *   期望值都是**手写的字面量**，不要在这里用被测代码生成期望值（否则等于没测）。
@@ -19,6 +21,7 @@
 #include "console_action.hpp" /* T7.3：`decide_console_action`（纯判定、只依赖 windows.h；从 scripting/lua 搬来） */
 #include "console_style.hpp"  /* T7.3 切片 B：`console_style_enabled`（`help` 上色的纯判定） */
 #include "handoff_decision.hpp" /* T8 切片 a1（D63）：`decide_handoff_action`（纯判定，不碰 I/O、不碰 Lua） */
+#include "base_dir.hpp"          /* T8 切片 a2（D63）：`path_is_absolute` / `join_base_dir`（拼接口径，纯函数） */
 #include "json_writer.hpp"
 #include "png_writer.hpp"
 #include "rand.hpp"
@@ -500,23 +503,67 @@ void test_console_style(test_ctx *t)
  *   这样 4 条断言同时盖住 4 条规则与基线（基线必须能为 1，否则「都是 0」也能过）。 */
 void test_handoff_decision(test_ctx *t)
 {
-    /* 基线：64 位 host + 有 exec 条目 + 不是归主 exe 的选项 + 没显式 legacy -> 1 */
+    /* 基线：64 位 host + 有 exec 条目 + 不是归主 exe 的选项 + 没显式 legacy + 没 `--no-handoff` -> 1 */
     check_int(t, "handoff.decision.baseline-eligible",
-              decide_handoff_action(true, true, false, false), 1, "eligible -> handoff");
+              decide_handoff_action(true, true, false, false, false), 1, "eligible -> handoff");
 
     /* 规则 ①：-h / --list / --version / --selftest 归主 exe */
     check_int(t, "handoff.decision.main-exe-option",
-              decide_handoff_action(true, true, true, false), 0, "main-exe option");
+              decide_handoff_action(true, true, true, false, false), 0, "main-exe option");
 
     /* 规则 ②：载荷里没有 exec 条目（单架构 `make.bat a 86` 就是这种） */
     check_int(t, "handoff.decision.no-exec-entry",
-              decide_handoff_action(true, false, false, false), 0, "no exec entry");
+              decide_handoff_action(true, false, false, false, false), 0, "no exec entry");
 
     /* 规则 ③ + ④：host 不是 64 位（含 IsWow64Process 取不到的那一档）；显式 --variant=legacy */
-    bool host_not_64 = (decide_handoff_action(false, true, false, false) == 0);
-    bool legacy_wins = (decide_handoff_action(true, true, false, true) == 0);
+    bool host_not_64 = (decide_handoff_action(false, true, false, false, false) == 0);
+    bool legacy_wins = (decide_handoff_action(true, true, false, true, false) == 0);
     check_bool(t, "handoff.decision.host-not-64-or-explicit-legacy", host_not_64 && legacy_wins,
                "host 不是 64 或显式 legacy -> 0");
+
+    /* 规则 ⑤：显式 `--no-handoff`（排障 / 门禁开关，拍板 A） */
+    check_int(t, "handoff.decision.no-handoff-switch",
+              decide_handoff_action(true, true, false, false, true), 0, "--no-handoff -> main exe");
+}
+
+/* -------------------- 脚本相对路径的基准目录（T8 切片 a2 / D63） --------------------
+ * `base_dir()` 那半截要读 env / 主 exe 路径，不可单测；这里断的是它拍下来的**口径**（纯函数部分）：
+ *   · 绝对路径原样透传（盘符式与 UNC）——否则拼接会把 `C:\\x` 变成 `base\\C:/x`；
+ *   · 相对路径拼到基准目录（期望值是手写字面量，不用被测代码生成）；
+ *   · 基准目录不带尾分隔符 ⇒ 拼接时补一个，且已带尾分隔符时不得翻倍。
+ * 期望值用反斜杠字面量（实现里补的分隔符是 `\\`）；断言逐字节比较（同其它段）。 */
+void test_base_dir(test_ctx *t)
+{
+    char out[128];
+
+    /* ① 绝对路径原样透传 */
+    bool abs_drive = path_is_absolute("C:/x/y.txt") && path_is_absolute("C:foo");
+    bool abs_unc   = path_is_absolute("\\\\server\\share\\f.bin");
+    bool rel_ok    = !path_is_absolute("fixture.txt") && !path_is_absolute("sub/fixture.txt");
+    check_bool(t, "base_dir.absolute-passthrough", abs_drive && abs_unc && rel_ok,
+               "盘符式/UNC 算绝对；裸文件名与 sub/ 算相对");
+
+    if (!join_base_dir("C:\\base", "C:/x/y.txt", out, (unsigned)sizeof out))
+        out[0] = '\0';
+    check_str(t, "base_dir.absolute-passthrough", out, "C:/x/y.txt");
+
+    /* ② 相对路径拼到基准目录 */
+    if (!join_base_dir("C:\\base", "fixture.txt", out, (unsigned)sizeof out))
+        out[0] = '\0';
+    check_str(t, "base_dir.join-relative", out, "C:\\base\\fixture.txt");
+
+    /* ③ 基准目录不带尾分隔符（已定）：拼接时补一个，已带尾分隔符的不翻倍；
+     *    基准为空（env 与主 exe 目录都取不到）→ 原样用，不算失败 */
+    bool joined = join_base_dir("C:\\base", "fixture.txt", out, (unsigned)sizeof out);
+    bool no_double = joined && strcmp(out, "C:\\base\\fixture.txt") == 0;
+    if (!join_base_dir("C:\\base\\", "f.bin", out, (unsigned)sizeof out))
+        out[0] = '\0';
+    bool no_trailing = strcmp(out, "C:\\base\\f.bin") == 0;
+    if (!join_base_dir("", "fixture.txt", out, (unsigned)sizeof out))
+        out[0] = '\0';
+    bool empty_base = strcmp(out, "fixture.txt") == 0;
+    check_bool(t, "base_dir.no-trailing-sep", no_double && no_trailing && empty_base,
+               "拼接补一个分隔符、不翻倍；base 为空则原样用");
 }
 
 /* ------------------------------ PNG / BMP（截图编码，S4） ------------------------------ */
@@ -601,6 +648,7 @@ int run_selftests(selftest_report_fn report, void *ctx)
     test_console_action(&t);
     test_console_style(&t);
     test_handoff_decision(&t);
+    test_base_dir(&t);
     test_image(&t);
 
     {

@@ -733,7 +733,16 @@ if "%ARCH%" == "86" set PACKMOD=!PACKMOD! %INSTALLROOT::=$:%\AutoDbgLegacy_lua_%
 >>%BUILDDIR%\build.ninja echo.
 >>%BUILDDIR%\build.ninja echo build !LOBJ!\cmdline.obj: cc %SRCDIR::=$:%\common\cmdline.c
 >>%BUILDDIR%\build.ninja echo.
-set LOBJS=!LOBJ!\pack_entry.obj !LOBJ!\launcher.obj !LOBJ!\payload.obj !LOBJ!\module_loader.obj !LOBJ!\cmdline.obj pack\packdata.obj src\common\allocator.obj src\sys\lzma\LzmaDec.obj src\sys\lzma\Alloc.obj src\sys\msvcrt.lib %LINK_DEPS%
+:: T8 a2: handoff (the process boundary) + its pure decision + base_dir + dynapi
+>>%BUILDDIR%\build.ninja echo build !LOBJ!\handoff.obj: cxx %SRCDIR::=$:%\sys\pack\handoff.cpp
+>>%BUILDDIR%\build.ninja echo.
+>>%BUILDDIR%\build.ninja echo build !LOBJ!\handoff_decision.obj: cxx %SRCDIR::=$:%\common\handoff_decision.cpp
+>>%BUILDDIR%\build.ninja echo.
+>>%BUILDDIR%\build.ninja echo build !LOBJ!\base_dir.obj: cxx %SRCDIR::=$:%\common\base_dir.cpp
+>>%BUILDDIR%\build.ninja echo.
+>>%BUILDDIR%\build.ninja echo build !LOBJ!\dynapi.obj: cxx %SRCDIR::=$:%\common\dynapi.cpp
+>>%BUILDDIR%\build.ninja echo.
+set LOBJS=!LOBJ!\pack_entry.obj !LOBJ!\launcher.obj !LOBJ!\payload.obj !LOBJ!\module_loader.obj !LOBJ!\cmdline.obj !LOBJ!\handoff.obj !LOBJ!\handoff_decision.obj !LOBJ!\base_dir.obj !LOBJ!\dynapi.obj pack\packdata.obj src\common\allocator.obj src\sys\lzma\LzmaDec.obj src\sys\lzma\Alloc.obj src\sys\msvcrt.lib %LINK_DEPS%
 :: x86 的启动器也要 4.0 子系统版本（D12）；x64 保持 6.0
 if "x%PATCHVER%" == "x1" (
     >>%BUILDDIR%\build.ninja echo build %BUILDDIR::=$:%\pever\AutoDbg_%ARCH%.exe: ld !LOBJS! ^| t

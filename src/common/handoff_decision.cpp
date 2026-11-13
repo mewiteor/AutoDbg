@@ -1,16 +1,18 @@
 ﻿/* =============================================================================
  * src/common/handoff_decision.cpp —— handoff 判定的纯函数实现（T8 切片 a1 / D63）
  *
- * 来源：新写（口径见 `handoff_decision.hpp` 的文件头）。本文件只有四个早退 + 一个 1，
- *   没有 I/O、没有分配、没有 Lua、没有系统调用；调用方（启动器）负责把四个 bool 探好后传进来。
+ * 来源：新写（口径见 `handoff_decision.hpp` 的文件头）。本文件只有五个早退 + 一个 1，
+ *   没有 I/O、没有分配、没有 Lua、没有系统调用；调用方（启动器）负责把五个 bool 探好后传进来。
  * 与旧实现的差异：无（新文件）。
- * 门禁：`src/common/selftest.cpp` 的 `handoff.decision-*` 四条（73 → 77）。
+ * 门禁：`src/common/selftest.cpp` 的 `handoff.decision-*`（T8 a1 四条 73 → 77；规则 ⑤ `--no-handoff`
+ *   补一条 → 81 + 1 = 82）。
  * ========================================================================== */
 #include "handoff_decision.hpp"
 
 namespace autodbg::common
 {
-int decide_handoff_action(bool host_is_64, bool has_exec_entry, bool main_exe_only_option, bool explicit_legacy)
+int decide_handoff_action(bool host_is_64, bool has_exec_entry, bool main_exe_only_option, bool explicit_legacy,
+                          bool no_handoff)
 {
     /* ① 归主 exe 的选项（-h / --list / --version / --selftest） */
     if (main_exe_only_option)
@@ -26,6 +28,11 @@ int decide_handoff_action(bool host_is_64, bool has_exec_entry, bool main_exe_on
 
     /* ④ 显式 --variant=legacy：排障开关优先 */
     if (explicit_legacy)
+        return 0;
+
+    /* ⑤ 显式 --no-handoff：排障 / 门禁开关（拍板 A）。门禁靠它继续测 x86 半份 —— (c) 之前
+     * x64 半份调不了 32 位目标（见 handoff_decision.hpp 的规则 ⑤）。 */
+    if (no_handoff)
         return 0;
 
     return 1;

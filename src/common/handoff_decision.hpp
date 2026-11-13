@@ -17,7 +17,11 @@
  *   ② 没有 `exec` 条目 → 0（没有可执行的半份，只能映射 x86 模块；单架构 `make.bat a 86` 就是这种）；
  *   ③ host 不是 64 位 → 0（`IsWow64Process` 取不到就算不是 64，95/98 本来没有 64 位）；
  *   ④ 显式 `--variant=legacy` → 0（排障开关优先）：落盘的 x64 半份恒为 modern（D10 / D63），
- *      x64 host 上唯一能跑到 legacy 的路径就是主 exe（x86）自己跑。
+ *      x64 host 上唯一能跑到 legacy 的路径就是主 exe（x86）自己跑；
+ *   ⑤ 显式 `--no-handoff` → 0（拍板 A：排障 / 门禁开关，只 launcher 侧解析，不占 boot 字段）。
+ *      它的用处不是「绕过判定」，而是让门禁能继续测 x86 半份：(c) 的四件做完之前，x64 半份调不了
+ *      32 位目标（`parse_pe` 按编译期 `_WIN64`、`GetThreadContext` 对 WOW64 线程无效），所以
+ *      `e2e_dbg` / `e2e_tcp` / `e2e_repl` 在 64 位 host 上跑 x86 产物时必须带它。
  * ========================================================================== */
 #ifndef AUTODBG_COMMON_HANDOFF_DECISION_HPP
 #define AUTODBG_COMMON_HANDOFF_DECISION_HPP
@@ -25,7 +29,8 @@
 namespace autodbg::common
 {
 /* 1 = handoff（跑落盘的 exec 条目）；0 = 不 handoff（主 exe 自己跑）。参数按已定规则列出。 */
-int decide_handoff_action(bool host_is_64, bool has_exec_entry, bool main_exe_only_option, bool explicit_legacy);
+int decide_handoff_action(bool host_is_64, bool has_exec_entry, bool main_exe_only_option, bool explicit_legacy,
+                          bool no_handoff);
 } /* namespace autodbg::common */
 
 #endif /* AUTODBG_COMMON_HANDOFF_DECISION_HPP */

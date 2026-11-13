@@ -14,6 +14,11 @@
  *   · `__gc` 只做「尽力关闭 + 警告」，不会替调用方补数据。
  * T1（D50）：`open_file` 的 w/a 句柄会进 `images` 登记表（`output.hpp`）——只记路径，
  *   内容不动；去重与上限都在登记层，这里只在**真的打开成功**后记一笔。
+ * T8 切片 a2（D63）：本地模式下**相对路径的基准是 `common/base_dir`**（env `AUTODBG_BASE_DIR` 优先，
+ *   否则主 exe 所在目录），不是 CWD —— handoff 之后 `GetModuleFileName(NULL)` 在 child 里是 tmpdir
+ *   那份，基准会漂，所以主 exe 把原始目录用 env 传过来。❗`o->path` 与 `images` 仍存调用方给的
+ *   那一份（D50 的登记口径不变），只有真去打开时才用解析后的路径；`io.open` 与 `gui.screenshot_to`
+ *   仍按 CWD（它们不是这层的口径），所以门禁的 `handoff.script-relative-base` 用 `open_file` 跑。
  * ========================================================================== */
 #include "file_io.hpp"
 
@@ -21,6 +26,7 @@
 #include "stream.hpp"
 
 #include "common/allocator.hpp"
+#include "common/base_dir.hpp"   /* T8（D63）：相对路径的基准目录（env > 主 exe 目录） */
 #include "common/frame.hpp"   /* T4：read_req/read_resp 的 u32 编解码 */
 #include "common/json_writer.hpp"
 
@@ -71,6 +77,20 @@ unsigned g_read_timeout_ms = 5000;   /* T4：一次文件操作的等待上限�
 bool ensure_rbuf(file_obj *o);
 
 unsigned g_next_id = 0;
+
+/* T8（D63）：相对路径的基准目录。绝对路径原样返回；base 取不到也原样返回（不算失败）；
+ * 结果装不下返回 nullptr（不写半个路径）。 */
+const char *resolve_relative(const char *path, char *out, unsigned cap)
+{
+    if (common::path_is_absolute(path))
+        return path;
+
+    const char *base = common::base_dir();
+    if (base == nullptr || base[0] == '\0')
+        return path;
+
+    return common::join_base_dir(base, path, out, cap) ? out : nullptr;
+}
 
 /* T1（D50）：写入模式（w / a）才进 `images`；纯读句柄不算「本次运行写出的文件」 */
 void record_written_path(const file_obj *o)
@@ -326,8 +346,14 @@ int lua_open_file(lua_State *L)
 
     if (!client_io_enabled())
     {
-        /* 本地：就是真文件（与 io.open 等价） */
-        o->fp = fopen(path, norm);
+        /* 本地：就是真文件（与 io.open 等价），但相对路径的基准是 base_dir（T8 / D63）。
+         * base 取不到（env 没有、主 exe 路径也读不到）→ 原样用，不算失败。 */
+        char resolved[k_path_max];
+        const char *openp = resolve_relative(path, resolved, (unsigned)sizeof resolved);
+        if (openp == nullptr)
+            return push_err(L, "open_file: relative path does not fit after base dir"), 2;
+
+        o->fp = fopen(openp, norm);
         if (o->fp == nullptr)
             return push_err(L, "open_file: cannot open file"), 2;
         record_written_path(o);
