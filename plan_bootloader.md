@@ -2,7 +2,7 @@
 
 > 建议单独开分支（`feat/bootloader`）：它改的是产物矩阵与打包口径，不改引擎状态机。
 > 决策仍归 `AGENTS.md` §13；坑归 `PITFALLS.md`；对外契约文档归 `tools/agent/autodbg-skill/`。
-> 门禁基线（本轮实测）：import 12 产物全过 / selftest 67 / e2e_tcp 48 / e2e_json 32 / e2e_gui 21（26）/ nvim_smoke 32 / check_skill 14（39 片段）。
+> 门禁基线（当前，详见 `plan_t7.md` §12.2）：import **14 产物** / selftest **73** / e2e_tcp **59**（x64 51）/ e2e_json 32 / e2e_gui 21（26）/ nvim_smoke **35**（含 `repl.*` 三条）/ check_skill **17（58 片段）** / e2e_dbg 36 / e2e_repl 11。
 > 依赖：`plan_t7.md` —— handoff 之后真正跑脚本的是 child，child 的执行模型必须是逐事件的。
 
 ---
@@ -20,8 +20,8 @@
 | 产物 | 角色 | `scan_dir.py` 的 auto 口径 |
 | --- | --- | --- |
 | `AutoDbg.exe`（x86） | 主 exe：launcher + x86 模块 + 内嵌 x64 blob | w95 —— `pick_target_os` 的名字规则要加 `AutoDbg.exe` |
-| `AutoDbg_64.exe`（x64） | 与 blob 同一份字节；独立可跑（x64 host 上直接跑） | w7（machine 规则已覆盖） |
-| 落盘的 `adbg64.bin`（tmpdir） | 主 exe 在 x64 host 上 exec 的那个 | ❗当前 `scan_one` 只扫 `.exe`/`.dll` ⇒ `.bin` 会被跳过，门禁要显式加扩展名或单独跑 |
+| ~~`AutoDbg_64.exe`（x64）~~ | **不再产出为交付物**（已定）：x64 半份字节只作为**构建期 blob 输入**喂给 `AutoDbg.exe` | w7 口径照旧，跑在构建期的 blob 产物上 |
+| 落盘的 `adbg64.bin`（tmpdir） | 主 exe 在 x64 host 上 exec 的那个（与构建期 blob 同一份字节） | ❗`scan_one` 只扫 `.exe`/`.dll` ⇒ 加 `.bin`；门禁输入用**构建期的 blob 产物**（运行时落盘路径不稳定），不要扫 tmpdir |
 
 - `pever`：x86 产物打 4.0（D12）；blob 是 x64，保持 6.0，不需要处理。
 - `tools/pack`：payload entry 需要类型标志（`.dll` = 映射 / blob = 落盘 + CreateProcess）；D11 的结构边界校验按 blob 条目调整（解压长度校验不变）；blob 本身是 PE，导入审计按 x64 口径照旧跑。
@@ -80,17 +80,32 @@
 
 | # | 议题 | 建议 |
 | --- | --- | --- |
-| D8 | exe 命名 | 主 exe `AutoDbg.exe`（x86）+ 落盘 `adbg64.bin`；`AutoDbg_64.exe` 保留（独立可跑） |
+| D8 | exe 命名 | **已由 D63 改**：主 exe `AutoDbg.exe`（x86）+ 落盘 `adbg64.bin`；**不保留 `AutoDbg_64.exe`** |
 | D10 | flavor | flavor 是**脚本级**，不再由「映射到哪个模块」决定；变体在 x64 恒 modern |
 | D11 | 载荷 | entry 加类型标志；仍无 magic / 版本号 |
 | D12 | pever | x86 打 4.0；blob（x64）保持 6.0 |
 | D26 | 不落盘 | 脚本仍然全程不落盘；**可执行文件必须落盘**（进程主模块必须是文件背衬的 image section）——作为显式例外记录 |
-| D40 | LSP 注解 | 按 **host** 挂（不再按脚本 `arch=`）；混合树里 32 位节点按 x86 的 23 项理解 |
-| 新 | job | dynapi + best-effort + 嵌套失败降级；不设任何 limit |
+| D40 | LSP 注解 | 按 **host** 挂（不再按脚本 `arch=`；`setup.lsp.arch` 仍是显式覆盖）——正式记进 §13 的 **D64**；混合树里 32 位节点按 x86 的 23 项理解 |
+| 新 | job | **做**（已定）：dynapi + best-effort + 嵌套 assign 失败干净降级；不设任何 limit；退出码仍靠 wait 透传，job 只覆盖「主 exe 被强杀」这一种 |
 | 新 | 命令行 / 退出码 | 引导器透传命令行（引号口径 = `autodbg_split_cmdline_a/w`）+ 透传退出码 + 不写 stdout |
-| 新 | 脚本相对路径基准 | 显式传原始 exe 目录（`--base-dir`）→ `boot` 加字段 |
+| 新 | 脚本相对路径基准 | `--base-dir` 走 **env var `AUTODBG_BASE_DIR`**（大写，已定），不占 boot 字段 → ABI 保持 **5** |
 
 ❗**ABI**：`base_dir` 走 env var 后不占 boot 字段 ⇒ 唯一的 bump 是 T7.5 的 `repl_mode`（4 → 5）。`e2e_tcp.ps1` 的 `client.version-abi` 与 `nvim_smoke.lua` 的 `version.abi` 会跟着改。
+
+## 5.5 落点与切片边界（已定）
+
+- **handoff 落点**：`src/sys/pack/handoff.cpp` + `handoff.hpp`（新文件），`launcher.cpp` 仍只解析选项（AGENTS §10 的口径：启动器解析选项 → boot；handoff 是进程边界，不是 boot 契约）。
+- **门禁落点**：新建 `tools/boot_test/e2e_boot.ps1`（本地可测 14 条）；`boot.no-wow64-branch` 挂 `plan.md` §1.3 的 Win9x 矩阵。
+- **(a) 引导器最小版**：`tools/pack` 的 entry `kind`（`module`/`exec`）+ x64 半份字节作为 blob 打进 x86 exe + handoff（tmpdir 文件名一次到位用 `adbg64.bin`，按 build 串校验、被锁不清写、只读目录明确报错）+ `CreateProcess`（引号口径 = `autodbg_split_cmdline_a/w`）+ job（dynapi、best-effort、嵌套失败干净降级）+ 透传退出码 + `AUTODBG_BASE_DIR` + `e2e_boot.ps1`。此阶段 `.out/AutoDbg_64.exe` 仍作为构建产物喂 blob（不交付）。
+- **(b) 产物矩阵与命名一次改完**：主 exe 改名 `AutoDbg.exe` + `scan_dir.py` 的名字规则与 `.bin` 支持 + `AutoDbg_64.exe` 停止产出 + 4 个 e2e 脚本的 exe 路径口径（`-Render 64` 从此含义是「跑 `AutoDbg.exe` → handoff」）+ nvim 的 PATH 查找加 host 位宽档（D39 本地模式）+ skill `references/cli.md` 加「产物与位数」一节。
+- **(c) WOW64 四件**：`parse_pe` 按运行期 `Machine`、`Wow64Get/SetThreadContext` 能力上报、`stack_trace` 走 EBP 链、PEB/TEB 按位宽 + `wow64.target-unsupported`。
+
+### 仍待确认（(a) 开工前）
+
+1. `tools/pack` 遇到**没有 x64 blob** 时（单架构 `make.bat a 86` 就是这种情形）：报错挡在构建期，还是「无 `exec` 条目 → 构建照常完成、运行期回退 x86 模块」？后者要加一条断言 `handoff.no-blob-fallback`，并且 handoff 门禁要求一次两架构全量构建。
+2. `--selftest` 归主 exe（不落盘、不 handoff，与 `-h` / `--list` / `--version` 同侧）还是跟着 handoff？建议归主 exe，这样 selftest 门禁口径不变（73 条）。
+3. `handoff.job-nested-fails-clean` 的写法：PowerShell 没有原生 job API，门禁里用 `Add-Type` P/Invoke 建 job 并把主 exe assign 进去（`CreateJobObject` / `AssignProcessToJobObject` 是 wxp+，本机可用）。确认这个写法。
+
 
 ---
 
