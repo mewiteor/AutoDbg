@@ -15,6 +15,7 @@ autodbg-skill/
 └── recipes/
     ├── run-and-break.md      # 启动 + 断点抓参数（Run + 回调）
     ├── stop-and-inspect.md   # dbg：两个会话同时停住 → 各读 context/内存 → 收尾
+    ├── child-process.md      # 进程树：d:procs() / d:proc(pid) / d:current_pid() -> 读那个进程自己的内存
     ├── attach-existing.md    # Attach 已在跑的进程（--pid / gui.pick）
     ├── scan-and-patch.md     # FindMemory -> WriteMemory -> 验证
     ├── gui-automation.md     # gui.* 控件 / 输入 / 截图
