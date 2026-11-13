@@ -8,7 +8,7 @@
 # 用法：pwsh -File tools/server_test/e2e_dbg.ps1 [-Render 64|86] [-Variant ''|modern|legacy]
 # 退出码：0 = 全过；1 = 有失败；2 = 前置缺失（产物不存在 / x64+legacy 组合）
 #
-# 覆盖（切片 A + C1a）：
+# 覆盖（切片 A + C1a + C1b）：
 #   caps.*            这台机器/build 的事实：arch / variant / flavor / win9x / attach / detach / hits_cap
 #   detach.capability `dbg.detach` 存在且 `dbg.close` **已删**（D51：无隐式回退，能力缺席就是 nil）
 #   help.*            help() / help('dbg') / help('dbg.pump') / 未知主题 / 管道下纯文本（无 ESC）
@@ -17,6 +17,12 @@
 #     identity          dbg.last() == dbg.session(root_pid)（**同一个 userdata**）
 #     pump-cache-first  d.stop 非空时 d:pump(0) 立即返回同一张表；code == 0 的事件也不清 d.stop
 #     event-table       事件表的八个字段齐全，type 是 DEBUG_EVENT 码（CREATE_PROCESS = 3）
+#   session.*         （切片 C1b：数据面接上对象，plan_t7.md §2.2 第 12 条 / §11.4）
+#     read-write        停在 fixture 的 int3 上读 6 字节 = `B8 44 42 47 50 CC`、小端 u32、写回原字节
+#     read-partial      256 MB 请求在第一个不可读页停下（0 < 真实长度 < 请求长度）；完全读不到 → nil
+#     context           d:context() 的 `Cip` = 停住那条 int3 的**下一条**；d:context(nil, {Cax=…})
+#                       部分更新返回 true 且读回生效（键名与 `GetContext` 逐字一致：x86 是 `Cax…Cip`）
+#     mods-threads      d:mods() 有 name 含 x86_loop.exe 且 base > 0；d:threads() 含事件的 tid
 # ❗session.* / kill.* 需要 x86 的 fixture ⇒ x64 上这两段整段 SKIP（8 条）。
 # =============================================================================
 [CmdletBinding()]
@@ -83,6 +89,43 @@ function Write-Lua([string]$name, [string]$text)
     $path = Join-Path $TmpDir $name
     [IO.File]::WriteAllText($path, $text, (New-Object System.Text.UTF8Encoding($false)))
     return $path
+}
+
+# fixture 里 `mov eax, 0x50474244` + `int 3` 的 6 字节模式定位（与 e2e_tcp.ps1 的扫描逻辑同一份口径：
+# 匹配整条指令编码 `B8 44 42 47 50 CC`，命中的 RVA + 5 = 那条 int3 的地址）。
+# ❗不在 PowerShell 里算 RVA → EA：运行时 base 由 `d:mods()` 给（plan_t7.md §9.9：`GetModBase` 返回
+# 的是 LuaVariant，做算术会被截断）。
+function Find-FixtureSite([string]$path)
+{
+    $b = [IO.File]::ReadAllBytes($path)
+    $peOff = [BitConverter]::ToUInt32($b, 60)
+    $soh = [BitConverter]::ToUInt16($b, $peOff + 20)
+    $nsec = [BitConverter]::ToUInt16($b, $peOff + 6)
+    $secOff = $peOff + 24 + $soh
+    $pattern = [byte[]](0xB8, 0x44, 0x42, 0x47, 0x50, 0xCC)
+    $hits = New-Object System.Collections.Generic.List[int]
+    for ($i = 0; $i -le $b.Length - $pattern.Length; $i++)
+    {
+        $ok = $true
+        for ($k = 0; $k -lt $pattern.Length; $k++)
+        {
+            if ($b[$i + $k] -ne $pattern[$k]) { $ok = $false; break }
+        }
+        if ($ok) { $hits.Add($i) }
+    }
+    $rva = -1
+    foreach ($h in $hits)
+    {
+        for ($s = 0; $s -lt $nsec; $s++)
+        {
+            $e = $secOff + $s * 40
+            $va = [BitConverter]::ToUInt32($b, $e + 12)
+            $rawsize = [BitConverter]::ToUInt32($b, $e + 16)
+            $raw = [BitConverter]::ToUInt32($b, $e + 20)
+            if ($h -ge $raw -and $h -lt ($raw + $rawsize)) { $rva = $va + ($h - $raw) }
+        }
+    }
+    return @{ count = $hits.Count; rva = $rva; site = $rva + 5 }
 }
 
 # ---------------------------------------------------------------- ① caps / 能力
@@ -193,6 +236,86 @@ print('kill=' .. tostring(d:kill()))
     Check 'session.event-table' ($r.out -match 'ev_type=3' -and $r.out -match 'ev_fields=true' -and `
         $r.out -match 'ev_cont=65538' -and $r.out -match 'sessions=1 kind=create bound=true') `
         "事件表八个字段齐全、type = CREATE_PROCESS_DEBUG_EVENT(3)；out=[$($r.out)]"
+
+    # ------------------------------------------------------------ ⑤ 数据面（C1b）
+    $site = Find-FixtureSite $fx
+    $s_data = Write-Lua 'data.lua' @"
+local EXE = '$fxLua'
+local SITE = $($site.rva) + 5
+local d, err = dbg.create{ imagepath = EXE }
+print('data_obj=' .. tostring(d ~= nil) .. ' err=' .. tostring(err))
+if not d then return end
+local ev = d:pump(3000)
+local base
+for _, m in ipairs(d:mods()) do
+    if m.name and string.lower(m.name):find('x86_loop.exe', 1, true) then base = m.base end
+end
+if ev then d:cont(0x00010002) end
+local hit = false
+for i = 1, 24 do
+    ev = d:pump(3000)
+    if ev == nil then break end
+    if base and ev.ea == base + SITE then hit = true break end
+    d:cont(0x00010002)
+end
+print('hit=' .. tostring(hit) .. ' base_pos=' .. tostring(base ~= nil and base > 0))
+if not hit then print('kill=' .. tostring(d:kill())) return end
+
+-- session.read-write
+local pat = d:read(base + SITE - 5, 6)
+local hex = {}
+for i = 1, #pat do hex[#hex + 1] = string.format('%02X', pat:byte(i)) end
+print('read6=' .. table.concat(hex, ' ') .. ' len=' .. #pat)
+print('u32=0x' .. string.format('%08X', d:read_u32(base + SITE - 4)))
+print('write=' .. tostring(d:write(base + SITE - 5, pat)) .. ' same=' .. tostring(d:read(base + SITE - 5, 6) == pat))
+
+-- session.read-partial
+local s = d:read(base, 0x10000000)
+print('partial=' .. tostring(s ~= nil) .. ' len=' .. tostring(s and #s) ..
+      ' short=' .. tostring(s ~= nil and #s > 0 and #s < 0x10000000))
+local bad, berr = d:read(0x7FFF0000, 16)
+print('bad=' .. tostring(bad) .. ' err=' .. tostring(berr))
+
+-- session.context
+local ctx = d:context()
+print('cip=0x' .. string.format('%X', ctx.Cip) .. ' want=0x' .. string.format('%X', base + SITE + 1))
+print('set=' .. tostring(d:context(nil, { Cax = 0x1234 })) .. ' cax=0x' .. string.format('%X', d:context().Cax))
+d:context(nil, { Cax = ctx.Cax })
+print('restored=' .. tostring(d:context().Cax == ctx.Cax))
+
+-- session.mods-threads
+local modok = false
+for _, m in ipairs(d:mods()) do
+    if m.name and string.lower(m.name):find('x86_loop.exe', 1, true) and m.base > 0 then modok = true end
+end
+local tidok = false
+for _, t in ipairs(d:threads()) do
+    if t.tid == ev.tid then tidok = true end
+end
+print('mod_ok=' .. tostring(modok) .. ' nthreads=' .. #d:threads() .. ' tid_ok=' .. tostring(tidok))
+print('kill=' .. tostring(d:kill()))
+"@
+    $r = Run-Local $s_data
+    Check 'session.read-write' ($r.out -match 'data_obj=true' -and $r.out -match 'hit=true base_pos=true' -and `
+        $r.out -match 'read6=B8 44 42 47 50 CC len=6' -and $r.out -match 'u32=0x50474244' -and `
+        $r.out -match 'write=true same=true') `
+        "停在 fixture 的 int3 上读/写目标内存；out=[$($r.out)]"
+    Check 'session.read-partial' ($r.out -match 'partial=true' -and $r.out -match ' short=true' -and `
+        $r.out -match 'bad=nil err=d:read: unreadable address') `
+        "256 MB 请求必须在第一个不可读页停下（0 < 真实长度 < 请求长度），而不是整体失败；out=[$($r.out)]"
+    $m = [regex]::Match($r.out, 'cip=(0x[0-9A-Fa-f]+) want=(0x[0-9A-Fa-f]+)')
+    $cipOk = $false
+    if ($m.Success)
+    {
+        # `Cip` 必须等于「那条 int3 的下一条」——裸 int3 被系统停在 CC 之后（plan_t7.md §2.1 实测口径）
+        $cipOk = ([Convert]::ToInt64($m.Groups[1].Value.Substring(2), 16) -eq
+                  [Convert]::ToInt64($m.Groups[2].Value.Substring(2), 16))
+    }
+    Check 'session.context' ($cipOk -and $r.out -match 'set=true' -and $r.out -match 'cax=0x1234' -and `
+        $r.out -match 'restored=true') `
+        "d:context() 的 Cip = 停住那条 int3 的下一条；d:context(nil, {Cax=…}) 部分更新生效；out=[$($r.out)]"
+    Check 'session.mods-threads' ($r.out -match 'mod_ok=true' -and $r.out -match 'nthreads=[1-9]\d* tid_ok=true') `
+        "d:mods() 有 x86_loop.exe 且 base > 0；d:threads() 含事件 tid；out=[$($r.out)]"
 }
 
 Write-Output ''

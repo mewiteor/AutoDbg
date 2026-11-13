@@ -13,6 +13,12 @@
  *   ② `pump` 的返回值从「事件码」变成**普通事件表**（无 metatable）：`d:pump()` 返回的就是缓存进
  *      `d.stop` 的那**同一张表** ⇒ 判「还是不是同一个」用表身份 `e == d.stop`，没有 seq、没有代次。
  *
+ * 切片 C1b（数据面接上对象）加了一组 `d:` 方法：`read` / `read_u8|u16|u32|u64` / `read_str` /
+ *   `write` / `context` / `stack` / `mods` / `threads`。形状与对应的契约名同形（`ReadMemory` 的字节、
+ *   `GetContext` 的键、`StackTrace` 的帧字段），差别只有 D52 要求的「LuaVariant → 普通整数」；
+ *   「真实读取长度」靠 core 新增的 `read_some`（§2.2 第 12 条）。❗断点面（`bp` / `bp_hw` /
+ *   `bps`）、`snapshot`/`restore`、`mem_regions` 不在本切片；多会话与代理在 C2 / C-remote。
+ *
  * pump 的两层（D57，C1a 已按此落地，但只有一个会话可路由）：
  *   · `dbg.pump([timeout[, autocont]])`（模块级）= **唯一的「等」**：读一条事件 → 分派（记录 + 回调 +
  *     引擎记账）→ 返回事件表；`nil` = 没等到事件；`nil, err` = 引擎错 / 回调里出错 / 被取消。
@@ -67,12 +73,15 @@
 #include "common/allocator.hpp"   /* free_from_tchar → common::release（UNICODE 下才真释放） */
 #include "common/dynapi.hpp"      /* get_proc_as：DebugActiveProcessStop 的能力探测（D51） */
 #include "common/platform.hpp"    /* is_win9x / arch_name / variant_name / flavor_name（caps） */
+#include "core/context.hpp"       /* context_fields / ctx_kind：`d:context` 的键与 `GetContext` 同源 */
 #include "core/core.hpp"
 #include "core/types.hpp"         /* RunParams / DebugCallbacks / 事件载荷 / callback_ref_t */
 #include "core/util.hpp"          /* TCHAR 宏、tchar 转换、ZeroMem */
 
+#include "bindings.hpp"           /* lua_stack_trace：`d:stack` 复用同一个栈回溯迭代器（不写第二套） */
 #include "exec_guard.hpp"         /* D32：pump 空闲片里的那一个 poll 点 */
 #include "help_bindings.hpp"      /* `dbg.help()` = `help('dbg')`（同一张文本表，不是第二真相源） */
+#include "variant.hpp"            /* lv_push / lv_check：契约名的参数形状是 LuaVariant（`StackTrace` 要它） */
 
 namespace autodbg::host
 {
@@ -700,6 +709,444 @@ static SessionState *self(lua_State *L)
 {
     SessionUserdata *ud = (SessionUserdata *)lua_touserdata(L, 1);
     return ud ? ud->state : nullptr;
+}
+
+/* ---------------- 数据面（切片 C1b：plan_t7.md §2.2 第 12 条 + §11.4） ----------------
+ * 形状与 29 个契约名里的对应项**同形**，只按 D52 把「LuaVariant → 普通整数」换掉：
+ *   · `d:context()` 的键来自 core 的 `context_fields()` —— 那就是 `lua_get_context` 自己用的表，
+ *     所以 x86 的 `Cax/Cbx/…/Cip`（= 通用寄存器，`C` 前缀是旧 X-macro 的口径）与 x64 多出的
+ *     `R8-R15/Xmm0-15/P1Home…` 都由那张表的 `#ifdef _WIN64` 决定，这里**不另起一套键名**；
+ *   · `d:stack()` 的帧字段 `index/ea/modname/rva` 就是 `StackTrace` 迭代器一次返回的那四个值
+ *     （因此直接复用 `lua_stack_trace`，不写第二套 StackWalk 调用）。
+ * 错误一律当值返回（D55 第 4 条：`nil, err`），这些方法从不 `lua_error`；**没有会话**时与
+ * `pump` 同口径（`kErrNoSess`）—— 收尾（detach/kill）之后数据面就没有引擎可问了。 */
+
+/* 缺省线程：`d.stop` 的那个（= 当前停住的线程）；没有未应答事件时用最近一条事件的 tid。
+ * `d.stop` 是普通表（D55），所以这里只能从缓存里取 `tid` 字段，没有第二处可依。 */
+static DWORD current_tid(lua_State *L, SessionState *st)
+{
+    if (st->stop_ref != LUA_NOREF)
+    {
+        lua_rawgeti(L, LUA_REGISTRYINDEX, st->stop_ref);
+        lua_getfield(L, -1, "tid");
+        DWORD tid = (DWORD)lua_tointeger(L, -1);
+        lua_pop(L, 2);
+        if (tid) return tid;
+    }
+    return st->last_tid;
+}
+
+/* `d:context(nil, t)` / `d:stack()` 的缺省 tid：显式数字优先，否则走上面那条。 */
+static DWORD arg_tid(lua_State *L, SessionState *st, int base)
+{
+    if (lua_type(L, base) == LUA_TNUMBER) return (DWORD)lua_tointeger(L, base);
+    return current_tid(L, st);
+}
+
+/* 64 位值怎么推给 Lua：Lua 5.5（含 x86 构建）与 x64 的 LuaJIT 的 `lua_Integer` 都是 64 位 ⇒ 整数；
+ * x86 的 LuaJIT 是 32 位 ptrdiff_t ⇒ 走 double（2^53 以内精确，读内存的值实际都在这个范围内）。
+ * 判据与 `variant.cpp` 的 `set_lv_integer` 同一条（D52：新面只用普通整数）。 */
+static void push_u64(lua_State *L, uint64_t v)
+{
+    if (sizeof(lua_Integer) >= 8) lua_pushinteger(L, (lua_Integer)v);
+    else                          lua_pushnumber(L, (lua_Number)v);
+}
+
+/* `fail` 的两段拼接版（零 CRT 下没有 snprintf；只用于「指名是哪个键」的错误文案） */
+static int fail_two(lua_State *L, const char *a, const char *b)
+{
+    char   buf[96];
+    size_t n = 0;
+    for (size_t i = 0; a[i] && n < sizeof buf - 1; i++) buf[n++] = a[i];
+    for (size_t i = 0; b[i] && n < sizeof buf - 1; i++) buf[n++] = b[i];
+    buf[n] = 0;
+    return fail(L, buf);
+}
+
+/* `d:read(addr, n)` → **实际读到的字节**（Lua string，可能短于 n）。0 字节 ⇒ `nil, err`。
+ * 与契约名 `ReadMemory` 的差别只有形状：那边返回字节数组（且部分读被吞成整体失败），
+ * 这边返回字节串 + 真实长度（plan_t7.md §2.2 第 12 条）。 */
+static int do_read(lua_State *L, SessionState *st, int base)
+{
+    if (!st->started) return fail(L, kErrNoSess);
+    if (!lua_isnumber(L, base)) return fail(L, "d:read: addr (number) expected");
+    if (!lua_isnumber(L, base + 1)) return fail(L, "d:read: size (number) expected");
+
+    size_t addr = (size_t)lua_tointeger(L, base);
+    size_t size = (size_t)lua_tointeger(L, base + 1);
+    if (!addr || !size) return fail(L, "d:read: addr and size must be positive");
+
+    void  *buf = alloc_(size);
+    size_t got;
+    {
+        SessionScope scope(st);
+        got = st->sess->read_some(addr, buf, size);
+    }
+    if (!got)
+    {
+        free_(buf);
+        return fail(L, "d:read: unreadable address");
+    }
+    lua_pushlstring(L, (const char *)buf, got);
+    free_(buf);
+    return 1;
+}
+
+/* `d:read_u8/u16/u32/u64(addr)` → 整数（小端，宽度由函数名给出，D52）。读不到 ⇒ `nil, err`。 */
+static int read_int(lua_State *L, SessionState *st, int base, size_t nbytes)
+{
+    if (!st->started) return fail(L, kErrNoSess);
+    if (!lua_isnumber(L, base)) return fail(L, "d:read_*: addr (number) expected");
+
+    size_t addr = (size_t)lua_tointeger(L, base);
+    BYTE   buf[8];
+    if (!addr) return fail(L, "d:read_*: addr must be positive");
+
+    size_t got;
+    {
+        SessionScope scope(st);
+        got = st->sess->read_some(addr, buf, nbytes);
+    }
+    if (got != nbytes) return fail(L, "d:read_*: unreadable address");
+
+    uint64_t v = 0; /* 显式按字节拼：目标地址可能不对齐，不能直接解引用成 uint32_t/uint64_t */
+    for (size_t i = 0; i < nbytes; i++) v |= (uint64_t)buf[i] << (8 * i);
+    push_u64(L, v);
+    return 1;
+}
+
+static int do_read_u8(lua_State *L, SessionState *st, int base)  { return read_int(L, st, base, 1); }
+static int do_read_u16(lua_State *L, SessionState *st, int base) { return read_int(L, st, base, 2); }
+static int do_read_u32(lua_State *L, SessionState *st, int base) { return read_int(L, st, base, 4); }
+static int do_read_u64(lua_State *L, SessionState *st, int base) { return read_int(L, st, base, 8); }
+
+/* `d:read_str(addr)` → 以 NUL 结尾的字节串。复用 core 的 `loadstr`（`LoadStr` 用的同一个函数），
+ * 所以语义逐字一致：每 16 字节一块、不含结尾 NUL、**字节原样**（不转码 —— UNICODE 变体也不转，
+ * 与 `LoadStr` 相同；目标里的串是 UTF-8 还是 GBK 由目标的编译器决定）。 */
+static int do_read_str(lua_State *L, SessionState *st, int base)
+{
+    if (!st->started) return fail(L, kErrNoSess);
+    if (!lua_isnumber(L, base)) return fail(L, "d:read_str: addr (number) expected");
+
+    size_t addr = (size_t)lua_tointeger(L, base);
+    if (!addr) return fail(L, "d:read_str: addr must be positive");
+
+    char  *s   = nullptr;
+    size_t len = 0;
+    bool   ok;
+    {
+        SessionScope scope(st);
+        ok = st->sess->loadstr(addr, &s, &len);
+    }
+    if (!ok)
+    {
+        if (s) free_(s);
+        return fail(L, "d:read_str: unreadable address");
+    }
+    if (s) lua_pushlstring(L, s, len);
+    else   lua_pushliteral(L, "");   /* 首字节就是 NUL ⇒ `loadstr` 不给缓冲，但这不是错误 */
+    if (s) free_(s);
+    return 1;
+}
+
+/* `d:write(addr, data)` → `true` / `nil, err`。`data` 是字节串或整数：
+ *   · 字节串：原样写（长度 = 串长）；
+ *   · 整数：**u32 小端 4 字节**（宽度靠字节串表达 —— 新面不加 `d:write_u16/_u64`，D52 的
+ *     「宽度靠函数名」在这里体现为「要别的宽度就给字节串」）。
+ * 走 core 的 `write(..., up_intrin = true)`（写代码页时要刷指令缓存）。 */
+static int do_write(lua_State *L, SessionState *st, int base)
+{
+    if (!st->started) return fail(L, kErrNoSess);
+    if (!lua_isnumber(L, base)) return fail(L, "d:write: addr (number) expected");
+
+    size_t addr = (size_t)lua_tointeger(L, base);
+    if (!addr) return fail(L, "d:write: addr must be positive");
+
+    const void *data = nullptr;
+    size_t      size = 0;
+    BYTE        word[4];
+    int         type = lua_type(L, base + 1);
+    if (type == LUA_TSTRING)
+    {
+        data = lua_tolstring(L, base + 1, &size);
+    }
+    else if (type == LUA_TNUMBER)
+    {
+        uint64_t v = (uint64_t)lua_tointeger(L, base + 1);
+        for (size_t i = 0; i < sizeof word; i++) word[i] = (BYTE)(v >> (8 * i));
+        data = word;
+        size = sizeof word;
+    }
+    else
+    {
+        return fail(L, "d:write: string or number expected");
+    }
+    if (!size) return fail(L, "d:write: empty data");
+
+    bool ok;
+    {
+        SessionScope scope(st);
+        ok = st->sess->write(addr, data, size, true);
+    }
+    if (!ok) return fail(L, "d:write: cannot write");
+    lua_pushboolean(L, 1);
+    return 1;
+}
+
+/* `d:context([tid[, t]])`：一个函数两个方向（与 `GetContext` / `SetContext` 的分工一致）——
+ *   · 不给表 ⇒ 返回整张寄存器表；
+ *   · 给表 ⇒ **部分更新**（只写表里出现的键），返回 `true` / `nil, err`（D55 第 4 条：
+ *     setter 必须返回值，静默失败/静默写错寄存器是这类 API 最贵的 bug）。 */
+static int do_context(lua_State *L, SessionState *st, int base)
+{
+    if (!st->started) return fail(L, kErrNoSess);
+
+    DWORD tid = arg_tid(L, st, base);
+    if (!tid) return fail(L, "d:context: tid expected");
+
+    bool   ok;
+    HANDLE h = nullptr;
+    CONTEXT ctx;
+    ZeroMem(ctx);
+    {
+        SessionScope scope(st);
+        h = st->sess->get_thread_by_tid(tid);
+        ok = (h != nullptr) && st->sess->get_context(h, CONTEXT_ALL, &ctx);
+    }
+    if (!h)  return fail(L, "d:context: thread not found");
+    if (!ok) return fail(L, "d:context: cannot get thread context");
+
+    size_t                 count  = 0;
+    const core::ctx_field *fields = core::context_fields(&count);
+
+    if (!lua_istable(L, base + 1))
+    {
+        lua_createtable(L, 0, (int)count);
+        for (size_t i = 0; i < count; i++)
+        {
+            const BYTE *p = (const BYTE *)&ctx + fields[i].offset;
+            switch (fields[i].kind)
+            {
+            case core::ctx_kind::U32 : lua_pushinteger(L, (lua_Integer)(*(const uint32_t *)p)); break;
+            case core::ctx_kind::U64 : push_u64(L, *(const uint64_t *)p); break;
+            case core::ctx_kind::UPTR: push_u64(L, (uint64_t)(*(const size_t *)p)); break;
+            case core::ctx_kind::M128:
+            {
+                /* M128A = { Low, High }（与 `GetContext` 暴露的两个 64 位半部同名） */
+                const uint64_t *q = (const uint64_t *)p;
+                lua_createtable(L, 0, 2);
+                push_u64(L, q[0]); lua_setfield(L, -2, "Low");
+                push_u64(L, q[1]); lua_setfield(L, -2, "High");
+                break;
+            }
+            }
+            lua_setfield(L, -2, fields[i].name);
+        }
+        return 1;
+    }
+
+    /* setter：只写表里出现的键（`nil` = 不改；**未知键按 `SetContext` 的既有口径忽略**）；
+     * 值不是数字（M128 不是 {Low, High}）⇒ 指名报错，**一个字节都不写**（不写半套）。 */
+    for (size_t i = 0; i < count; i++)
+    {
+        lua_getfield(L, base + 1, fields[i].name);
+        int t = lua_type(L, -1);
+        if (t != LUA_TNIL && t != LUA_TNONE)
+        {
+            BYTE *p = (BYTE *)&ctx + fields[i].offset;
+            if (fields[i].kind == core::ctx_kind::M128)
+            {
+                if (t != LUA_TTABLE) { lua_pop(L, 1); return fail_two(L, "d:context: bad value for ", fields[i].name); }
+                lua_getfield(L, -1, "Low");
+                lua_getfield(L, -2, "High");
+                if (!lua_isnumber(L, -2) || !lua_isnumber(L, -1))
+                {
+                    lua_pop(L, 3);
+                    return fail_two(L, "d:context: bad value for ", fields[i].name);
+                }
+                uint64_t *q = (uint64_t *)p;
+                q[0]        = (uint64_t)lua_tointeger(L, -2);
+                q[1]        = (uint64_t)lua_tointeger(L, -1);
+                lua_pop(L, 2);
+            }
+            else
+            {
+                if (t != LUA_TNUMBER) { lua_pop(L, 1); return fail_two(L, "d:context: bad value for ", fields[i].name); }
+                uint64_t v = (uint64_t)lua_tointeger(L, -1);
+                switch (fields[i].kind)
+                {
+                case core::ctx_kind::U32 : *(uint32_t *)p = (uint32_t)v; break;
+                case core::ctx_kind::U64 : *(uint64_t *)p = v; break;
+                case core::ctx_kind::UPTR: *(size_t *)p = (size_t)v; break;
+                case core::ctx_kind::M128: break; /* 上面已处理 */
+                }
+            }
+        }
+        lua_pop(L, 1);
+    }
+
+    bool wrote;
+    {
+        SessionScope scope(st);
+        wrote = st->sess->set_context(h, CONTEXT_ALL, &ctx);
+    }
+    if (!wrote) return fail(L, "d:context: cannot set thread context");
+    lua_pushboolean(L, 1);
+    return 1;
+}
+
+/* 迭代器的一次返回值**不保证**四个都在：`lua_stack_trace_iter` 在「这一帧不属于任何已知模块」时
+ * 只返回 `(index, ea)` 两个值（`bindings.cpp` 的原样行为，`get_peinfo_by_ea` 失败就 `return 2`）⇒
+ * 缺的位置按 0 / "" 补。这里不能直接把 nil 交给 `lv_check`：那会 `lua_error` 长跳出去，
+ * 而 D55 的口径是「错误是值」。 */
+static lua_Integer frame_value(lua_State *L, int idx)
+{
+    if (lua_type(L, idx) != LUA_TUSERDATA) return 0;
+    return (lua_Integer)lv_check(L, idx, LV_ANY)->val.uz;   /* 迭代器给的变体类型是 UZ/U32（同一个 union） */
+}
+
+/* `d:stack([tid[, depth]])` → 帧数组（`{ index, ea, modname, rva }`，与 `StackTrace` 同形）。
+ * 帧来源是**契约名** `StackTrace(tid)` 建出来的那个迭代器：`d:stack` 只负责把它逐帧收进数组
+ * （再加一个帧数上限 —— §2.2 第 15 条：低层原语必须有界）。不复制 StackWalk 的 x86/x64 两条
+ * 回调路径（那是 `stack_trace.cpp` 与绑定层已有的实现）。
+ * ❗`lua_stack_trace` 按位置 1 取 LuaVariant、出错走 `lua_error` ⇒ 两处都用 `lua_pcall` 隔开：
+ *   同时保证它的长跳不会穿过 `SessionScope` 的 C++ 帧（D18）。 */
+static int do_stack(lua_State *L, SessionState *st, int base)
+{
+    if (!st->started) return fail(L, kErrNoSess);
+
+    DWORD tid = arg_tid(L, st, base);
+    if (!tid) return fail(L, "d:stack: tid expected");
+
+    int depth = 64;   /* 缺省帧数上限；`StackTrace` 迭代器本身会自然结束，这里只是兜底 */
+    if (lua_type(L, base + 1) == LUA_TNUMBER)
+    {
+        depth = (int)lua_tointeger(L, base + 1);
+        if (depth < 1) depth = 1;
+        if (depth > 512) depth = 512;
+    }
+
+    int top = lua_gettop(L);
+    lua_pushcfunction(L, lua_stack_trace);
+    lv_push(L, LV_U32)->val.u32 = tid;
+    {
+        SessionScope scope(st);
+        if (lua_pcall(L, 1, 2, 0) != 0)   /* 成功 ⇒ (迭代器, nil)；失败 ⇒ (nil, 文案) */
+        {
+            char   buf[96];
+            size_t n = 0;
+            const char *msg = lua_tostring(L, -1);   /* ❗先拷出：`lua_settop` 之后这个指针就悬空了 */
+            for (size_t i = 0; msg && msg[i] && n < sizeof buf - 1; i++) buf[n++] = msg[i];
+            buf[n] = 0;
+            lua_settop(L, top);
+            return fail(L, n ? buf : "d:stack: cannot walk the stack");
+        }
+    }
+    if (!lua_isfunction(L, -2))
+    {
+        const char *msg = lua_tostring(L, -1);
+        char        buf[96];
+        size_t      n = 0;
+        for (size_t i = 0; msg && msg[i] && n < sizeof buf - 1; i++) buf[n++] = msg[i];
+        buf[n] = 0;
+        lua_settop(L, top);
+        return fail(L, n ? buf : "d:stack: cannot walk the stack");
+    }
+    lua_pop(L, 1);                    /* 成功时第二个返回值是 nil */
+    int iter = top + 1;               /* 迭代器固定在这个下标 */
+    lua_createtable(L, 0, 8);         /* 帧数组 */
+    int arr = iter + 1;
+
+    for (int i = 0; i < depth; i++)
+    {
+        lua_pushvalue(L, iter);
+        {
+            SessionScope scope(st);
+            if (lua_pcall(L, 0, 4, 0) != 0)
+            {
+                lua_settop(L, arr);       /* 迭代里出错：保留已收到的帧（错误当值报给上层没意义） */
+                break;
+            }
+        }
+        if (lua_isnil(L, iter + 2))
+        {
+            lua_settop(L, arr);           /* 迭代结束（0 个返回值 ⇒ 补出 4 个 nil） */
+            break;
+        }
+
+        lua_createtable(L, 0, 4);         /* 帧表：字段名与迭代器的返回值一一对应 */
+        lua_pushinteger(L, frame_value(L, iter + 2));
+        lua_setfield(L, -2, "index");
+        lua_pushinteger(L, frame_value(L, iter + 3));
+        lua_setfield(L, -2, "ea");
+        if (lua_type(L, iter + 4) == LUA_TSTRING) lua_pushvalue(L, iter + 4);
+        else                                     lua_pushliteral(L, "");
+        lua_setfield(L, -2, "modname");
+        lua_pushinteger(L, frame_value(L, iter + 5));
+        lua_setfield(L, -2, "rva");
+        lua_rawseti(L, arr, i + 1);
+        lua_settop(L, arr);               /* 丢掉这一帧的四个返回值 */
+    }
+
+    lua_pushvalue(L, arr);
+    lua_remove(L, iter);                  /* 只返回帧数组 */
+    return 1;
+}
+
+/* `d:mods()` → `{ {name, base, size, path}, ... }`：**纯投影**（`peinfos()` 的只读视图）。
+ * 不在这里解析 PE、也不过滤 pid —— 同名多实例的区分交给 `(name, base)` 这两个字段（§2.2 第 1 条）。 */
+static int do_mods(lua_State *L, SessionState *st)
+{
+    if (!st->started) return fail(L, kErrNoSess);
+
+    int n = 0;
+    for (core::PEInfo *pe = st->sess->peinfos().head(); pe; pe = pe->next) n++;
+    lua_createtable(L, n, 0);
+
+    int i = 0;
+    for (core::PEInfo *pe = st->sess->peinfos().head(); pe; pe = pe->next)
+    {
+        LPCTSTR name = pe->Path + pe->name_offset;
+        char    namebuf[64];
+        copy_name(namebuf, sizeof namebuf, name);   /* 与事件表的 `modname` 同一口径（截断到 63 字节） */
+
+        lua_createtable(L, 0, 4);
+        lua_pushstring(L, namebuf);                          lua_setfield(L, -2, "name");
+        lua_pushinteger(L, (lua_Integer)pe->base);           lua_setfield(L, -2, "base");
+        lua_pushinteger(L, (lua_Integer)pe->size);           lua_setfield(L, -2, "size");
+        /* 完整路径转 UTF-8（UNICODE 变体下 `utf16_to_utf8` 是分配来的，用完释放） */
+#ifdef _UNICODE
+        LPSTR path = utf16_to_utf8(pe->Path, NULL);
+        if (path) { lua_pushstring(L, path); release(path); }
+        else        lua_pushliteral(L, "");
+#else
+        lua_pushstring(L, pe->Path);
+#endif
+        lua_setfield(L, -2, "path");
+        lua_rawseti(L, -2, ++i);
+    }
+    return 1;
+}
+
+/* `d:threads()` → `{ {tid}, ... }`：`threads()` 的只读投影。
+ * ❗缺省 tid 只对「当前停住的线程」方便；看别的线程必须显式给 tid（D55 第 5 条）。 */
+static int do_threads(lua_State *L, SessionState *st)
+{
+    if (!st->started) return fail(L, kErrNoSess);
+
+    int n = 0;
+    for (core::ThreadInfo *t = st->sess->threads().head(); t; t = t->next) n++;
+    lua_createtable(L, n, 0);
+
+    int i = 0;
+    for (core::ThreadInfo *t = st->sess->threads().head(); t; t = t->next)
+    {
+        lua_createtable(L, 0, 1);
+        lua_pushinteger(L, (lua_Integer)t->dwThreadId);
+        lua_setfield(L, -2, "tid");
+        lua_rawseti(L, -2, ++i);
+    }
+    return 1;
 }
 
 /* ---------------- worker（模块级与对象方法共用；base = 第一个真实参数的下标） ---------------- */
@@ -1356,6 +1803,84 @@ static int session_paused(lua_State *L)
 static int session_caps(lua_State *L) { return do_caps(L, self(L)); }
 static int session_help(lua_State *L) { return do_help(L, self(L)); }
 
+/* 数据面（C1b）：全部是 `d:` 调用，没有模块级转发（它们天然属于某一个会话） */
+static int session_read(lua_State *L)
+{
+    SessionState *st = self(L);
+    if (!st) return fail(L, kErrNoSess);
+    return do_read(L, st, 2);
+}
+
+static int session_read_u8(lua_State *L)
+{
+    SessionState *st = self(L);
+    if (!st) return fail(L, kErrNoSess);
+    return do_read_u8(L, st, 2);
+}
+
+static int session_read_u16(lua_State *L)
+{
+    SessionState *st = self(L);
+    if (!st) return fail(L, kErrNoSess);
+    return do_read_u16(L, st, 2);
+}
+
+static int session_read_u32(lua_State *L)
+{
+    SessionState *st = self(L);
+    if (!st) return fail(L, kErrNoSess);
+    return do_read_u32(L, st, 2);
+}
+
+static int session_read_u64(lua_State *L)
+{
+    SessionState *st = self(L);
+    if (!st) return fail(L, kErrNoSess);
+    return do_read_u64(L, st, 2);
+}
+
+static int session_read_str(lua_State *L)
+{
+    SessionState *st = self(L);
+    if (!st) return fail(L, kErrNoSess);
+    return do_read_str(L, st, 2);
+}
+
+static int session_write(lua_State *L)
+{
+    SessionState *st = self(L);
+    if (!st) return fail(L, kErrNoSess);
+    return do_write(L, st, 2);
+}
+
+static int session_context(lua_State *L)
+{
+    SessionState *st = self(L);
+    if (!st) return fail(L, kErrNoSess);
+    return do_context(L, st, 2);
+}
+
+static int session_stack(lua_State *L)
+{
+    SessionState *st = self(L);
+    if (!st) return fail(L, kErrNoSess);
+    return do_stack(L, st, 2);
+}
+
+static int session_mods(lua_State *L)
+{
+    SessionState *st = self(L);
+    if (!st) return fail(L, kErrNoSess);
+    return do_mods(L, st);
+}
+
+static int session_threads(lua_State *L)
+{
+    SessionState *st = self(L);
+    if (!st) return fail(L, kErrNoSess);
+    return do_threads(L, st);
+}
+
 static int session_detach(lua_State *L)
 {
     SessionState *st = self(L);
@@ -1373,7 +1898,7 @@ static int session_kill(lua_State *L)
 /* 每个执行建一份的方法表（`__index` 落到它上面；`detach` 按平台能力装） */
 static void push_methods(lua_State *L, bool has_detach)
 {
-    lua_createtable(L, 0, 14);
+    lua_createtable(L, 0, 24);
     lua_pushcfunction(L, session_pump);    lua_setfield(L, -2, "pump");
     lua_pushcfunction(L, session_cont);    lua_setfield(L, -2, "cont");
     lua_pushcfunction(L, session_step);    lua_setfield(L, -2, "step");
@@ -1386,6 +1911,18 @@ static void push_methods(lua_State *L, bool has_detach)
     lua_pushcfunction(L, session_paused);  lua_setfield(L, -2, "paused");
     lua_pushcfunction(L, session_caps);    lua_setfield(L, -2, "caps");
     lua_pushcfunction(L, session_help);    lua_setfield(L, -2, "help");
+    /* 数据面（C1b） */
+    lua_pushcfunction(L, session_read);     lua_setfield(L, -2, "read");
+    lua_pushcfunction(L, session_read_u8);  lua_setfield(L, -2, "read_u8");
+    lua_pushcfunction(L, session_read_u16); lua_setfield(L, -2, "read_u16");
+    lua_pushcfunction(L, session_read_u32); lua_setfield(L, -2, "read_u32");
+    lua_pushcfunction(L, session_read_u64); lua_setfield(L, -2, "read_u64");
+    lua_pushcfunction(L, session_read_str); lua_setfield(L, -2, "read_str");
+    lua_pushcfunction(L, session_write);    lua_setfield(L, -2, "write");
+    lua_pushcfunction(L, session_context);  lua_setfield(L, -2, "context");
+    lua_pushcfunction(L, session_stack);    lua_setfield(L, -2, "stack");
+    lua_pushcfunction(L, session_mods);     lua_setfield(L, -2, "mods");
+    lua_pushcfunction(L, session_threads);  lua_setfield(L, -2, "threads");
     if (has_detach) { lua_pushcfunction(L, session_detach); lua_setfield(L, -2, "detach"); }
     lua_pushcfunction(L, session_kill);    lua_setfield(L, -2, "kill");
 }

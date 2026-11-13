@@ -79,6 +79,9 @@ public:
 
     /* --- 内存（memory.cpp） --- */
     bool read(size_t addr, void *data, size_t size);
+    /* T7 切片 C1b（plan_t7.md §2.2 第 12 条）：逐页读，**在第一个读不了的页处停下**，
+     * 返回**实际读到的字节数**（0 = 一字节都没读到）。`read()` 是它的全有或全无包装。 */
+    size_t read_some(size_t addr, void *data, size_t size);
     bool write(size_t addr, const void *data, size_t size, bool up_intrin);
     bool update_memory(size_t addr, void *old_data, const void *new_data, size_t size, bool is_up_intrin);
     bool loadstr(size_t addr, char **pp, size_t *nn);

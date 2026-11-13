@@ -4,6 +4,10 @@
  * 对应 TODO 阶段 3 的 memory.cpp；P4.6 又把 **FindMemoryContext / GetMemoryRegion 的搜索与遍历**
  * 从绑定层下沉到这里（旧实现只差“把结果推回 Lua 栈”那一步）。
  * 依赖：会话状态（`proc()`）+ util 的错误/日志。
+ *
+ * T7 切片 C1b 追加 `read_some`（plan_t7.md §2.2 第 12 条）：逐页读、在第一个读不了的页处停下，
+ *   把「真实读到的字节数」交给调用方。`read()` 变成它的全有或全无包装（签名与 29 个契约名的
+ *   可观察行为都不变），`write` / `update_memory` / `loadstr` 一个字未改。
  * ========================================================================== */
 #include "memory.hpp"
 #include "core.hpp" /* P6.4：引擎函数是会话成员（本 TU 多数定义即成员，直接用自身状态） */ /* 模块 11：proc() 等状态现在通过 current_session() 取（宏别名） */
@@ -24,6 +28,59 @@ using autodbg::core::FindMemoryMatch;
 using autodbg::core::MemRegionInfo;
 using autodbg::core::MemRegionIter;
 
+/* 一块（不超过一页）的读：旧 `read()` 的三步原样保留 ——
+ * `VirtualProtectEx(PAGE_EXECUTE_READ)` → `ReadProcessMemory`（长度必须精确相等）→ 还原保护。
+ * ❗本函数**不刷错误日志**：逐页路径里「碰到不可读的页」是**正常路径**（partial read 的全部意义），
+ *   在那里报错会把一次正常的短读变成满屏噪音。诊断留给 `read()`（它失败时打一行，见下）。
+ * ❗`ReadProcessMemory` 失败时按 0 字节算，**即使它报了部分拷贝** —— 旧 `read()` 对任何
+ * `ReadProcessMemory` 失败都整体返回 false，这一条不能因为有了 `read_some` 就松动。 */
+static size_t read_block(DebuggerSession &sess, size_t addr, void *data, size_t size)
+{
+    DWORD old_protect;
+    if (!VirtualProtectEx(sess.proc().hProcess, (LPVOID)addr, size, PAGE_EXECUTE_READ, &old_protect))
+        return 0;
+    size_t got      = 0;
+    SIZE_T new_size = 0;
+    if (ReadProcessMemory(sess.proc().hProcess, (LPVOID)addr, data, size, &new_size) && new_size <= size)
+        got = (size_t)new_size;
+    if (!VirtualProtectEx(sess.proc().hProcess, (LPVOID)addr, size, old_protect, &old_protect))
+        E("VirtualProtectEx");
+    return got;
+}
+
+/* 逐页读（plan_t7.md §2.2 第 12 条）：**在第一个读不了的页处停下**，返回实际读到的字节数。
+ * 为什么必须逐页：`VirtualProtectEx` / `ReadProcessMemory` 都是**整段**语义 —— 256 MB 的请求里
+ *   只要有一页不可读就整体失败，调用方连「已经读到的那部分是真的」都拿不到（旧 `ReadMemory`
+ *   就是这样把部分读吞掉的）。逐页把失败收敛到那一块，前面的字节仍然有效。
+ * 不变式：`read()` 只是它的「全有或全无」包装 ⇒ 29 个契约名（`ReadMemory` / `LoadStr` /
+ *   `GetContext` 之类）的行为一个字节都没变；`bindings.cpp` 里读内存的代码一律没动。 */
+size_t DebuggerSession::read_some(size_t addr, void *data, size_t size)
+{
+    if (!addr || !data || !size)
+    {
+        LOG(TEXT("参数错误: addr: %zu, data: %p, size: %zu"), addr, data, size);
+        return 0;
+    }
+    SYSTEM_INFO si;
+    ZeroMem(si);
+    GetSystemInfo(&si);
+    size_t page = si.dwPageSize ? si.dwPageSize : 0x1000;
+
+    BYTE  *out  = (BYTE *)data;
+    size_t done = 0;
+    while (done < size)
+    {
+        size_t cur    = addr + done;
+        size_t inpage = page - (cur % page); /* 这一块最多到页尾 */
+        size_t chunk  = size - done;
+        if (chunk > inpage) chunk = inpage;
+        size_t got = read_block(*this, cur, out + done, chunk);
+        done += got;
+        if (got != chunk) break; /* 第一块读不了 ⇒ 停；后面的字节一个都不碰 */
+    }
+    return done;
+}
+
 bool DebuggerSession::read(size_t addr, void *data, size_t size)
 {
     if (!addr || !data || !size)
@@ -31,24 +88,13 @@ bool DebuggerSession::read(size_t addr, void *data, size_t size)
         LOG(TEXT("参数错误: addr: %zu, data: %p, size: %zu"), addr, data, size);
         return false;
     }
-    DWORD old_protect;
-    if (!VirtualProtectEx(proc().hProcess, (LPVOID)addr, size, PAGE_EXECUTE_READ, &old_protect))
-    {
-        E("VirtualProtectEx(%p, %zu)", addr, size);
-        return false;
-    }
-    bool   r = true;
-    SIZE_T new_size;
-    if (!ReadProcessMemory(proc().hProcess, (LPVOID)addr, data, size, &new_size))
-    {
-        E("ReadProcessMemory");
-        r = false;
-    }
-    else if (size != new_size)
-        r = false;
-    if (!VirtualProtectEx(proc().hProcess, (LPVOID)addr, size, old_protect, &old_protect))
-        E("VirtualProtectEx");
-    return r;
+    size_t got = read_some(addr, data, size);
+    if (got == size)
+        return true;
+    /* 旧实现在这里打的是「哪个系统调用失败」（`VirtualProtectEx(addr, size)` / `ReadProcessMemory`）。
+     * 逐页之后那几个调用不再对应**整个**范围，所以改报真正的事实：要多少、只拿到多少。 */
+    E("ReadProcessMemory(%p, %zu), only %zu", addr, size, got);
+    return false;
 }
 
 bool DebuggerSession::write(size_t addr, const void *data, size_t size, bool up_intrin)

@@ -6,10 +6,13 @@
  * 来源：新写。形态照 `gui` / `open_file`：注册**一个全局表** `dbg`（AGENTS.md §5 第 6 条），
  *   29 个契约名一个都不动。
  *
- * 形状（切片 C1a：D55 / D57，仍限**单会话**）：
+ * 形状（切片 C1a：D55 / D57，仍限**单会话**；切片 C1b 把数据面接上对象）：
  *   · `dbg.create{...}` / `dbg.attach(pid)` → **会话对象**（full userdata + metatable `AutoDbgSession`）；
  *   · 对象方法：pump / cont / step / eip / arm / hits / dropped / setcap / stopped / paused / caps /
  *     help / detach / kill（`detach` 只在平台有 `DebugActiveProcessStop` 时装，D51）；
+ *   · **数据面（C1b）**：read / read_u8 / read_u16 / read_u32 / read_u64 / read_str / write /
+ *     context（读 + 部分更新）/ stack / mods / threads —— 一律 `nil, err` 报错（D55 第 4 条），
+ *     键名与帧字段跟 `GetContext` / `StackTrace` 同源；
  *   · 对象字段：`stop`（当前未应答的事件表，与 `pump` 返回的是**同一张表**）/ `root_pid` / `kind` /
  *     `state`（`running` / `stopped` / `exited`）；
  *   · 模块级保留 create / attach / pump / cont / step / eip / arm / hits / dropped / setcap / stopped /

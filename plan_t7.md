@@ -542,7 +542,7 @@ type  pid  tid  ea  modname  rva  code  first_chance  cont_code
 | **A** ✅ 已落地 | `close` → `detach`/`kill`（9x 无 `detach`）；`dbg.caps()`；`help()` 纯文本表 | ~700 行（含新文件与门禁） | `e2e_dbg.ps1` 十条：`caps.*` / `detach.capability` / `help.*` / `kill.*` |
 | **B** ✅ 已落地 | help 上色（`core::print_styled` + `console_style_enabled` 纯判定 + `NO_COLOR`; sink / 非控制台 / `--json` 天然纯文本） | ~230 行（含自测与注释） | 自测 `console.style-*` 三条（70 → 73）+ 既有 `help.plain-when-piped` |
 | **C1a** ✅ 已落地 | Session 对象（full userdata + 弱值句柄表）+ C 侧 registry + `dbg.sessions/session/last` + **事件表**（`d.stop`/`cont_code`，删 `dbg.code`）+ `d:pump` 缓存优先 + 延迟武装；**仍限单会话** | ~1350 行（含门禁与注释） | `e2e_dbg` 10 → 13（`session.identity` / `session.pump-cache-first` / `session.event-table`）；`e2e_tcp` ⑯ 六个脚本迁移，条数不变（56） |
-| **C1b** | 数据面接上对象：`d:read*/write/context/stack/trace/mods/threads`、`d:bp/bp_hw/bps`（§2.2 的 1/2/3/12） | ~350 行 | `pump.partial-read-length`、`repl.snapshot-restore`（部分）、`session.data-plane` |
+| **C1b** ✅ 已落地 | 数据面接上对象：`d:read` / `read_u8` / `read_u16` / `read_u32` / `read_u64` / `read_str` / `write` / `context([tid[,t]])` / `stack` / `mods` / `threads` + core 的 `read_some`（真实读取长度） | ~450 行 | `e2e_dbg` 13 → 17（`session.read-write` / `read-partial` / `context` / `mods-threads`） |
 | **C2** | 多会话：事件归属分派 + 每 session 深度 1 的待应答槽 + 进程树 pid-set + 按 pid 的句柄（§10，D57） | ~400 行 | `route.*` + `pump.dispatch-attribution` / `pump.one-pending-per-session` |
 | **C3** | 29 名转薄转发 + `Var` 退出新面（D52） | ~200 行 | `session.default-parity` |
 | **D** | REPL 本体（T7.5：`event` 帧 / `out.id` 归因 / proto 2 / ABI 5 / `=` 简写 / 多行 / 退出收尾报告） | 按 §8 | `repl.*` |
@@ -552,7 +552,7 @@ type  pid  tid  ea  modname  rva  code  first_chance  cont_code
 顺序硬约束：**A 必须早于 C**（`detach`/`kill` 就是 Session 对象的方法）；**C 必须早于 D**（REPL 里
 人/AI 都按对象写）。29 个旧名在 C 期间转成对象 API 的薄转发（行为逐字节不变，`session.default-parity`
 守门），退役留给之后的 D 条目。
-### 11.8 切片 A / B / C1a 落地状态（已提交）
+### 11.8 切片 A / B / C1a / C1b 落地状态（已提交）
 
 - `src/common/platform.{hpp,cpp}`（新文件）：`is_win9x()` / `is_nt()`（`GetVersionExA` 的 `dwPlatformId`，与启动器 `detect_variant()` 同一判据）+ `arch_name` / `variant_name` / `flavor_name`（收拢一处，免得 caps / help / info 各写一份字符串）。❗为什么不用编译开关：`/DAUTODBG_WIN9X` 是「要能在 9x 上跑」的**构建约束**，legacy 产物在 Win11 上也跑；而 caps 报的是**这台机器**。
 - `src/scripting/lua/help_bindings.{hpp,cpp}`（新文件）：`help([topic])` 与 `dbg.help()` 共用 `kHelp[]` 一张表，`help('dbg')` 是**前缀匹配生成的成员列表**（不存在第二份）。输出走 `PrintS` ⇒ server 模式自动进 `out` 帧、本地进控制台/管道，本层不碰句柄。正文是**窄串字面量**（现代变体 UTF-8、legacy CP936，`PrintS` 各自转成 console 需要的形式）；**主题名与签名保持 ASCII**（门禁逐字匹配）。❗legacy 编译警告 **C4566** 的教训：`⇒` / `❗` 这类字符**不能出现在字符串字面量里**（CP936 表示不出），注释里可以 —— 帮助正文里一律用 `->` 与「注意：」。
@@ -572,6 +572,14 @@ type  pid  tid  ea  modname  rva  code  first_chance  cont_code
 - 门禁：`e2e_dbg` 10 → **13**（`session.identity` / `session.pump-cache-first` / `session.event-table`）；`e2e_tcp` ⑯ 段六个脚本迁到事件表 + `d.stop`，断言名与总数不变（**56**）。
 - 本机实测：`e2e_dbg` 86 modern 13 / 86 legacy 13 / 64 modern 8（`session.*` 需 x86 fixture）、`e2e_tcp` 56 / 56 / 48、`--selftest` 73（两架构）、导入表 13 产物、`e2e_json` 32、`e2e_gui` 21、`check_skill` 14、`nvim_smoke` 32 全绿。
 - 本轮确认的取舍（**下一切片别推翻**）：① 模块级 `dbg.cont` 保留 `cont([pid[,tid[,code]]])` 旧形态（对象方法才是 `d:cont([code])`，两者作用同一份状态、成功都清 `d.stop`）；② `hits()` 保留 `seq`（D55 的「同形」只落在**事件表**，历史窗口仍是有序副本）；③ 无会话时 `hits/dropped/setcap` 返回 `nil, kErrNoSess`（不再读上一次的残留窗口）；④ `SessionState::sess` 暂时指向宿主的**同一个** `DebuggerSession`（C2 才有「每会话一个引擎会话」）。
+**切片 C1b（数据面接上对象）**：
+
+- core 新增 `DebuggerSession::read_some(addr, buf, size) -> size_t`：**逐页**读（`VirtualProtectEx` → `ReadProcessMemory` → 还原保护，三步沿用旧 `read()`），在第一个读不了的页处停下并返回真实字节数；`read()` 变成 `read_some(...) == size` 的**全有或全无包装**（签名与可观察行为不变，`write`/`update_memory`/`loadstr` 一字未改）。
+- 对象方法（与契约名同形，只按 D52 把 LuaVariant 换成普通整数）：`d:read(addr,n)`（返回**实际字节串**，可能短于 n；0 字节 → `nil, err`）、`d:read_u8|u16|u32|u64(addr)`（小端）、`d:read_str(addr)`（复用 `loadstr`）、`d:write(addr, string|number)`（整数按 u32 小端；`write(..., up_intrin=true)`）、`d:context([tid])` / `d:context(tid, t)`（**部分更新**，返回 `true` / `nil, err`）、`d:stack([tid[,depth]])`（复用 `lua_stack_trace` 的迭代器，帧字段 `index/ea/modname/rva`）、`d:mods()`（投影 `peinfos()`：`name/base/size/path`）、`d:threads()`（投影 `threads()`：`tid`）。
+- ❗`d:context()` 的键名来自 core 的 `context_fields()`（`GetContext` 用的同一张表）：**`Cax/Cbx/Ccx/Cdx/Csi/Cdi/Csp/Cbp/Cip`**（`C` 前缀 + 通用寄存器名，x86/x64 同名），另有 `EFlags`/`Seg*`/`Dr*`；x64 再多 `R8-R15/Xmm0-15/P1Home…`。所以文档/脚本里不要写 `Eip`——指令指针是 **`Cip`**。
+- 门禁：`e2e_dbg` 13 → **17**（`session.read-write`：读回 fixture 的 `B8 44 42 47 50 CC` 且 `read_u32 == 0x50474244`、写回原值；`session.read-partial`：256 MB 读只拿到一部分、`0x7FFF0000` 完全读不到；`session.context`：`Cip == site+1`、部分更新 `Cax` 生效并可还原；`session.mods-threads`：`mods()` 含 `x86_loop.exe`、`threads()` 的 tid 与事件一致）。
+- 本机实测：`e2e_dbg` 86 modern **17** / 86 legacy 17 / 64 modern 8（数据面需 x86 fixture）、`e2e_tcp` 56/56/48、`--selftest` 73（两架构）、导入表 13 产物、`e2e_json` 32、`e2e_gui` 21、`check_skill` 14、`nvim_smoke` 32 全绿。
+- 仍**没做**：`d:bp/bp_hw/bps`、`snapshot/restore`、`mem_regions`、写入日志/`dry_run`、通配符扫描（都是 §2.2 余下的数据面补口，属 C1b 之后的 T7.4 尾巴）；多会话在 C2、代理在 C-remote。
 ### 11.9 多 session 的脚本面（D57 / D58，随切片 C / T7.6）
 
 #### 11.9.1 pump 的两层（D57）
@@ -635,10 +643,10 @@ while not (a:paused() and b:paused()) do
     end
 end
 -- 两边都停住：context/栈只能在这时读（内存本来随时可读）
-local ca, cb = a:context(), b:context()
+local ca, cb = a:context(), b:context()   -- 键名是 core 的口径：Cax/Cbx/…/Cip（EFlags 保留原名）
 a:cont(); b:cont(); a:detach(); b:detach()
 ```
 
 必须写进 skill / help 的四条：每会话**有界超时** + `stopped()` 双判；跑着的会话只能读内存不能读
-context；两个会话都要显式收尾；命中武装断点时引擎已 EIP-- 并置 TF，所以 `ev.ea == context().eip`
+context；两个会话都要显式收尾；命中武装断点时引擎已 EIP-- 并置 TF，所以 `ev.ea == context().Cip`
 是**正常**的，不要自己再减 1。
