@@ -13,6 +13,9 @@
  * ❗例外（T1 后续）：legacy 变体的 `LjGetMappedFileNameA` 从「只有 Toolhelp」改成三档回退
  *   （Toolhelp + `TH32CS_SNAPMODULE32` → `psapi!GetMappedFileNameA` 动态解析 → 自己走目标的
  *   PEB/Ldr 链表），并带 3 次重试；原因与顺序见该函数前的注释。
+ * ❗追加（T7.3 切片 B / D53）：`print_styled`（`help` 的上色出口）。它是 **`PrintExN` 之外**
+ *   唯一会写 std 句柄的入口，且刻意与 `PrintExN` 共用同一份 sink 判定与 `write_bytes`：
+ *   sink 已装 / 非控制台 / `attr == 0` 三种情况都退回纯文本（零属性字节）。
  * ========================================================================== */
 #include "util.hpp"
 
@@ -218,6 +221,67 @@ void PrintExN(DWORD handle, const wchar_t *s, size_t n)
     int w = WideCharToMultiByte(cp, 0, s, (int)n, b, len, NULL, NULL);
     write_bytes(h, b, (size_t)w);
     common::release(b);
+}
+
+/* T7.3 切片 B（D53）：带颜色的打印。降级链见 util.hpp 的声明处；这条链与 `PrintExN`
+ * 共用同一份 `std_handle` / `write_bytes` / sink 判定，所以「管道下零属性字节」是结构性的
+ * （非控制台根本走不到 `SetConsoleTextAttribute`）。
+ * 导入表：`SetConsoleTextAttribute` / `GetConsoleScreenBufferInfo` 在 Win95 的 kernel32 里
+ * 就有（`tools/api_check/datas.bin` 的 w95 表已核实），不需要 dynapi 降级。 */
+void print_styled(unsigned attr, const char *utf8)
+{
+    if (utf8 == nullptr)
+        return;
+    size_t n = strlen(utf8);
+    if (n == 0)
+        return;
+
+    /* ① sink 优先（server 的 `out` 帧 / `--json` 信封）：属性无处安放 ⇒ 当纯文本交出。
+     * ② `attr == 0` = 默认色 ⇒ 与普通打印完全同一条路径。 */
+    if (g_output_sink != nullptr || attr == 0)
+    {
+        PrintExN(STD_OUTPUT_HANDLE, utf8, n);
+        return;
+    }
+
+    HANDLE h = std_handle(STD_OUTPUT_HANDLE);
+    if (!h)
+        return;
+
+    DWORD mode = 0;
+    if (!GetConsoleMode(h, &mode))
+    {
+        /* ③ 管道 / 文件 / 重定向：只写字节，一个属性字节都不许出现（门禁就在这条上） */
+        write_bytes(h, utf8, n);
+        return;
+    }
+
+    /* ④ 真控制台：只换前景色、保留背景（控制台可能被用户配成非黑底）。
+     * 取不到旧属性时退化成「按 attr 原样设」且**不还原**：没有可信的还原值。 */
+    CONSOLE_SCREEN_BUFFER_INFO info;
+    bool                       have_info = GetConsoleScreenBufferInfo(h, &info) != 0;
+    WORD                       new_attr  = (WORD)attr;
+    if (have_info)
+        new_attr = (WORD)((info.wAttributes & 0xFFF0) | (attr & 0x000F));
+    SetConsoleTextAttribute(h, new_attr);
+
+#ifdef _UNICODE
+    /* 与 `PrintExN` 同一理由：窄串是 UTF-8，`WriteConsoleA` 会按控制台代码页解释 → 乱码 */
+    int    wn = (int)n;
+    LPWSTR w  = utf8_to_utf16_n(utf8, &wn);
+    if (w != nullptr && wn > 0)
+        WriteConsoleW(h, w, (DWORD)wn, NULL, NULL);
+    else
+        write_bytes(h, utf8, n); /* 不是合法 UTF-8 → 至少不丢内容（与 `PrintExN` 一致） */
+    if (w != nullptr)
+        common::release(w);
+#else
+    /* ANSI（legacy）变体：Win9x 控制台是 ANSI-only，窄串就是 CP936 字节 → 直接写 */
+    write_bytes(h, utf8, n);
+#endif
+
+    if (have_info)
+        SetConsoleTextAttribute(h, info.wAttributes);
 }
 
 void PrintExA(DWORD o, LPCSTR fmt, ...)

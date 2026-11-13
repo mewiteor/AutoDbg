@@ -98,7 +98,7 @@ make.bat i <dir>         :: 指定输出目录（默认 .out）
 | 链 | 入口 | 说明 |
 | --- | --- | --- |
 | 导入表门禁 | `uv --directory tools/api_check run scan_dir.py` | 扫 `.out` 下全部产物，按产物自动选口径（`AutoDbgLegacy_*` 与启动器 → `w95`、`.out/fixtures/` 下的 fixture → `w95`（fixture 里禁止 NT-only 调用）、其余 x86 → `wxp`、x64 → `w7`），有目标系统不可用的导入就打印并返回 1。单文件用法：`uv --directory tools/api_check run main.py <exe\|dll> <w95\|w98\|w982\|wxp>`（x64 免第二个参数） |
-| 纯函数自测 | `.out\AutoDbg_<arch>.exe --selftest` | 覆盖 `json_writer` / `png_writer` / `dbl2str` / **帧编解码** / **`decide_console_action`**（T7.1）等纯计算层（基线 70 → T1/D50 转义 +11 = 81 → T2 帧编解码 +20 = 101 → T5 删 `http`/`base64` 两段后 = 67 → **T7.1 补 `decide_console_action` 三条 = 70**） |
+| 纯函数自测 | `.out\AutoDbg_<arch>.exe --selftest` | 覆盖 `json_writer` / `png_writer` / `dbl2str` / **帧编解码** / **`decide_console_action`**（T7.1）等纯计算层（基线 70 → T1/D50 转义 +11 = 81 → T2 帧编解码 +20 = 101 → T5 删 `http`/`base64` 两段后 = 67 → **T7.1 补 `decide_console_action` 三条 = 70** → **T7.3 切片 B 补 `console_style_enabled` 三条 = 73**） |
 | GUI 自动化（本地） | `pwsh tools/server_test/e2e_gui.ps1 -Render <64\|86> [-Variant legacy]` | 起一个 `gui_target.ps1` 靶子窗口，用**本地 CLI** 跑 `gui.*` 脚本断言（屏幕/窗口/控件/截图/`gui.pick`）；`-AllowInput` 才跑会动真鼠标/键盘的用例。T5 之前它走 HTTP `/run`，现已改成本地（`gui.*` 与传输无关，21 条断言；带 `-AllowInput` 是 26 条） |
 | raw TCP 帧（T2/T3/T4/D42） | `pwsh tools/server_test/e2e_tcp.ps1 -Render <64\|86> [-Variant legacy]` | `--server=tcp`：握手帧（`id` = 协议版本、`data` = token）→ `info`；版本不符 / 首帧非握手 / 错 token 的 `error` 帧；`script` → `out`+`result`+`end`；`control` 的 health / version / cancel / 未知 / shutdown；**执行期的 control**（Lua 死循环 + 引擎空转）；**`dbg` 状态机**（T7.3：`pump.*` 八条 —— 停住不放行 / 默认 code 对齐 / step / 重入拒绝 / record-and-continue + dropped / 空转期 cancel / attach + close 只分离 / attach 参数错）；**`--remote` 客户端**（跑脚本 / `--json` 信封 / 语法错误 / health / version / 另一个进程的 `--cancel`）；**`open_file` 读向**（远程 open 应答、read/tell/seek/lines 字节与位置语义、等回包超时 → `nil,"timeout"` 且脚本继续）、**调试回调里的阻塞读**（超时后回调返回、下一次 `Run` 照常；迟到的 `read_resp` 被丢弃）；**`0.0.0.0` 横幅列出网卡地址**。56 条断言（`pump.*` 只在 x86 跑），legacy 同样必须真过 |
 | `dbg` 本地门禁（切片 A） | `pwsh tools/server_test/e2e_dbg.ps1 -Render <64\|86> [-Variant legacy]` | 本地模式（不起 server）：`dbg.caps()` 的 `arch/variant/flavor/win9x/attach/detach/hits_cap` 与本 build 一致、**`dbg.detach ~= nil` 且 `dbg.close == nil`**（D51：能力缺席而不是降级）、`help()` / `help('dbg')` / `help('dbg.pump')` / 未知主题的 `nil, err`、管道下**无 ESC**（切片 B 上色也不许漏到管道）、`dbg.kill()` 真终止目标且之后状态复位（`pump` → `nil, "no session"`）。10 条断言（x64 无 fixture ⇒ `kill.*` SKIP，8 条），legacy 同样必须真过 |
@@ -157,7 +157,7 @@ src/scripting/lua/   唯一感知 lua_State 的层
   （`http` / `base64` / `exec_session` / `effects` / `mcp.lua` 已在 T5 随 D41/D43/D44 删除）
 src/common/          共享基础设施：allocator、containers、dynapi、handle、dbl2str、cmdline、
                      net（winsock 动态载入）、frame（帧头编解码）、json_writer、rand、png_writer、selftest、
-                     console_action（控制台输入判定：纯函数）、platform（is_win9x / arch / variant / flavor）
+                     console_action（控制台输入判定：纯函数）、console_style（help 上色判定：纯函数）、platform（is_win9x / arch / variant / flavor）
 src/sys/             零 CRT 运行时：影子头文件、*.def 导入表、x86 MASM（flt.asm）、mainCRTStartup、
                      CRT 缺口实现（strtoull.c / destruct_eh.c）
   pack/              打包与加载：boot.h（exe↔模块 ABI 契约）、payload（LZMA 单流解包）、

@@ -540,7 +540,7 @@ type  pid  tid  ea  modname  rva  code  first_chance  cont_code
 | 切片 | 内容 | 量 | 门禁 |
 | --- | --- | --- | --- |
 | **A** ✅ 已落地 | `close` → `detach`/`kill`（9x 无 `detach`）；`dbg.caps()`；`help()` 纯文本表 | ~700 行（含新文件与门禁） | `e2e_dbg.ps1` 十条：`caps.*` / `detach.capability` / `help.*` / `kill.*` |
-| **B** | help 上色（`core::print_styled` + 探测 + `NO_COLOR` + `--json` 口径） | ~80 行 | `help.no-color-when-piped` |
+| **B** ✅ 已落地 | help 上色（`core::print_styled` + `console_style_enabled` 纯判定 + `NO_COLOR`; sink / 非控制台 / `--json` 天然纯文本） | ~230 行（含自测与注释） | 自测 `console.style-*` 三条（70 → 73）+ 既有 `help.plain-when-piped` |
 | **C** | Session 对象（事件是**普通表**，无 Stop 对象）+ registry + `dbg.sessions/session/last/detach(pid)/kill(pid)`；29 名转薄转发；`Var` 退出新面 | ~550 行 | `session.*`（含 §10 那组 `route.*`）、`session.default-parity` |
 | **D** | REPL 本体（T7.5：`event` 帧 / `out.id` 归因 / proto 2 / ABI 5 / `=` 简写 / 多行 / 退出收尾报告） | 按 §8 | `repl.*` |
 | **C-remote** | `dbg.remote(host:port, token)` 远端 session 代理（方法面与本地相同，复用 `--server` + `client.cpp`）—— 跨位数 / 强隔离的唯一形态（D56） | ~200 行 | `remote.proxy-parity`（需两个位数） |
@@ -549,13 +549,15 @@ type  pid  tid  ea  modname  rva  code  first_chance  cont_code
 顺序硬约束：**A 必须早于 C**（`detach`/`kill` 就是 Session 对象的方法）；**C 必须早于 D**（REPL 里
 人/AI 都按对象写）。29 个旧名在 C 期间转成对象 API 的薄转发（行为逐字节不变，`session.default-parity`
 守门），退役留给之后的 D 条目。
-### 11.8 切片 A 落地状态（已提交）
+### 11.8 切片 A / B 落地状态（已提交）
 
 - `src/common/platform.{hpp,cpp}`（新文件）：`is_win9x()` / `is_nt()`（`GetVersionExA` 的 `dwPlatformId`，与启动器 `detect_variant()` 同一判据）+ `arch_name` / `variant_name` / `flavor_name`（收拢一处，免得 caps / help / info 各写一份字符串）。❗为什么不用编译开关：`/DAUTODBG_WIN9X` 是「要能在 9x 上跑」的**构建约束**，legacy 产物在 Win11 上也跑；而 caps 报的是**这台机器**。
 - `src/scripting/lua/help_bindings.{hpp,cpp}`（新文件）：`help([topic])` 与 `dbg.help()` 共用 `kHelp[]` 一张表，`help('dbg')` 是**前缀匹配生成的成员列表**（不存在第二份）。输出走 `PrintS` ⇒ server 模式自动进 `out` 帧、本地进控制台/管道，本层不碰句柄。正文是**窄串字面量**（现代变体 UTF-8、legacy CP936，`PrintS` 各自转成 console 需要的形式）；**主题名与签名保持 ASCII**（门禁逐字匹配）。❗legacy 编译警告 **C4566** 的教训：`⇒` / `❗` 这类字符**不能出现在字符串字面量里**（CP936 表示不出），注释里可以 —— 帮助正文里一律用 `->` 与「注意：」。
 - `dbg` 表：`detach`（按 `DebugActiveProcessStop` 的可用性装）/ `kill` / `caps` / `help`，**删 `close`**；宿主侧收尾收拢成 `finish_session()`（unref 回调 + 释放 TCHAR 串 + 复位 started/paused/pid）。`detach` 前若停着未应答事件，先 `ContinueDebugEvent(pid, tid, DBG_CONTINUE)`。
 - 门禁：**新文件 `tools/server_test/e2e_dbg.ps1`**（本地模式、10 条）——`caps.arch-variant`、`caps.detach`、`detach.capability`（`dbg.detach ~= nil` 且 `dbg.close == nil`）、`help.index/group/topic/unknown-topic/plain-when-piped`、`kill.terminates`、`kill.state-reset`。`e2e_tcp.ps1` 的 `pump.attach-detach` 改成「留一个未应答事件再 detach」并断言 caps/表成员一致、目标仍活着；条数仍 56。
 - 本机实测：`e2e_dbg` 86 modern 10 / 86 legacy 10 / 64 modern 8（x64 无 fixture ⇒ `kill.*` SKIP）+ `e2e_tcp` 86/legacy 56、x64 48、`--selftest` 70（两架构）、导入表 13 产物、`e2e_json` 32、`e2e_gui` 21、`check_skill` 14、`nvim_smoke` 32 全绿。
+
+**切片 B（help 上色）**：src/common/console_style.{hpp,cpp} 的纯函数 `console_style_enabled(is_console, no_color_env)` + `no_color_requested()`（NO_COLOR，no-color.org 口径：存在且非空）；core::print_styled(attr, utf8) 的降级链是 **sink 优先 → ttr == 0 → GetConsoleMode 失败（管道/重定向）→ 控制台**，所以「管道里零属性字节」是结构性的（非控制台根本走不到 `SetConsoleTextAttribute`）。控制台上只换前景、保留背景（`(old & 0xFFF0) | (attr & 0x000F)`），写完恢复旧属性；help_bindings 只给每行配一个属性，**文本字节一个不改**（切片 A 的输出逐字保留）。自测 +3（console.style-console / -no-color / -not-console，70 → 73）；`NO_COLOR` 的环境探测故意不进自测（依赖跑测机器的环境）。导入表：`SetConsoleTextAttribute` / `GetConsoleScreenBufferInfo` / `GetEnvironmentVariableA` 都在 w95 段（scan_dir.py 13 产物全过可证）。实测同上（2e_dbg 10/10/8、2e_tcp 56/56/48、--selftest 73）。
 
 ### 11.9 多 session 的脚本面（D57 / D58，随切片 C / T7.6）
 

@@ -20,7 +20,8 @@ namespace autodbg::host
 void register_help_api(lua_State *L);
 
 /* 打印某个主题，返回 false = 没有这个主题（`dbg.help()` 用它，找不到时报固定文案）。
- * 输出走 core 的 `PrintS`（⇒ server 模式下进 `out` 帧，本地进控制台/管道）。 */
+ * 输出走 core 的 `PrintS` / `print_styled`（⇒ server 模式下进 `out` 帧，本地进控制台/管道；
+ * 只有真控制台且没有 `NO_COLOR` 才带属性，其余情况纯文本）。 */
 bool help_print_topic(const char *topic);
 
 /* 打印索引（`help()` 无参时的那一屏）。 */

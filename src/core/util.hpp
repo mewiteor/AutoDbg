@@ -22,6 +22,11 @@
  *   装了 sink 且它返回「已消费」时直接返回、不写句柄（`plan_server.md` §5.3）。
  *   未装 sink 时行为与 P7 完全一致。
  *
+ * ❗再一处（T7.3 切片 B / D53）：`print_styled(attr, utf8)` —— `help` 的上色出口。
+ *   它不是 `Print*` 的包装而是**与 `PrintExN` 同级**的第二个写句柄入口（要包住
+ *   「存旧属性 → 设属性 → 写 → 还原」这一段），但 sink / 非控制台 / `attr == 0`
+ *   三种情况都退回纯文本，见声明处的降级链。
+ *
  * ❗窄串的控制台分支**不能**用 `WriteConsoleA`：UNICODE 构建的窄串是 **UTF-8**
  *   （`/utf-8` 同时改了执行字符集），`WriteConsoleA` 会按控制台代码页（中文 = CP936）
  *   解释这些字节 → 中文全乱（`server: 配置错误 …` 显示成 `閰嶇疆閿欒 …`）。
@@ -103,6 +108,17 @@ inline void ErrorS(const char *s) { PrintExS(STD_ERROR_HANDLE, s); }
 inline void ErrorS(const wchar_t *s) { PrintExS(STD_ERROR_HANDLE, s); }
 inline void Error(const char *s) { PrintEx(STD_ERROR_HANDLE, s); }
 inline void Error(const wchar_t *s) { PrintEx(STD_ERROR_HANDLE, s); }
+
+/* 带颜色的打印（T7.3 切片 B / D53；落点由 `plan_t7.md` §11.3 指定为 core）。
+ * `attr` 是 `SetConsoleTextAttribute` 的位组合（`FOREGROUND_*` / `BACKGROUND_*`），
+ *   **0 = 默认色**（不设属性，保留控制台当前的属性）。
+ * 降级链（与 `PrintExN` 同一口径）：
+ *   ① 装了 sink（server 的 `out` 帧 / `--json` 信封）-> 当纯文本交给 sink，不上色；
+ *   ② `attr == 0` -> 直接走 `PrintExN`（纯文本，零属性字节）；
+ *   ③ 非控制台（管道/文件/重定向，`GetConsoleMode` 失败）-> 只写字节，不上色；
+ *   ④ 真控制台 -> 存旧属性 -> `SetConsoleTextAttribute` -> `WriteConsoleW` -> 恢复旧属性。
+ * 只用 `SetConsoleTextAttribute`，不用 ANSI 转义（9x 控制台没有 VT，D53）。 */
+void print_styled(unsigned attr, const char *utf8);
 
 /* 格式化打印（替代旧的 PrintF/ErrorF/ErrorFV 宏；变参无法用内联转发 → 真实函数）
  * 注：**宽字符格式化路径仅 _UNICODE 构建存在**（1:1 对应旧 lib.c 的 `#ifdef _UNICODE`

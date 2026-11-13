@@ -7,10 +7,16 @@
  * 与旧实现的差异：无旧实现。三条设计约束：
  *   ① **一处文本**：正文只在下面的 `kHelp[]` 里；`help('dbg')` 与 `dbg.help()` 都是
  *      「按前缀生成」的 —— 不存在第二份成员列表。
- *   ② **输出走 core 的 `PrintS`**：本地控制台/管道都好使，server 模式下自动进 `out` 帧
- *      （`set_output_sink`），本层不碰句柄。切片 B 才在 `PrintS` 之上加 `print_styled` 与
- *      「只在真控制台上色」（`GetConsoleMode` 探测），所以现在这一版天然是纯文本。
+ *   ② **输出走 core 的 `PrintS` / `print_styled`**：本地控制台/管道都好使，server 模式下
+ *      自动进 `out` 帧（`set_output_sink`），本层不碰句柄。切片 B（下面 `put`/`line`）只给
+ *      每一行带一个属性，**文本字节一个不改**；条件不满足（非控制台 / `NO_COLOR` /
+ *      server 的 sink / `--json`）时属性位自动退回 0 = 纯文本（`core::print_styled` 的
+ *      降级链），所以管道里没有任何属性字节或 ESC。
  *   ③ **错误当值返回**（`nil, err`），不长跳 —— 与 `types.hpp` 的既定口径一致。
+ *
+ * 上色（切片 B / D53）：只有**真控制台**且没有 `NO_COLOR` 才上色，判定在
+ *   `common::console_style_enabled`（纯函数，`--selftest` 直接断言）；不用 ANSI 转义
+ *   （9x 控制台没有 VT），真正的 `SetConsoleTextAttribute` 在 `core::print_styled` 里。
  *
  * 文本编码：源码是 UTF-8。现代变体 `/utf-8` ⇒ 窄串就是 UTF-8，`PrintS` 会按控制台需要转
  *   UTF-16；legacy 变体 `/execution-charset:gbk` ⇒ 窄串是 CP936，`PrintS` 走 ANSI 分支。
@@ -19,7 +25,8 @@
  * ========================================================================== */
 #include "help_bindings.hpp"
 
-#include "core/util.hpp" /* PrintS（走输出 sink：本地控制台 / server 的 out 帧） */
+#include "common/console_style.hpp" /* 上色判定：真控制台 && 没有 NO_COLOR（切片 B / D53） */
+#include "core/util.hpp"           /* PrintS / print_styled（走输出 sink：本地控制台 / server 的 out 帧） */
 
 namespace autodbg::host
 {
@@ -189,6 +196,44 @@ const HelpEntry kHelp[] = {
     },
 };
 
+/* 切片 B（D53）的三种色。取值是 `SetConsoleTextAttribute` 的 `FOREGROUND_*` 位；
+ * `STYLE_PLAIN = 0` = 默认色（`core::print_styled` 不设属性）。 */
+enum HelpStyle
+{
+    STYLE_PLAIN     = 0,
+    STYLE_TITLE     = FOREGROUND_GREEN | FOREGROUND_INTENSITY, /* 标题：亮绿 */
+    STYLE_TOPIC     = FOREGROUND_BLUE | FOREGROUND_INTENSITY,  /* 主题名：亮蓝 */
+    STYLE_SECONDARY = FOREGROUND_INTENSITY,                    /* 注释 / 次要行：暗色 */
+};
+
+/* 本屏是否上色：**每屏开头赋值一次**（`help_print_index` / `help_print_topic`），整屏复用 ——
+ * `help` 是低频调用，但没理由每行都查一遍环境变量。零初始化的 POD（不是线程局部、也没有
+ * 非平凡构造），所以不违反映射模块的禁令（AGENTS §11.5）；未探测前默认 false = 纯文本，
+ * 即「忘了探测」只会少颜色，不会多属性字节。 */
+bool g_styling = false;
+
+/* 真控制台 + 没有 `NO_COLOR`（判定本身是 `common` 的纯函数，`--selftest` 直接断言）。
+ * ❗sink 装没装不在这里判：`core::print_styled` 自己先把 sink 当纯文本（server / `--json`）。 */
+bool detect_styling()
+{
+    HANDLE h    = GetStdHandle(STD_OUTPUT_HANDLE);
+    DWORD  mode = 0;
+    bool   is_console = (h != NULL && h != INVALID_HANDLE_VALUE) && GetConsoleMode(h, &mode) != 0;
+    return autodbg::common::console_style_enabled(is_console, autodbg::common::no_color_requested());
+}
+
+/* 唯一输出点：不带样式的调用一律给 `STYLE_PLAIN`（文本字节因此与切片 A 逐字一致）。 */
+void put(HelpStyle style, const char *s)
+{
+    autodbg::core::print_styled(g_styling ? (unsigned)style : 0u, s);
+}
+
+void line(HelpStyle style, const char *s)
+{
+    put(style, s);
+    put(STYLE_PLAIN, "\n");
+}
+
 bool streq(const char *a, const char *b)
 {
     if (a == nullptr || b == nullptr) return a == b;
@@ -235,20 +280,14 @@ bool has_group(const char *topic)
     return false;
 }
 
-void print_line(const char *s)
-{
-    autodbg::core::PrintS(s);
-    autodbg::core::PrintS("\n");
-}
-
 void print_entry_summary(const HelpEntry &e)
 {
-    autodbg::core::PrintS("  ");
-    autodbg::core::PrintS(e.topic);
+    put(STYLE_PLAIN, "  ");
+    put(STYLE_TOPIC, e.topic);
     /* 粗略对齐（按字符数补到 12 列）：索引与分组列表才好扫读 */
     size_t n = slen(e.topic);
-    for (size_t i = n; i < 12; i++) autodbg::core::PrintS(" ");
-    print_line(e.summary);
+    for (size_t i = n; i < 12; i++) put(STYLE_PLAIN, " ");
+    line(STYLE_SECONDARY, e.summary);
 }
 
 void print_group(const char *topic)
@@ -265,6 +304,7 @@ void print_group(const char *topic)
 
 bool help_print_topic(const char *topic)
 {
+    g_styling = detect_styling();
     if (topic == nullptr || *topic == 0)
     {
         help_print_index();
@@ -272,26 +312,26 @@ bool help_print_topic(const char *topic)
     }
     if (const HelpEntry *e = find_entry(topic))
     {
-        autodbg::core::PrintS(e->topic);
-        autodbg::core::PrintS(" —— ");
-        autodbg::core::PrintS(e->summary);
-        autodbg::core::PrintS("\n\n");
-        if (e->body != nullptr) autodbg::core::PrintS(e->body);
+        put(STYLE_TOPIC, e->topic);
+        put(STYLE_PLAIN, " —— ");
+        put(STYLE_SECONDARY, e->summary);
+        put(STYLE_PLAIN, "\n\n");
+        if (e->body != nullptr) put(STYLE_PLAIN, e->body);
         /* 既是条目、又有成员的（`dbg`）：紧跟着把成员列出来 —— 这就是 `help('dbg')`
          * 与 `dbg.help()` 的全部实现（不另存第二份成员表）。 */
         if (has_group(topic))
         {
-            autodbg::core::PrintS("\n成员（help('<名字>') 看详细）：\n");
+            line(STYLE_TITLE, "\n成员（help('<名字>') 看详细）：");
             print_group(topic);
         }
         return true;
     }
     if (has_group(topic))
     {
-        autodbg::core::PrintS(topic);
-        autodbg::core::PrintS(" 的成员（help('");
-        autodbg::core::PrintS(topic);
-        autodbg::core::PrintS(".<名字>') 看详细）\n\n");
+        put(STYLE_TOPIC, topic);
+        put(STYLE_SECONDARY, " 的成员（help('");
+        put(STYLE_TOPIC, topic);
+        put(STYLE_PLAIN, ".<名字>') 看详细）\n\n");
         print_group(topic);
         return true;
     }
@@ -300,16 +340,17 @@ bool help_print_topic(const char *topic)
 
 void help_print_index()
 {
-    print_line("autodbg 帮助 —— help('topic') 看详细；help('dbg') 看 dbg 表全部成员");
-    print_line("语义/坑/示例：tools/agent/autodbg-skill/    机器可读能力：dbg.caps()");
-    print_line("");
+    g_styling = detect_styling();
+    line(STYLE_TITLE, "autodbg 帮助 —— help('topic') 看详细；help('dbg') 看 dbg 表全部成员");
+    line(STYLE_SECONDARY, "语义/坑/示例：tools/agent/autodbg-skill/    机器可读能力：dbg.caps()");
+    line(STYLE_PLAIN, "");
     for (const HelpEntry &e : kHelp)
     {
         /* 索引只列**顶层主题**（不带点）；成员靠 help('dbg') */
         if (top_level(e.topic)) print_entry_summary(e);
     }
-    print_line("");
-    print_line("  例：help('dbg.pump')    dbg.help()    dbg.caps()");
+    line(STYLE_PLAIN, "");
+    line(STYLE_SECONDARY, "  例：help('dbg.pump')    dbg.help()    dbg.caps()");
 }
 
 namespace

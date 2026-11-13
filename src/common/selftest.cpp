@@ -6,7 +6,8 @@
  * 覆盖：json_writer（转义/嵌套/数字/深度溢出/T1 的全转义出口）、rand（hex 形状与两次不相等）、
  *   帧头编解码（T2：定长头 / json 长度反推 / raw 长度前缀 / 全部拒绝路径）、PNG/BMP 编码、
  *   `decide_console_action`（T7.1 补上 plan.md §1.1 第 1 条欠着的三条：67 → 70；T7.3 从
- *   `scripting/lua/console_input.*` 搬进 `common/console_action.*`，消除 `common → scripting` 的反向依赖）。
+ *   `scripting/lua/console_input.*` 搬进 `common/console_action.*`，消除 `common → scripting` 的反向依赖）、
+ *   `console_style_enabled`（T7.3 切片 B：`help` 上色的三条判定，70 → 73）。
  * ❗T5（D41/D44）删除了 HTTP 与 base64 两段：它们跟着 http.* / ase64.* 一起消失。
  * 说明：断言用 `strcmp`/`memcmp` 逐字节比较（跨架构/跨编译器稳定）；
  *   期望值都是**手写的字面量**，不要在这里用被测代码生成期望值（否则等于没测）。
@@ -15,6 +16,7 @@
 
 #include "frame.hpp"   /* T2：帧头编解码（plan_cli.md §2.1） */
 #include "console_action.hpp" /* T7.3：`decide_console_action`（纯判定、只依赖 windows.h；从 scripting/lua 搬来） */
+#include "console_style.hpp"  /* T7.3 切片 B：`console_style_enabled`（`help` 上色的纯判定） */
 #include "json_writer.hpp"
 #include "png_writer.hpp"
 #include "rand.hpp"
@@ -477,6 +479,18 @@ void test_console_action(test_ctx *t)
     check_bool(t, "console.no-matching-record", keydown_only && other_key && empty_records, "无匹配记录 -> 0");
 }
 
+/* -------------------- 上色判定（T7.3 切片 B / D53） --------------------
+ * `console_style_enabled` 是纯函数（`is_console && !no_color_env`），所以「什么时候上色」直接
+ *   三条真/假断言；`NO_COLOR` 的**环境探测**不在自测里测
+ *   （它依赖跑自测那台机器的环境变量，不具确定性）。
+ */
+void test_console_style(test_ctx *t)
+{
+    check_bool(t, "console.style-console", console_style_enabled(true, false), "真控制台 + 无 NO_COLOR -> true");
+    check_bool(t, "console.style-no-color", !console_style_enabled(true, true), "NO_COLOR 非空 -> false");
+    check_bool(t, "console.style-not-console", !console_style_enabled(false, false), "管道/重定向 -> false");
+}
+
 /* ------------------------------ PNG / BMP（截图编码，S4） ------------------------------ */
 void test_image(test_ctx *t)
 {
@@ -557,6 +571,7 @@ int run_selftests(selftest_report_fn report, void *ctx)
     test_rand(&t);
     test_frame(&t);
     test_console_action(&t);
+    test_console_style(&t);
     test_image(&t);
 
     {
