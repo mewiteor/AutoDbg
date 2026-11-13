@@ -756,3 +756,89 @@ a:cont(); b:cont(); a:detach(); b:detach()
 必须写进 skill / help 的四条：每会话**有界超时** + `stopped()` 双判；跑着的会话只能读内存不能读
 context；两个会话都要显式收尾；命中武装断点时引擎已 EIP-- 并置 TF，所以 `ev.ea == context().Cip`
 是**正常**的，不要自己再减 1。
+
+---
+
+## 12. 剩余任务（交接清单，2026-11-13）
+
+> 分支 `feat/t7-low-level-api`，最后提交 `6ab289a`（C2b）。工作区干净。
+> 本节是**换机器接着干**用的：状态快照 + 剩余四件事 + 复跑命令 + 不要破坏的东西。
+
+### 12.1 已落地的切片（全部有门禁，按提交顺序）
+
+| 提交 | 切片 |
+| --- | --- |
+| `c65d67a` / `7226f5e` | T7.3 `dbg` 表；`create`/`attach` 拆分（`close` → `detach`/`kill`） |
+| `7f444dd` / `c447d80` | A：`detach`/`kill`/`caps`/`help`；B：help 上色 |
+| `f67c8b8` / `252b601` | C1a：会话对象 + registry + 事件表；C1b：数据面 + `read_some` |
+| `6acb111` / `c3fa70d` | C2a：多会话 + 进程级路由；sugar：`dbglib.wait_all`/`run_all` |
+| `95122b3` / `258457c` / `6f8b247` | D1：`--repl`（ABI 5）；D2a：协议 2（`event` + `out.id`）；D2b：`--repl --server` |
+| `9e42413` / `28e930b` / `49acb80` / `6ab289a` | C-remote：`dbg.remote`；C1c：类型统一；**C1d**：`V` 仅回调 + `d:v` + `context` 全 variant；**C2b**：进程树 + 按 pid 句柄 + `d:proc` |
+| `88d0470` | 修 C2a 回归（29 名跟随 `dbg.last()`） |
+| `b66eb09` / `d47710b` / `d620b00` / `bbfa908` | 文档：skill 包 + PITFALLS（S15–S28） |
+
+### 12.2 当前门禁基线（换机器后先复跑一遍）
+
+| 门禁 | 命令 | 基线 |
+| --- | --- | --- |
+| 构建 | `cmd /c "chcp 936 && make.bat a 86"` / `a 64` | 0 错 0 警告（**必须 936 代码页**，见 AGENTS §1） |
+| 自测 | `.out\AutoDbg_86.exe --selftest` / `_64` | **73 / 73** |
+| 导入表 | `uv --directory tools/api_check run scan_dir.py` | **14 产物**（含两个 fixture） |
+| `dbg` 本地 | `pwsh tools/server_test/e2e_dbg.ps1 -Render 86`（+`-Variant legacy`、`-Render 64`） | **36 / 36 / 8** |
+| raw TCP | `e2e_tcp.ps1 -Render 86`（+legacy、64） | **59 / 59 / 51** |
+| REPL | `e2e_repl.ps1 -Render 86`（+legacy、64） | **11 / 11 / 10** |
+| JSON 信封 | `e2e_json.ps1 -Render 86` | 32 |
+| GUI | `e2e_gui.ps1 -Render 86` | 21（`-AllowInput` 26） |
+| skill 包 | `tools/agent/check_skill.ps1 -Render 86`（+64） | **16 断言 / 55 片段** |
+| nvim | `nvim_smoke.ps1 -Render 86` | 32 |
+
+### 12.3 剩余任务
+
+#### ① C3 —— 29 名转薄转发 + `Var` 退出新面（可做可不做，纯内部整理）
+
+- **内容**：把 `bindings.cpp` 里 29 个 `lua_*` 改成「转发到 session 对象的那份实现」，删除重复逻辑（数据面已经在 `dbg_bindings.cpp` 里有一份）。`Var`（`V`/`U32`…）继续只在 29 名里存活，新面不新增。
+- **硬约束**：**行为逐字节不变** —— 门禁是 `session.default-parity`（`e2e_dbg` 第 28 条）+ `e2e_tcp` 59 条 + `e2e_json` 32 条。改完必须逐条比对文案与错误码。
+- **入口**：`src/scripting/lua/bindings.cpp`（29 个 `lua_*`）、`src/scripting/lua/dbg_bindings.cpp`（`session_*` 实现、`kProcMethods`）、`registry.cpp`（注册点）。
+- **风险**：`GetContext`/`SetContext` 的 kind 映射、`LoadStr` 的缓冲释放、`FindMemory` 的上下文生命周期——这三处是最容易改出差异的。
+
+#### ② nvim `:AutoDbgRepl`（子模块，独立仓提交）
+
+- **内容**：在 `nvim/`（子模块 `AutoDbg.nvim`）里加 `:AutoDbgRepl`：连 `--repl --server`（协议 2、每条命令一个 `id`、`result.id` = 该行错误码），把 `out`/`event` 帧渲染进一个 scratch buffer；`M.cancel()` 走 `control` 帧；`config` 里补 `repl = { … }` 的默认值。
+- **入口**：`nvim/lua/autodbg/tcp.lua`（`PROTO = 2`、`EVENT = 16` 已经在 D2a 里加好了）、`nvim/lua/autodbg/init.lua`（命令注册）、`nvim/README.md`（用法）。
+- **注意**：`docker`/`nvim` 侧的回调是 **fast event context** ⇒ 一切 nvim API 要 `vim.schedule`（PITFALLS N12）；`nvim_smoke.ps1` 必须仍过 32 条。
+- **提交**：`nvim/` 是独立仓，**在子模块里单独提交**，父仓只更新 gitlink（AGENTS §8）。
+
+#### ③ skill 包补 C2b 一节（文档）
+
+- `tools/agent/autodbg-skill/references/lua-api.md` 加「进程树与进程对象」：`d:procs()`、`d:proc(pid)`（`pid` + `read*/write/v/context/stack/mods`）、`d:current_pid()`、`d:threads()` 的 `pid` 字段、**两个限制**（`d:arm` 只打第一个进程；`CREATE_PROCESS` 归属靠「谁在 pump」）。
+- 顺手给 `recipes/` 加一个 `child-process.md`（父起子、`d:procs()` 找子、`p:read` 读子、`d:current_pid()` 在回调里定位）。
+- 门禁：`check_skill`（脚本片段会做语法检查，不执行）。
+
+#### ④ `AGENTS.md` §12 的 REPL / 进程树口径（文档尾巴）
+
+- §12 目前只写到文件 I/O 与 server；补两小节：`--repl`（本地 + `--repl --server`、`=` 简写、续行判据 `near <eof>`、退出码 = 最后一条命令、退出会话报告）与「进程树」（`owns_pid`、`handle_for_pid`、`d:procs/d:proc/current_pid`、两个限制）。写清之后 `AGENTS.md` 才和代码同源。
+
+### 12.4 已记录、**不打算现在做**的延期项（别当 bug 报）
+
+1. **按 pid 的断点记录层**：`BreakpointInfo.orignal_byte` 是单字节 + 布局不可动 ⇒ 进程树里 `d:arm` 只对第一个进程生效（PITFALLS S27）。正解是新记录层（§10 第 4 条），留给后续。
+2. **`CREATE_PROCESS` 的归属 hint**：`DEBUG_EVENT` 无 parent pid ⇒ 多会话同时派生时「谁在 pump 归谁」（PITFALLS S28）。串行驱动是设计前提。
+3. **`dbg.remote` 下的 `d:v` / 进程对象**：代理的 `SESSION_METHODS` 不含 `v`、也没有 `proc`（跨进程每跳一次往返，暂不做）。
+4. **`Run`/`Attach` 与 `dbg` 在同一个执行里混用**：`dbg_busy()` 直接拒（设计如此，D60 之后 `V` 在回调里的归属才是唯一确定）。
+5. **REPL 无本地中断**：`dbg` 的 `on_wait_timeout` 不读控制台（§11.6 第 4 条），长 `pump` 只能等超时或从 `--server` 发 `control cancel`。
+
+### 12.5 换机器后第一步
+
+```powershell
+cd <repo>
+git switch feat/t7-low-level-api
+git log --oneline -3            # 确认最后一个是 6ab289a 或其后
+cmd /c "chcp 936 && make.bat a 86"
+cmd /c "chcp 936 && make.bat a 64"
+.out\AutoDbg_86.exe --selftest
+uv --directory tools/api_check run scan_dir.py
+pwsh tools/server_test/e2e_dbg.ps1 -Render 86
+pwsh tools/server_test/e2e_tcp.ps1 -Render 86
+pwsh tools/server_test/e2e_repl.ps1 -Render 86
+```
+
+基线对得上（见 §12.2）再开始动代码；对不上先查 `PITFALLS.md` 的 B 节（构建）与 `.build` 是否干净（`make.bat r` 会全量重建）。
