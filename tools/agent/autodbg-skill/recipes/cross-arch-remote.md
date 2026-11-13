@@ -56,16 +56,16 @@ end
 if not ev then d:kill(); h:close(); error('no event from the remote session') end
 print('ev', ev.type, ev.pid, ev.tid)
 
--- 停住时读寄存器：键名与本地完全一致（Cax … Cip），event.session 已填回这个代理对象
-print(string.format('Cip=%X', d:context().Cip))
+-- 停住时读寄存器：键名/类型与本地完全一致（Cax … Cip 是 LuaVariant），event.session 已填回这个代理对象
+print('Cip=' .. d:context().Cip.hex)             -- 地址类用 .hex / .val，不能塞 string.format('%X', …)
 
--- 数据面：模块表 + 内存。地址过线走 __i（x64 基址 15 位十进制，否则 jsonx 会丢低位），
--- 字节过线走 __hex —— 两种标记代理已自动处理，脚本拿到的就是普通整数 / 字节串。
+-- 数据面：模块表 + 内存。地址类值（mods()[].base / ev.ea）过线走 __u64（取 .val：精确十进制），
+-- 字节过线走 __hex —— 两种标记代理已自动处理，脚本拿到的就是 LuaVariant / 字节串。
 local mods, merr = d:mods()
 if not mods or not mods[1] then d:kill(); h:close(); error(merr or 'no modules') end
 local m = mods[1]
-local head = d:read(m.base, 4)
-print(m.name, string.format('base=%X', m.base), 'head_len=' .. tostring(head and #head))
+local head = d:read(m.base, 4)                   -- m.base 是 LuaVariant，d:read 直接收
+print(m.name, 'base=' .. m.base.hex, 'head_len=' .. tostring(head and #head))
 print('is MZ:', head ~= nil and #head == 4 and string.byte(head, 1) == 0x4D)
 print('u16 as number:', type(d:read_u16(m.base)) == 'number')
 
@@ -101,7 +101,11 @@ print('close', h:close())
 - **显式 `--server-token=` 时 loopback 也校验**，客户端的 `opts.token` 必须同值；两边都不给才免校验。
 - **`ev.session` 是代理对象**，所以 `ev.session:cont(ev.cont_code)` 在本地 / 远端写法一致。
   事件表是普通表，字段与本地同一份（`type` / `pid` / `tid` / `ea` / `modname` / `rva` / `code` /
-  `cont_code` / `first_chance`）。
+  `cont_code` / `first_chance`），**类型也同一份**：`ea` 是 LuaVariant，`rva` / `code` 是 number。
+- **地址类过线是 `__u64`（取 `.val`）**：`ev.ea` / `mods()[].base` / `read_u64` / `context()` 的
+  `UPTR` 键都是 LuaVariant ⇒ 编码成 `{"__u64":"<十进制>"}`，解码回来是 **`U64(…)`**（`LV_U64`）。
+  ❗所以**跨位数比较一律用 `.val` / `.hex`**：本地 x86 的 `ev.ea` 是 `LV_U32`，远端回来的是
+  `LV_U64`，`==`（只在同型时成立）永远 false。旧的 `__i`（裸大整数）解码侧仍兼容，不是现行编码。
 - **回调过不了线**：`d:arm(mod, rva, cb)` 在代理上必失败
   （`nil, 'dbg.remote: argument cannot cross the wire (function/userdata/Nan)'`）。断点只能在
   **远端**那个 state 里武装；代理这侧负责 `pump` / `cont` / 数据面 / 收尾。

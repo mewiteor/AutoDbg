@@ -83,6 +83,8 @@ stdout **只有一行**、纯 ASCII：
 - `detached` 只在目标真的存活时为 true（真 detach / keep-alive）；被 kill → false。
 - `images` = 本次写盘过的路径（`open_file` 的 w/a、`gui.screenshot_to`），去重、上限 64，空也输出 `[]`。
 - `result` = 脚本返回值：1 个 → 那个值；0 个 → `null`；多个 → 数组；编不了（function / 稀疏表 / NaN / 循环引用）→ `null`（`ok` 仍可能为 true）。
+  ❗地址类值是 LuaVariant（`dbg` 新面：`ev.ea` / `mods().base` / `eip` / `read_u64`…）⇒ 走 `jsonx`
+  的 `userdata` 分支吐 `.val`（**精确十进制**），不会被 `%.14g` 截断（裸 number 会被）。
 - `--out=<path>` 写同一份 JSON 到文件，stdout 留空。
 - JSON 模式下被调试进程的 stdout/stderr 被指到本进程的 stderr —— 不会污染那一行。
 

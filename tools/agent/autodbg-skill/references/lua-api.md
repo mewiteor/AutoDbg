@@ -53,9 +53,9 @@ if not d then error(err) end
 
 local ev = d:pump(3000)            -- 等一个事件；默认**不放行**（目标停在这里）
 if ev then
-  print(ev.type, ev.pid, ev.tid, string.format('ea=%X', ev.ea))
+  print(ev.type, ev.pid, ev.tid, 'ea=' .. ev.ea.hex)   -- ❗地址类是 LuaVariant：用 .hex / .val
   local c = d:context()            -- 键名是 Cax…Cip（见下表）
-  print(string.format('eip=%X', c.Cip))
+  print('eip=' .. c.Cip.hex)       -- Cip 也是 LuaVariant，不能塞 string.format('%X', …)
   d:cont()                         -- 放行；缺省 = ev.cont_code
 end
 
@@ -75,7 +75,8 @@ if d.detach then d:detach() else d:kill() end   -- 收尾；9x 上没有 detach
 `create` 的选项：`imagepath`（必填）、`cmdline`、`cwd`、`is_new_console`、`use_scylla_hide`，
 以及六个回调 `callback` / `exception_callback` / `on_exception` / `on_breakpoint` /
 `on_single_step` / `on_exit_process`。❗回调收的是**一张表** `{ pid, tid, ea, code, modname, rva }`
-（`callback` 里 `ea`/`code` 是 0）—— 与 `Run` 的 `callback(pid, tid)` 形状**不同**（D52：新面一律表 + 普通整数）。
+（`callback` 里 `ea`/`code` 是 0）—— 与 `Run` 的 `callback(pid, tid)` 形状**不同**（D52：新面一律收一张表；
+表里的 `ea` 是 LuaVariant、其余是小整数，见下面「字段类型」）。
 
 ### 会话对象的字段
 
@@ -88,17 +89,24 @@ if d.detach then d:detach() else d:kill() end   -- 收尾；9x 上没有 detach
 
 ### 事件表（`d:pump()` 的返回值就是 `d.stop` 那张表）
 
-| 字段 | 说明 |
-| --- | --- |
-| `type` | `DEBUG_EVENT` 码（`1` 异常 / `2` 建线程 / `3` 建进程 / `5` 退出进程 / `6` 加载 DLL …） |
-| `pid` / `tid` | 事件的进程 / 线程 |
-| `ea` / `modname` / `rva` | 命中地址与归属模块（没有命中语义的事件是 `0` / `""` / `0`） |
-| `code` | **异常码**（`EXCEPTION_*`；没有异常的事件是 `0`） |
-| `first_chance` | `1` / `0`，也可能是 `nil`（该通道 core 不上报首次命中） |
-| `cont_code` | core 算好的**默认应答码**（`0x00010002` = `DBG_CONTINUE` / `0x80010001` = `NOT_HANDLED`） |
-| `session` | 本事件**归属的会话**（userdata）：多会话时靠它归因，不要拿 `ev.pid` 去猜 |
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `type` | number | `DEBUG_EVENT` 码（`1` 异常 / `2` 建线程 / `3` 建进程 / `5` 退出进程 / `6` 加载 DLL …） |
+| `pid` / `tid` | number | 事件的进程 / 线程 |
+| `ea` | **LuaVariant** | 命中地址（指针宽：x86 `LV_U32`、x64 `LV_U64`）；没有命中语义的事件是 `0` |
+| `modname` | string | 归属模块（没有命中语义的事件是 `""`） |
+| `rva` | number | 模块内偏移（**普通 number**，不是 LuaVariant） |
+| `code` | number | **异常码**（`EXCEPTION_*`；没有异常的事件是 `0`） |
+| `first_chance` | number? | `1` / `0`，也可能是 `nil`（该通道 core 不上报首次命中） |
+| `cont_code` | number | core 算好的**默认应答码**（`0x00010002` = `DBG_CONTINUE` / `0x80010001` = `NOT_HANDLED`） |
+| `session` | userdata | 本事件**归属的会话**：多会话时靠它归因，不要拿 `ev.pid` 去猜 |
 
 ❗`code` 与 `cont_code` 不许混用：`code` 是「这是什么异常」，`cont_code` 是「该回的应答码」。
+
+❗**类型口径（切片 C1c / D59）**：**地址类 = LuaVariant**（指针宽），**小整数 = number**。
+事件表里只有 `ea` 是 LuaVariant；`type` / `pid` / `tid` / `code` / `cont_code` / `first_chance` / `rva`
+都是普通 number。别把 `ev.rva` 也包成 variant —— `d:arm` 吃的就是普通数字。
+比较与算术的正确姿势见下面「地址类值的比较与算术」（`ev.ea == 0x401000` 恒为 **false**）。
 
 ### 方法
 
@@ -107,9 +115,9 @@ if d.detach then d:detach() else d:kill() end   -- 收尾；9x 上没有 detach
 | `d:pump([ms[, autocont]])` | **缓存优先**：`d.stop` 非空就立即返回它（不阻塞）；否则等属于本会话的事件。`nil` = 没等到（**不是错误**，也不清 `d.stop`）。缺省 `ms = 100` |
 | `d:cont([code])` | 应答当前事件 → `true` / `false`；缺省 `code` = `cont_code`。吞掉断点用 `0x00010002`，交给程序用 `0x80010001` |
 | `d:step([tid])` | 置 TF 单步（下一个事件是 SINGLE_STEP）；之后还要 `d:cont()` |
-| `d:eip([tid])` | 当前指令指针（整数）；拿寄存器表用 `d:context()` |
-| `d:arm(modname, rva, callback)` | 武装软件断点。`rva` 是**普通数字**（不要用 `GetModBase` 做算术：LuaVariant 会算错）；**允许延迟武装**（模块没加载就登记，`CREATE_PROCESS`/`LOAD_DLL` 时补 `0xCC`）。❗别打在本来就写着 `CC` 的地址上 |
-| `d:hits()` | 命中窗口的**副本**：`{ {seq,type,pid,tid,ea,modname,rva,code,cont_code,first_chance}, … }`；`type` `1` 断点 / `2` 异常 / `3` 单步 |
+| `d:eip([tid])` | 当前指令指针（**LuaVariant**，同 `context().Cip`）；拿整张寄存器表用 `d:context()` |
+| `d:arm(modname, rva, callback)` | 武装软件断点。`rva` 是**普通数字**（`GetModBase()` 返回的是 LuaVariant：要做算术先 `tonumber(x.val)`，否则 `x + n` 得到的是另一个 variant）；**允许延迟武装**（模块没加载就登记，`CREATE_PROCESS`/`LOAD_DLL` 时补 `0xCC`）。❗别打在本来就写着 `CC` 的地址上 |
+| `d:hits()` | 命中窗口的**副本**：`{ {seq,type,pid,tid,ea,modname,rva,code,cont_code,first_chance}, … }`；`type` `1` 断点 / `2` 异常 / `3` 单步。字段类型同事件表（`ea` = LuaVariant，其余 number，见下面「字段类型」） |
 | `d:dropped()` | 窗口满了以后被丢掉多少条（你看到的是窗口，不是全部事实） |
 | `d:setcap([1..64])` | 设置/查命中窗口上限（返回实际生效值） |
 | `d:stopped()` / `d:paused()` | 目标是否已结束（run 循环出口）/ 是否有未应答事件 |
@@ -121,15 +129,16 @@ if d.detach then d:detach() else d:kill() end   -- 收尾；9x 上没有 detach
 
 ```lua
 local s   = d:read(addr, 32)          -- **实际读到的字节串**（可能短于 32）；0 字节 → nil, err
-local b   = d:read_u8(addr)           -- 宽度靠函数名：read_u8 / read_u16 / read_u32 / read_u64
+local b   = d:read_u8(addr)           -- number；宽度靠函数名：read_u8/u16/u32
+local q   = d:read_u64(addr)          -- **LuaVariant**（`LV_U64`：x86 上也不会被截成 4 字节）
 local str = d:read_str(addr)          -- 以 NUL 结尾的字节串（不转码，与 LoadStr 同一函数）
 d:write(addr, "\x90\x90")             -- 字节串原样写
 d:write(addr, 0x1234)                 -- 整数 = u32 小端 4 字节
 
-local c = d:context()                 -- 整张寄存器表（普通整数；x64 的 Xmm* 是 { Low=, High= }）
+local c = d:context()                 -- 整张寄存器表（地址类键是 LuaVariant；x64 的 Xmm* 是 { Low=, High= }）
 d:context(nil, { Cax = 0x1234 })      -- **部分更新**（只写表里出现的键）→ true / nil, err
 local frames = d:stack()              -- { {index, ea, modname, rva}, … }（栈回溯，与 StackTrace 同形）
-for _, m in ipairs(d:mods()) do end   -- { name, base, size, path }
+for _, m in ipairs(d:mods()) do end   -- { name, base, size, path }（base 是 LuaVariant，size 是 number）
 for _, t in ipairs(d:threads()) do end-- { {tid}, … }
 ```
 
@@ -137,10 +146,75 @@ for _, t in ipairs(d:threads()) do end-- { {tid}, … }
   **`Cax Cbx Ccx Cdx Csi Cdi Csp Cbp Cip`** + `ContextFlags` / `EFlags` / `SegGs…SegSs` / `Dr0-Dr3` /
   `Dr6` / `Dr7`；x64 另加 `R8-R15`、`Xmm0-15`（`{Low, High}`）、`P1Home…P6Home`、`MxCsr`、
   `VectorControl`、`DebugControl`、`LastBranch*`。**不是** `Eax`/`Eip`/`Rip`。
+  ❗**值类型按 `ctx_kind` 分流**：`UPTR` 的键（`Cax…Cip`、`Dr0-Dr7`、x64 的 `R8-R15` /
+  `P1Home…P6Home` / `LastBranch*Rip` / `LastException*Rip`）是 **LuaVariant**；`U32` 的键
+  （`ContextFlags` / `EFlags` / `SegGs…SegSs` / `MxCsr`）与 `U64` 的键（`VectorControl` /
+  `DebugControl`）是**普通 number**；`M128` 的键（`Xmm0-15`）是 `{ Low, High }` 表。
+  **setter 两种都收**：`d:context(nil, { Cip = 0x401000 })` 与 `d:context(nil, { Cip = c.Cip })`
+  一样有效（地址类键走 `arg_num_or_lv`）。
 - 缺省 tid = 当前停住的那个线程（`d.stop.tid`），没有未应答事件时退到最近一条事件的 tid；
   要看别的线程就**显式**给 tid。
 - `d:read(addr, n)` 与契约名 `ReadMemory` 的差别只有形状：那边返回字节数组、部分读被吞成整体失败；
   这边返回**字节串 + 真实长度**。`d:stack([tid[, depth]])` 的 `depth` 缺省 64、上限 512。
+
+### 字段类型：地址类 = LuaVariant，小整数 = number（切片 C1c / D59）
+
+新面（`dbg` 会话）只有两条规则，**按字段位置**分，不按值的形状猜：
+
+| 来源 | 字段 | 类型 |
+| --- | --- | --- |
+| 事件表 / `d:hits()` / 用户回调 | `ea` | **LuaVariant**（指针宽：x86 `LV_U32`、x64 `LV_U64`） |
+| 同上 | `seq` / `type` / `pid` / `tid` / `rva` / `code` / `cont_code` / `first_chance` | number |
+| `d:mods()` | `base` | **LuaVariant**（`name` / `path` 是 string） |
+| 同上 | `size` | number |
+| `d:stack()` | `ea` | **LuaVariant**（`modname` 是 string） |
+| 同上 | `index` / `rva` | number |
+| `d:context()` | `ctx_kind::UPTR` 的键 | **LuaVariant** |
+| 同上 | `ctx_kind::U32` / `U64` 的键 | number |
+| 同上 | `ctx_kind::M128` 的键（x64 `Xmm*`） | 表 `{ Low, High }`（两个 number） |
+| `d:eip()` | 返回值 | **LuaVariant** |
+| `d:read_u64()` | 返回值 | **LuaVariant**（`LV_U64`：宽度由函数名给出，x86 上也不截断） |
+| `d:read_u8/u16/u32()` | 返回值 | number |
+| `d:read()` / `d:read_str()` | 返回值 | string（字节串） |
+| `dbg.sessions()` / `d.root_pid` / `d:threads()` | `root_pid` / `tid` | number |
+
+**入参一侧（读写对称）**：`d:read*` / `d:read_str` / `d:write` 的**地址实参**、`d:context(tid, t)` 的
+**字段值**，number 与 LuaVariant **都收**（`arg_num_or_lv`：userdata 必须是 LuaVariant，number 侧
+走 `lua_isnumber`，数字串也照旧收）。
+❗唯一「只收普通 number」的是 **`d:arm(modname, rva, callback)` 的 `rva`** —— `ev.rva` 与 `d:arm`
+的 rva 都是 **number**，不要包变体（D57 的门禁大量依赖 `ev.rva == 0x1028`）。
+为什么要这么统一（而不是一律 number）：29 个契约名（`ReadMemory` / `Ea2ModnameRva`…）本来吃
+LuaVariant ⇒ `ReadMemory(ev.ea, U32(4))` 直接可用；且 `--json` 的 `result` 与 `dbg.remote` 过线时
+`jsonx` 的 userdata 分支吐 `x.val`（精确十进制），x64 地址不丢低位。
+
+### 地址类值的比较与算术（AI 最容易踩）
+
+地址是 LuaVariant ⇒ **不能**直接 `==` 数字，也不能丢给 `string.format`：
+
+```lua
+-- ❌ 错法
+if ev.ea == 0x401000 then end          -- 恒为 false：__eq 只在两边**同型**时成立（U32(5) == 5 也是 false）
+print(string.format('%X', c.Cip))      -- 运行时报错：variant 不是 number（string.format 不认 __tostring）
+
+-- ✅ 比较：.val（十进制串）或 .hex（大写 hex、无前缀、不补零）—— 跨宽度是同一形态
+if ev.ea.val == '4198400' then end     -- 4198400 == 0x401000
+if ev.ea.hex == '401000' then end
+if c.Cip.val == ev.ea.val then end     -- 「停在哪 == 断点地址」这类判断一律比 .val
+
+-- ✅ 算术：先落地成普通 number 再算（地址实参 number 也收，见上表）
+local next_u32 = tonumber(ev.ea.val) + 0x10
+local word     = d:read_u32(next_u32)
+if word then print('next u32', string.format('%X', word)) end   -- read_u32 返回 number，可以 %X
+```
+
+- **别拿 `+` 的结果去比**：算术结果会经 `lv_simple` 归一成**能装下的最窄类型**
+  （`ev.ea + 1` 就可能换型）⇒ 类型一变 `==` 立刻判 false。要算就先 `.val` 转数字，全程用 number。
+- `tostring(v)` **形态不稳定**：大于 10000 给带 `0x` 前缀的定宽 hex，小值切回十进制 ⇒ 日志/`print`
+  里用没问题，**别拿它做比较、也别当载荷格式**（过线用 `.val`）。
+- `.val` 是**十进制字符串**、`.hex` 是**大写 hex、不带 `0x`、不补零**（实测 `U32(0x401000).hex ==
+  '401000'`）；两者跨宽度是同一形态，`tostring` 不是。
+- `tonumber(v.val)` 走 double：x64 用户态地址（≤ 47 位）在 2^53 以内，精确；只有极端高位地址要留心。
+- 完整的坑与门禁教训见仓库 `PITFALLS.md` 的 **S25**。
 
 ### 模块级 `dbg.*`
 
@@ -193,7 +267,7 @@ local ok, err = dbglib.wait_all({
 })
 if ok then
   local ca, cb = a:context(), b:context()   -- 两边都停住 ⇒ 现在才能读 context
-  print(string.format('%X %X', ca.Cip, cb.Cip))
+  print(ca.Cip.hex, cb.Cip.hex)             -- 地址类是 LuaVariant：比/印都用 .hex / .val
 end
 a:cont(); b:cont()                          -- 收尾前先放行
 if a.detach then a:detach() else a:kill() end
@@ -301,14 +375,25 @@ local one,  err2  = dbg.remote('127.0.0.1:8642', { token = 'c0ffee1234abcd02', p
 - 能力要**问远端**：`d:caps()` 报的是远端那台机器 / 那个 build 有什么。代理对象的 `d.detach`
   **永远是函数**（薄转发），远端是 9x 时调用才失败（见下面「错误」的最后一行）。
 
-### 过线的两种标记（代理已自动处理）
+### 过线的三种标记（代理已自动处理）
 
-- `>= 1e14` 的整数 ⇒ `{"__i":"140699000000000"}`。原因是 `jsonx.encode` 的**普通 number** 分支用 `%.14g`，而 x64 用户态地址的十进制有 15 位 ⇒ 直接过线会静默丢低位（实测 `jsonx.encode(140707532264324)` → `1.4070753226432e+014`）。**❗LuaVariant 是例外**：`jsonx` 的 `userdata` 分支直接吐 `x.val`（C 侧预算好的十进制片段），所以 `jsonx.encode(U64(addr))` **本来就是精确的** —— `__i` 只是给普通 number 兜底；自己传大整数首选 `U64(addr)`（`U64(x).val` 是字符串，`tostring` 才是 hex）。
-  地址的十进制有 15 位 ⇒ 直接过线会静默丢低位，`d:read(m.base, 4)` 就摸到错地址。
-- 字节串 ⇒ `{"__hex":"B8444250…"}`（`read` / `read_str` 的**返回值**、`write` 的**第二个参数**）；
+- **LuaVariant**（地址类：`ev.ea` / `hits()[i].ea` / `mods()[i].base` / `stack()[i].ea` / `d:eip()` /
+  `read_u64` / `context()` 的 `UPTR` 键…）⇒ `{"__u64":"140707532264324"}`，取的是 `x.val`
+  （**十进制串**）；解码侧 `U64(那个串)` 走 `strtoull`，**不经过 Lua 的 double** ⇒ x64 的 15 位地址
+  一位都不丢（`jsonx.encode` 的 number 分支是 `%.14g`，实测 `jsonx.encode(140707532264324)` →
+  `1.4070753226432e+014` —— 直接过线会静默丢低位）。
+  ❗C1c 起地址类值本来就是 LuaVariant（`jsonx` 的 `userdata` 分支吐 `x.val`）⇒ 编码侧走 `__u64`；
+  旧对端发的 `{"__i":"…"}` **解码侧仍收**（兼容，不是现行编码）。
+- **普通 number** 且 `>= 1e14` ⇒ `{"__i":"140699000000000"}`。这一支只给「脚本自己传了裸大整数」
+  兜底（例如自己算出来的绝对地址）—— 传地址首选用会话里拿到的 variant，别自己拼 number。
+- **字节串** ⇒ `{"__hex":"B8444250…"}`（`read` / `read_str` 的**返回值**、`write` 的**第二个参数**）；
   `nil` 参数 ⇒ `{"__nil":true}` 占位。
-- 两端共用 `encode_value` / `decode_value`，所以脚本这一侧拿到的是**普通 Lua 值**，不用管标记。
-  为什么是这两种、自己用 `jsonx` 传地址时要注意什么：见仓库 `PITFALLS.md` 的 **S23**。
+- 两端共用 `encode_value` / `decode_value`，所以脚本这一侧拿到的是**普通 Lua 值**（variant 过线回来
+  仍是 LuaVariant，`d:read(m.base, 4)` 直接用），不用管标记。
+  ❗过线回来的地址一律是 `U64(…)`（`LV_U64`）⇒ 与本地 x86 的 `ev.ea`（`LV_U32`）**不同型**，
+  跨代理比较同样只能比 `.val` / `.hex`。
+- `--json` 的 `result` 走同一个 `jsonx` userdata 分支 ⇒ 地址类是精确十进制，不会被 `%.14g` 截断。
+  为什么这么定：见仓库 `PITFALLS.md` 的 **S23**。
 
 ### 能力边界（不是待办，是设计）
 
@@ -360,13 +445,13 @@ end
 if not ev then d:kill(); h:close(); error('no event from the remote session') end
 print('ev', ev.type, ev.pid, ev.tid)
 
-print(string.format('Cip=%X', d:context().Cip))   -- 停住时读；键名与本地一致（Cax … Cip）
+print('Cip=' .. d:context().Cip.hex)              -- 停住时读；键名/类型与本地一致（Cax … Cip）
 
 local mods, merr = d:mods()                       -- { { name, base, size, path }, … }
 if not mods or not mods[1] then d:kill(); h:close(); error(merr or 'no modules') end
 local m    = mods[1]
-local head = d:read(m.base, 4)                    -- 字节串（base 走 __i、字节走 __hex）
-print(m.name, string.format('base=%X', m.base), 'head_len=' .. tostring(head and #head))
+local head = d:read(m.base, 4)                    -- 字节串（base 是 variant ⇒ 走 __u64、字节走 __hex）
+print(m.name, 'base=' .. m.base.hex, 'head_len=' .. tostring(head and #head))
 
 d:cont(ev.cont_code)                              -- 应答码用 cont_code，不是 ev.code
 print('kill', d:kill())                           -- 收尾动词仍是 kill / detach（D51）

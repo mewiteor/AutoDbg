@@ -21,7 +21,15 @@ local function base_of(d, modname)
   end
 end
 
+-- base 是 **LuaVariant**（地址类，D59）：算术先落地成普通 number（d:read 收 number 也收 variant）
+local function site_of(d, modname, rva)
+  local base = base_of(d, modname)
+  if not base then return nil end
+  return tonumber(base.val) + rva          -- base.val 是十进制串；rva（SITE）本来就是普通 number
+end
+
 local function hex(d, addr, n)
+  if not addr then return '<no module>' end
   local s = d:read(addr, n)
   if not s then return '<unreadable>' end
   local out = {}
@@ -57,11 +65,11 @@ if not (a:paused() and b:paused()) then
   return
 end
 
-print('stop rva', a.stop.rva, b.stop.rva)      -- 两边各停在自己的 site
+print('stop rva', a.stop.rva, b.stop.rva)      -- 两边各停在自己的 site（rva 是普通 number）
 print('cache-first', a:pump(0) == a.stop)      -- d:pump 返回的就是 d.stop 那张表
-print(string.format('a Cip=%X  b Cip=%X', a:context().Cip, b:context().Cip))
-print('a site:', hex(a, base_of(a, MOD) + SITE, 8))
-print('b site:', hex(b, base_of(b, MOD) + SITE, 8))
+print('a Cip=' .. a:context().Cip.hex .. '  b Cip=' .. b:context().Cip.hex)
+print('a site:', hex(a, site_of(a, MOD, SITE), 8))
+print('b site:', hex(b, site_of(b, MOD, SITE), 8))
 
 -- 两边都读完了再放行（cont 之后 d.stop 清空，那张表不再代表「当前」）
 a:cont()
@@ -93,7 +101,7 @@ print('both stopped:', ok, err)               -- true / nil, 'dbglib.wait_all: t
 
 if ok then
   local ca, cb = a:context(), b:context()     -- 两边都停住 ⇒ 现在才能读 context
-  print(string.format('a Cip=%X  b Cip=%X', ca.Cip, cb.Cip))
+  print('a Cip=' .. ca.Cip.hex .. '  b Cip=' .. cb.Cip.hex)   -- 地址类是 LuaVariant：用 .hex
 end
 
 a:cont(); b:cont()                            -- 收尾前先放行
@@ -111,12 +119,20 @@ a:kill(); b:kill()
   `d:cont(0x00010002)`。
 - **别把 `arm` 打在本来就写着 `CC` 的地址上**（会反复命中）；靶子自带的 `int 3` 只能显式
   `d:cont(0x00010002)` 放行。
+- **地址类是 LuaVariant，小整数是 number**：`ev.ea` / `m.base` / `stack()[i].ea` / `context()` 的
+  `Cax…Cip`（以及 `Dr*` / x64 的 `R8-R15`）`d:eip()` / `read_u64` 都是 **LuaVariant**；
+  `pid` / `tid` / `type` / `code` / `cont_code` / `rva` / `size` / `index` / `read_u8|u16|u32` 是
+  **普通 number**。比较一律比 `.val`（十进制串）或 `.hex`（大写 hex、无前缀），**不要** `ev.ea == 0x…`
+  （`__eq` 只在两边同型时成立，`U32(5) == 5` 都是 false）；要算术先 `tonumber(x.val)` 落地成数字。
+  完整口径见 `references/lua-api.md` 的「字段类型」/「地址类值的比较与算术」与仓库 `PITFALLS.md` 的 **S25**。
 - **`context()` 的键是 `Cax Cbx Ccx Cdx Csi Cdi Csp Cbp Cip`**（不是 `Eax`/`Eip`），另加
   `EFlags` / `SegGs…` / `Dr*`；x64 才有 `R8-R15` / `Xmm0-15`（`{ Low, High }`）。
 - 停住时 `Cip` 与 `ev.ea` 的关系要看**是哪种事件**（实测，同一份靶子）：
-  · `d:arm` 武装的断点被引擎**压回 EIP** ⇒ `Cip == ev.ea`；停住时引擎已把**原字节写回**
+  · `d:arm` 武装的断点被引擎**压回 EIP** ⇒ `c.Cip.val == ev.ea.val`；停住时引擎已把**原字节写回**
     （`d:read` 读到的是原指令、不是 `CC`），原指令还没执行，`cont` 时才重新补 `0xCC`；
-  · 目标里**自带的 `int 3`** 系统停在它之后 ⇒ `Cip == ev.ea + 1`。
+  · 目标里**自带的 `int 3`** 系统停在它之后 ⇒ `tonumber(c.Cip.val) == tonumber(ev.ea.val) + 1`。
+  ❗一律比 `.val`（或比 `tonumber(...val)`），**不要** `c.Cip == ev.ea` —— 两边都是 LuaVariant，
+  `__eq` 只在两边同型时成立，而 `+ 1` 的结果会被 `lv_simple` 换成另一种类型。
   所以不要拿 `Cip` 去反推断点地址，也不要自己加减 1 当断点地址。
 - 跑着的会话读内存随时可以（`d:read`），但读 context 是**竞态快照**；要判「停在哪」必须先让它停住。
 - 收尾两个动词：`d:detach()`（目标继续活着，NT+）与 `d:kill()`（终止）。**9x 上 `d.detach` 根本

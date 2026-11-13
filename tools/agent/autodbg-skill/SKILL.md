@@ -48,7 +48,7 @@ local d = dbg.create{ imagepath = [[C:\Windows\System32\notepad.exe]] }
 d:arm('notepad.exe', 0x1234, function(ev) print('hit', ev.ea) end)  -- 0x1234 = placeholder RVA
 local ev = d:pump(3000)                     -- blocks up to 3 s; leaves the event unanswered
 if ev then
-  print(ev.type, ev.tid, string.format('eip=%X', d:context().Cip))
+  print(ev.type, ev.tid, 'eip=' .. d:context().Cip.hex)  -- address-class values are LuaVariant: .hex / .val
   d:cont()                                  -- default = ev.cont_code
 end
 if d.detach then d:detach() else d:kill() end
