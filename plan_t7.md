@@ -78,6 +78,10 @@ stopped / paused`（`end` 改叫 `close` —— `end` 是 Lua 关键字，`dbg.e
 `close` 终止（= `Run` 的老口径）。返回值：0 = 正常；**1 = 要 detach 但系统没 `DebugActiveProcessStop`
 （Win95/98）⇒ 已降级成 kill**（D47 的能力上报）。`run()` 的旧路径（`to_detach` 恒为假）行为一字不变。
 
+> ❗**下一步（设计已拍板，见 §11.1 / D51）**：`close` 将被拆成 `d:detach()` / `d:kill()`，且 **9x 上
+> `dbg.detach` 根本不存在**（能力缺席而不是降级）。上一段描述的「`close` + 返回 1 降级」是 T7.3 的
+> 临时口径，它去掉前不要往新文档/示例里引用。
+
 同轮改的 core：`pump` 的等待按 **≤250 ms 切片**，每片没等到事件就问一次 `on_wait_timeout`
 （`run()` 传 100 ms ⇒ 正好一片 ⇒ 行为逐字节不变）；`m_last_code` + `last_code()` 让绑定层拿到
 「本来该用的 code」（`dbg.cont()` 无参时用它）；两条固定文案 `"pump cannot be called from a callback"`
@@ -266,6 +270,9 @@ repl.state-member-parity     run() 重构后既有门禁全绿（逐字节验证
 
 ## 9. 待确认
 
+> 本节只剩「还没拍」的条目；**已拍板的在 §11（D51–D55）与 `AGENTS.md` §13**，不要在这里重复。
+> 第 6、7 条（session 上限/回收、`default-parity`）的形状由 §11.5 / §11.7 定，具体数值仍待拍。
+
 1. `pump` 的默认 `autocont`：false（capture）还是 true（record）？我推荐 false，因为「停下来看」是 T7 的意义，但 REPL 里可以按模式翻。
 2. `hits()` 队列上限与 drop 策略（丢最旧 / 丢最新 / 计数后停）—— 我推荐 64 + 丢最旧 + `dropped` 计数，因为诚实性优先。
 3. proto 到底 bump 不 bump（§5）：如果 AI 客户端只有 nvim 一个，可以先只在 T7 里 bump；如果第三方 agent 已经在连，必须 bump。
@@ -324,3 +331,153 @@ session.one-exec-connection    一执行连接一 session（其它连接只能�
 session.idle-reclaim / session.cap
 session.default-parity         契约名与 sess: 方法逐字节一致
 ```
+---
+
+## 11. 对象化 API、命名、Help 与 session 生命周期（设计已拍板，D51–D55）
+
+> 本节是 **T7.3 之后的方向**：`dbg` 从「一个全局表 + 一堆函数」变成「会话对象 + 停止对象」，
+> 并顺带定下命名、帮助、能力探测与 session 归属。代码落地在 §11.7 的切片 A→D 里；
+> 已定的决策进 `AGENTS.md` §13（D51–D55）。
+
+### 11.1 `close` 拆成 `detach` / `kill`（D51）
+
+现状（T7.3 已提交的 `dbg.close()`）是「按目标来源决定杀不杀」，并返回 `1` 表示「要 detach 但系统
+没有 `DebugActiveProcessStop` ⇒ 已降级成 kill」。三个问题：策略藏在实现里、降级是**静默改变目标
+命运**（调用方不查返回值就会杀掉目标）、`close` 同时暗示两件事。
+
+改成：
+
+| 原语 | 语义 | 9x |
+| --- | --- | --- |
+| `d:detach()` / `dbg.detach(pid)` | 恢复断点原字节 → `DebugActiveProcessStop` → 关句柄；目标继续活着、pid 不变 | **key 不存在**（`dbg.detach == nil`） |
+| `d:kill()` / `dbg.kill(pid)` | `TerminateProcess` + 关句柄 | 有（`TerminateProcess` 全 w95） |
+
+- **能力缺席而不是降级**：`DebugActiveProcessStop` 的可用性是**平台属性**，在 `register_lua_api()`
+  时用 dynapi 探一次（core 的 `begin` 已经在探同一件事：`debug_loop.cpp` 的
+  `m_debug_active_process_stop`），探不到就不装这个 key。这样「`nil` = 这台机器没有」是唯一判据，
+  不会出现「存在但一调就失败」的第三种状态。
+- **detach 前必须先应答未决事件**：`paused` 为真时先 `ContinueDebugEvent(pid, tid, DBG_CONTINUE)`，
+  否则目标停在被系统挂起的线程上（`detach.pending-event` 门禁）。
+- 两个动词都做**完整收尾**（`unref` 回调、复位 `started`/`paused`、清 `params`），之后可以再
+  `create`/`attach`。
+- **CLI 的 `--detach` 保持 D47 的「降级 + `ack.reason` 上报」**：那是**显式上报**的回退（客户端要
+  统一接口面）；Lua 原语层是「诚实缺席」。两者的差别要写进 skill，不要当成不一致。
+- `close` 直接删（`dbg` 还没进 skill，对外零成本；只有 e2e 与本节引用它）。
+
+### 11.2 命名：新面一律小写，29 个 PascalCase 冻结（D52）
+
+事实：仓库的**新面全是小写**（`gui.*`、`dbg.*`、`open_file`、`_autodbg_info`、烘焙的
+`inspect`/`jsonx`/`moses`、`Var` 的方法 `to/tos/sto/write/off`）；PascalCase 只存在于 29 个历史契约名
+（`registry.cpp` 的 `lua_register` 列表）。所以：
+
+| 项 | 决定 |
+| --- | --- |
+| 帮助入口 | **`help()`**（小写），外加 `dbg.help()` 打印 `dbg` 那一节（同一张文本表，不是第二真相源） |
+| 29 个契约名 | **冻结**：不改名、不删、不加新参数；新文档/示例一律用对象 API。等 §11.7 的 C/D 落地且 gate 与 recipe 迁移完，再用新 D 条目退役 |
+| `V` / `U32` / `I32` / `U64` / `I64` / `F64` | **不出现在新面上**。已被实测咬过两次（§9.9 的 `GetModBase(...) + 0x1028` → `0x28`；`SetBreakpoint` 的 rva 只收 LuaVariant）。新面一律**普通整数 + 字符串**，宽度靠函数名表达（`d:read_u32`） |
+| 为什么保留而不是现在删 | `Run`/`Attach` 身上还挂着对象 API 没有的东西：鼠标选进程 + 上次 pid 持久化（D48 链）、控制台 q/Shift+Q 策略、`--json` 信封的 `images`/`result` 收尾。删之前这些必须先在 `dbglib`（T7.6）与 REPL 里落地，否则是功能回退，不是清理 |
+
+### 11.3 Help / caps / skill 的三方分工（D53）
+
+| 问题 | 归属 | 形态 |
+| --- | --- | --- |
+| 「这个 API 什么意思、前置条件、坑」 | **skill**（`tools/agent/autodbg-skill/references/*.md`） | markdown，`check_skill` 已做门禁 |
+| 「**这一台机器/这个 build** 实际有什么」 | **`dbg.caps()`** | 固定形状的普通表：`{ arch, variant, flavor, detach, attach, step, hits_cap, ... }`；按表成员生成，不引入第二真相源 |
+| 「我现在该敲什么」 | **`help([topic])`** | 人类散文，打印到输出 sink |
+
+`help` 的输出规则：
+
+- **只有真控制台才上色**：`GetConsoleMode(GetStdHandle(STD_OUTPUT_HANDLE), &mode)` 成功 ⇒ 用
+  `SetConsoleTextAttribute` + `WriteConsoleW`（9x 控制台支持；**不要**用 ANSI /
+  `ENABLE_VIRTUAL_TERMINAL_PROCESSING`，9x 没有）。管道/文件/重定向 ⇒ 纯文本，零属性字节。
+- 落点是 core 的 **`print_styled(attr, utf8)`**（core 不碰 Lua；`Print*` 已经自己选
+  `WriteConsoleW`/`WriteFile`），不是绑定层自己写句柄。
+- 尊重 `--quiet`、`NO_COLOR` 环境变量；**`--json` 下 help 走 stderr 且不上色**（stdout 只许那一行
+  JSON，D50）。
+- 门禁：把 help 的输出走管道 ⇒ 断言「无 0x1B、无属性字节、前后行数稳定」。
+
+AI 侧的能力探测（写进 skill）：
+
+1. `dbg.detach ~= nil` —— **权威判据**（表成员就是能力）；
+2. `inspect(dbg)` —— 给人看（键名一排），**明确标注「给人看，机器别解析」**；
+3. `dbg.caps()` —— 一次问全，形状稳定，可门禁。
+
+### 11.4 对象化 API（D55）
+
+形态照 `open_file` 的文件对象（D44/D49）——本仓已有先例：
+
+```lua
+local d = dbg.create{ imagepath = 'x86_loop.exe' }   -- 或 dbg.attach(pid)
+d.root_pid, d.kind('create'|'attach'), d.state       -- stopped | running | exited
+d:pump([msec])            -- → Stop 对象；nil = 没等到事件（不是错误）；nil,err = 引擎错
+d:cont([code])            -- 无参 = 用上一个事件的默认 code；显式 code = swallow/pass
+d:step([tid]) / d:stop()  -- stop() = 当前未应答的那个 Stop
+d:bp(modname, rva, cb) / d:bp_hw(ea, reg, type, size, cb)
+d:bps()                   -- 含 enable/hits/原始字节
+d:read(addr, n) → string / d:read_u8|u16|u32|u64 / d:read_str
+d:write(addr, data [, {dry_run=true}]) → {written=, old=}
+d:context([tid[, t]]) / d:stack([tid[, depth]]) / d:mods() / d:threads() / d:mem_regions()
+d:snapshot(addr, n) / d:restore(snap | snap_id)
+d:detach() / d:kill()     -- detach 在 9x 上不存在
+-- Stop
+s.type, s.pid, s.tid, s.ea, s.modname, s.rva, s.code, s.first_chance, s.seq
+s:trace([depth]), s:context(), s:cont([code]), s:swallow(), s:pass()
+```
+
+三条硬规则（不写清就会出现「随机复现的诡异 bug」）：
+
+1. **`d.root_pid` ≠ `s.pid`**：session 的键是一棵进程树（§10），`root_pid` 是树根，`s.pid` 是事件的
+   真实进程。字段名必须分开，否则 AI 会把子进程事件当成根进程。
+2. **`context()` 的 setter 必须返回值**：无参/带 tid → 表；`d:context(tid, t)` → **部分更新**（只改
+   给出的键），返回 `true` / `nil, err`。理由是 `types.hpp` 的既定口径「错误一律当值返回、不长跳」；
+   一个悄悄失败/悄悄写错寄存器的 setter 是这类 API 最贵的 bug。**返回值不影响「像语句一样用」**。
+3. **Stop 有代次**：`s.seq` 与 `d.stop_seq` 不符 ⇒ `s:cont()` 返回 `nil, "no pending event"`。
+   否则「拿旧 Stop 去 cont」会命中下一个事件，变成不可复现的错误。
+
+`d:pump()` 返回 `nil`（不再是现在的 `0`）让 `while d:pump(100) do ... end` 读起来自然；
+「没等到事件」与「引擎出错」靠第二返回值区分。
+
+### 11.5 session 生命周期与 registry（D54）
+
+- **`__gc` 绝不做副作用**（不 detach、不 kill）。`__gc` 可能在 `lua_close` 期间、在回调内部、在任意
+  步骤触发；它一旦动目标就是「随手 `d = nil` 把目标弄死」＋不可门禁的时序（同 PITFALLS M10 的取向）。
+  `__gc` 只做「解绑 Lua 侧句柄」。
+- **session 进 C 侧 registry**，作用域 = **一次执行**（不是进程级）：
+  - 于是 `d = nil` 只是丢句柄，会话仍在 registry 里，可以找回来；
+  - **D43 不破**：执行结束 registry 清空，跨调用仍然无状态（想再连就 `dbg.attach(pid)`）；
+    REPL 恰好就是「一次执行」，人的体验不受影响；
+  - API：`dbg.sessions()` → `{ {root_pid, kind, state, lua_bound} }`、`dbg.session(pid)`、
+    `dbg.last()`（最近一个会话）、`dbg.detach(pid)` / `dbg.kill(pid)` —— 「不记得 pid」这件事直接消失；
+  - REPL 退出时打印「N 个会话未关闭」并逐个收尾（NT+ detach、9x kill），这是给人的安全网。
+- **容器：侵入式链表线性扫，先不上 RBTree**。会话数是个位数量级（§9.6 的上限还没拍，但 8 这个量级）；
+  零 CRT 下自己写红黑树是 ~150 行 + 自测，收益为零。真到几十个会话，需要的其实是
+  `root_pid → session` 的哈希，也不是有序树。§10 的树路由只需「事件属于哪个 root」，线性足够。
+- 与 §10 的关系：**对象 = 一棵被调试进程树**（root pid 为键）；子进程的 `CREATE_PROCESS` 路由进
+  root 的会话；按 pid 的内存/断点句柄表就在会话对象里（§10 第 3 条要求的正是它）。
+
+### 11.6 REPL 与人的体验（T7.5 的口径补充）
+
+§4.3–4.5 已定：REPL 的输入是**合法 Lua 语句**（`dbg.*` / 对象方法），没有 gdb 式单字母命令。
+对 AI 这是最优形态（skill 已按 Lua 写、一行可发一批动作、失败是值）；对人的缺口是四件小事：
+
+1. `=expr` 简写（等价 `return expr`）；
+2. 多行续行（`luaL_loadbuffer` 的 "end of input expected" 视为未完）；
+3. `help()`（§11.3）；
+4. **本地 REPL 的取消**：`dbg` 的 `on_wait_timeout` 有意不读控制台，所以本地 REPL 里长 `pump`
+   目前无法 Ctrl+C。要么把 `decide_console_action`（已在 `common/`）接进 REPL 循环，要么明确写
+   「本地 REPL 不提供中断」。**必须现在定，否则以后会被当 bug 报。**
+
+明确不提供：历史记录 / 箭头键 / Tab 补全（Win9x 控制台 + 零 CRT + 无 readline，代价远大于收益）。
+
+### 11.7 切片与顺序（覆盖 §8 的 T7.4–T7.6 部分）
+
+| 切片 | 内容 | 量 | 门禁 |
+| --- | --- | --- | --- |
+| **A** | `close` → `detach`/`kill`（9x 无 `detach`）；`dbg.caps()`；`help()` 纯文本表 | ~200 行 | `detach.*`、`caps.*`、`help.plain-when-piped` |
+| **B** | help 上色（`core::print_styled` + 探测 + `NO_COLOR` + `--json` 口径） | ~80 行 | `help.no-color-when-piped` |
+| **C** | Session/Stop 对象 + registry + `dbg.sessions/session/last/detach(pid)/kill(pid)`；29 名转薄转发；`Var` 退出新面 | ~600 行 | `session.*`（含 §10 那组 `route.*`）、`session.default-parity` |
+| **D** | REPL 本体（T7.5：`event` 帧 / `out.id` 归因 / proto 2 / ABI 5 / `=` 简写 / 多行 / 退出收尾报告） | 按 §8 | `repl.*` |
+
+顺序硬约束：**A 必须早于 C**（`detach`/`kill` 就是 Session 对象的方法）；**C 必须早于 D**（REPL 里
+人/AI 都按对象写）。29 个旧名在 C 期间转成对象 API 的薄转发（行为逐字节不变，`session.default-parity`
+守门），退役留给之后的 D 条目。

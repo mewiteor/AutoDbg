@@ -496,6 +496,9 @@ payload              // 单条 LZMA 流：各模块原始字节按 entry 顺序�
 
 ## 13. 已定决策（不要再讨论/推翻；改之前先在 `PITFALLS.md` 查有没有相关坑）
 
+> **D51–D55 是 T7 余下切片的已定方向，代码尚未全部落地**（切片 A–D 见 `plan_t7.md` §11.7）。
+> 读下面时以那个进度表为准：`dbg.close()` / 返 1 的降级是 T7.3 的临时口径，会被 D51 取代。
+
 | # | 议题 | 决策 |
 | --- | --- | --- |
 | D1 | `98` 架构去留 | **退役**：legacy 变体取代；`make.bat` 只留 64/86；`a 98` 明确报错 |
@@ -548,3 +551,8 @@ payload              // 单条 LZMA 流：各模块原始字节按 entry 顺序�
 | D48 | pid 解析链 | 显式（`--pid=` / 握手帧 / 头标记 `pid=`）> `gui.pick()`（**在目标机上**解析：`GetCursorPos` → `WindowFromPoint` → `GetWindowThreadProcessId`，无交互桌面降级 `gui.foreground_pid()`，取不到就报错）> 脚本字面量；**禁止隐形状态**（「记住的 pid」只存在脚本头标记里） |
 | D49 | `open_file` buffer 与字节 | 默认 4096；`f:tell()` 是逻辑位置（client 位置 − 未消费 buffer）；`f:seek()` 是往返且清空 buffer；帧内字节一律精确（不再做 CRLF 归一） |
 | D50 | `--json` 契约 | `{"ok","exit","canceled","detached","pid","stdout","stderr","images","result"}`；`result` 暴露脚本返回值；`--out=<path>` 写同一份 JSON；legacy 变体一律 UTF-8 + `\uXXXX` |
+| D51 | `dbg` 会话的收尾 | **拆成 `d:detach()` / `d:kill()`**（`dbg.detach(pid)` / `dbg.kill(pid)` 同义，按 pid 操作），删掉 `dbg.close()`；**9x 上 `dbg.detach` 根本不存在**（建表时 dynapi 探 `kernel32!DebugActiveProcessStop`，探不到就不装 key）——能力缺席，不是静默降级；`--detach` 的 CLI 降级仍按 D47 用 `ack.reason` 显式上报。detach 前必须先 `ContinueDebugEvent` 应答未决事件 |
+| D52 | 命名口径 | **新面一律小写**（`help`、`dbg.*`、`open_file`、`gui.*`、`Var` 的方法）；**29 个 PascalCase 契约名冻结**（不改名/不删/不加新参数，新文档与示例一律用对象 API），退役留给后续 D 条目；**`V`/`U32`/`I32`/`U64`/`I64`/`F64` 不出现在新面上**（§9.9 的 LuaVariant 算术坑），新面一律普通整数 + 字符串、宽度靠函数名（`d:read_u32`） |
+| D53 | 帮助与能力探测的分工 | **三方分工、互不包含**：语义/契约 → skill markdown（唯一 AI 契约文档，`check_skill` 门禁）；「这台机器上有什么」→ `dbg.caps()` 固定形状的普通表（按表成员生成，不引入第二真相源）；「现在敲什么」→ `help([topic])` 人类散文。`help` **只在真控制台才上色**（`GetConsoleMode` 探测 + `SetConsoleTextAttribute`，禁 ANSI/9x 不存在的 VT），落点是 core 的 `print_styled`；尊重 `--quiet` / `NO_COLOR`；`--json` 下走 stderr 且不上色。AI 的权威判据是 `dbg.<name> ~= nil`，`inspect(dbg)` 给人看、明确标注「机器别解析」 |
+| D54 | session 的归属与 GC | **`__gc` 不做任何副作用**（不 detach/kill：任意时机触发 + 不可门禁）；session 进 **C 侧 registry，作用域 = 一次执行**（执行结束清空 ⇒ D43 不破，跨调用仍无状态）；`dbg.sessions()` / `dbg.session(pid)` / `dbg.last()` / `dbg.detach(pid)` / `dbg.kill(pid)`；REPL 退出时打印未关闭的会话并逐个收尾。容器先用**侵入式链表线性扫**（个位数会话），**不上 RBTree**（零 CRT 下手写红黑树收益为零；真到几十个会话要的是哈希） |
+| D55 | `dbg` 对象化 | 照 `open_file` 的文件对象：`dbg.create{...}` / `dbg.attach(pid[,opts])` 返回 **Session**，`d:pump()` 返回 **Stop**。三条硬规则：① `d.root_pid`（树根）与 `s.pid`（事件真实进程）必须分开命名；② `d:context([tid[,t]])` 无参/带 tid 为读、带表为**部分更新**，但 setter 必须返回 `true` / `nil, err`（不在错误上长跳）；③ Stop 有代次 `s.seq` vs `d.stop_seq`，过期 Stop 的 `cont` 返回 `nil, "no pending event"`。`d:pump()` 没事件返回 `nil`（不再是 `0`） |
