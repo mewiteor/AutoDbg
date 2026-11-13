@@ -7,16 +7,21 @@
  *   ② 不再用 imagehlp/shlwapi 遍历导入图 —— 打包集合由命令行给出，导入表只做**审计**；
  *   ③ 载荷格式按 §2.4（无 magic / 无版本号），且按 D14 用**单流**；
  *   ④ 新增 `-verify`（往返逐字节）与 `-dump <dir>`（把解出来的模块落盘，供外部 sha256 比对）。
- *   ⑤ 扩展名从 .c 改 .cpp：D2 要求分配走 autodbg::common::alloc，而它是 C++ 接口。
+ *   ⑤ 扩展名从 .c 改 .cpp：D2 要求分配走 autodbg::common::alloc，而它是 C++ 接口；
+ *   ⑥ T8 切片 a1（D63）：entry 加 `kind`（0 = module、1 = exec blob），blob 进同一条 LZMA 单流。
  *
  * 用法：
- *   pack <output.c> [-verify] [-dump <dir>] <module_file>...
+ *   pack <output.c> [-quiet] [-verify] [-dump <dir>] [--blob=<path>|--no-blob] <module_file>...
+ *   ❗`--blob` / `--no-blob` 必须给出其一（D63，构建期挡）：`--blob=<path>` 把 x64 半份字节作为一条
+ *   `kind = 1` 的 entry 打进产物，`--no-blob` 是「本次没有 blob 条目」的显式声明（给 x64 那一侧用——
+ *   它就是 blob 本体）。两个都不给 → 报错退 1；两个都给 → 互斥报错。没有「静默无 blob」第三档。
+ *   ❗选项一律排在文件列表之前（解析在第一个非选项参数处停下）；`--blob=<path>` 带值，走 `=` 内联。
  *
  * 载荷布局（小端，§2.4）：
  *   u32 entry_count
- *   entry: u16 name_len / char name[name_len]（小写、无路径）/ u32 raw_size
+ *   entry: u16 name_len / char name[name_len]（小写、无路径）/ u32 raw_size / u8 kind（0 = module、1 = exec）
  *   u8 props[5]
- *   payload（单条 LZMA 流，各模块原始字节按 entry 顺序背靠背）
+ *   payload（单条 LZMA 流，各 entry 原始字节按 entry 顺序背靠背；blob 的字节原样参与，不重新编码）
  *
  * 压缩参数与原型逐字一致：level 9、dictSize 0、其余 -1。
  * 编码侧必须带 /D_7ZIP_ST（见 src/sys/lzma 的头注释）。
@@ -27,6 +32,7 @@
 #include <stddef.h>   /* offsetof（影子头） */
 
 #include "../../src/common/allocator.hpp"
+#include "../../src/sys/pack/payload.hpp"   /* D63：entry kind 常量 —— 与消费侧同一份口径（只取头，不链代码） */
 #include "../../src/sys/lzma/7zTypes.h"
 #include "../../src/sys/lzma/Alloc.h"
 #include "../../src/sys/lzma/LzmaEnc.h"
@@ -51,8 +57,13 @@ struct pack_entry
 {
     char           name[64];         /* 小写、无路径 */
     unsigned       raw_size;
-    unsigned char *data;             /* 模块原始字节 */
+    unsigned char  kind;             /* k_entry_kind_module / k_entry_kind_exec（D63） */
+    unsigned char *data;             /* entry 原始字节（模块或 blob） */
 };
+
+/* blob 条目在 manifest 里的名字就是运行期落盘的文件名（D63：路径单一、永远 tmpdir）。
+ * 与 --blob=<path> 指向的输入文件名无关——输入是构建期产物，名字随 build 目录变。 */
+static const char *k_blob_name = "adbg64.bin";
 
 static_assert(offsetof(IMAGE_FILE_HEADER, NumberOfSections) == 2, "IMAGE_FILE_HEADER.NumberOfSections 偏移变了");
 static_assert(offsetof(IMAGE_FILE_HEADER, SizeOfOptionalHeader) == 16, "IMAGE_FILE_HEADER.SizeOfOptionalHeader 偏移变了");
@@ -138,6 +149,14 @@ bool str_ieq(const char *a, const char *b)
         if (ca != cb) return false;
         if (ca == '\0') return true;
     }
+}
+
+bool starts_with(const char *s, const char *prefix)
+{
+    for (; *prefix != '\0'; prefix++)
+        if (*s++ != *prefix)
+            return false;
+    return true;
 }
 
 /* 取文件名（去路径）并转小写，写进 dst（dst 至少 64 字节） */
@@ -280,15 +299,20 @@ int main(int argc, char **argv, char **envp)
     using autodbg::tool::base_name_lower;
     using autodbg::tool::put_le16;
     using autodbg::tool::put_le32;
+    using autodbg::tool::starts_with;
+    using autodbg::sys::pack::k_entry_kind_module;
+    using autodbg::sys::pack::k_entry_kind_exec;
 
     if (argc < 3)
     {
-        out_write("usage: pack <output.c> [-quiet] [-verify] [-dump <dir>] <module_file>...\n");
+        out_write("usage: pack <output.c> [-quiet] [-verify] [-dump <dir>] [--blob=<path>|--no-blob] <module_file>...\n");
         return 1;
     }
 
     const char *out_path  = argv[1];
     const char *dump_dir  = NULL;
+    const char *blob_path = NULL;      /* --blob=<path>：一条 kind = 1 的 entry（D63） */
+    bool        no_blob   = false;     /* --no-blob：显式声明本次没有 blob 条目（D63） */
     bool        verify    = false;
     bool        quiet     = false;
     int         module_first = argc;
@@ -303,24 +327,46 @@ int main(int argc, char **argv, char **envp)
         {
             dump_dir = argv[++a];
         }
+        else if (starts_with(argv[a], "--blob="))
+        {
+            blob_path = argv[a] + 7;
+        }
+        else if (strcmp(argv[a], "--no-blob") == 0)
+        {
+            no_blob = true;
+        }
         else
         {
             module_first = a;
             break;
         }
     }
+
+    /* D63：blob 的有无必须是**显式**的 —— 两个都不给 = 构建期直接报错（没有静默无 blob） */
+    if (blob_path != NULL && no_blob)
+    {
+        out_error("pack: --blob and --no-blob are mutually exclusive\n");
+        return 1;
+    }
+    if (blob_path == NULL && !no_blob)
+    {
+        out_error("pack: --blob=<path> or --no-blob is required\n");
+        return 1;
+    }
+
     if (module_first >= argc)
     {
         out_error("pack: no module file given\n");
         return 1;
     }
 
-    unsigned   count   = (unsigned)(argc - module_first);
+    unsigned   file_count = (unsigned)(argc - module_first);
+    unsigned   count      = file_count + ((blob_path != NULL) ? 1u : 0u);
     pack_entry *entries = (pack_entry *)autodbg::common::alloc(sizeof(pack_entry) * count);
 
     /* 1) 读入模块 */
     unsigned raw_total = 0;
-    for (unsigned e = 0; e < count; e++)
+    for (unsigned e = 0; e < file_count; e++)
     {
         const char *path = argv[module_first + (int)e];
         unsigned    size = 0;
@@ -332,12 +378,38 @@ int main(int argc, char **argv, char **envp)
         }
         base_name_lower(path, entries[e].name, sizeof entries[e].name);
         entries[e].raw_size = size;
+        entries[e].kind     = k_entry_kind_module;
         entries[e].data     = data;
         raw_total += size;
 
     }
 
-    /* 2) 导入审计 */
+    /* 1b) blob 条目（D63）：排在文件列表条目之后（manifest 顺序 = 单流字节顺序），
+     *     字节原样参与单流；名字固定为 `adbg64.bin`，读不到 → 报错退 1。 */
+    if (blob_path != NULL)
+    {
+        unsigned      blob_size = 0;
+        unsigned char *blob_data = read_file(blob_path, &blob_size);
+        if (blob_data == NULL)
+        {
+            out_error("pack: cannot read blob\n");
+            return 1;
+        }
+
+        pack_entry *be   = &entries[file_count];
+        unsigned    nlen = (unsigned)strlen(k_blob_name);
+        memcpy(be->name, k_blob_name, nlen);
+        be->name[nlen] = '\0';
+        be->raw_size   = blob_size;
+        be->kind       = k_entry_kind_exec;
+        be->data       = blob_data;
+        raw_total     += blob_size;
+    }
+
+    /* 2) 导入审计：blob 条目也是 PE，照同一个白名单跑（X1）。
+     *    pack 侧只有「白名单 + 是否在打包集合」这一层，没有按 OS 的数据集——按 OS 选口径的是
+     *    `tools/api_check/scan_dir.py`（blob 是 x64 → w7 口径，跑在**构建期的 blob 产物**上，不扫 tmpdir）。
+     *    白名单里的 `ucrtbase.dll` 只应出现在 x64 半份（X1 的按变体白名单口径未改）。 */
     for (unsigned e = 0; e < count; e++)
         if (!audit_imports(entries[e].data, entries[e].name, entries, count))
             return 1;
@@ -384,6 +456,8 @@ int main(int argc, char **argv, char **envp)
         }
         out_write("pack: round-trip ok\n");
 
+        /* blob 条目按它的名字落文件（`adbg64.bin`），不当模块处理：pack 侧没有映射器，
+         * `-verify` 对 blob 就是「解码长度 + 逐字节」这一层校验。 */
         if (dump_dir != NULL)
         {
             unsigned o = 0;
@@ -419,9 +493,10 @@ int main(int argc, char **argv, char **envp)
     }
 
     /* 5) 生成 .c */
+    /* D63：每条 entry 在 raw_size 之后多一个 `u8 kind` → 每条 +1 */
     unsigned manifest_len = 4;
     for (unsigned e = 0; e < count; e++)
-        manifest_len += 2 + (unsigned)strlen(entries[e].name) + 4;
+        manifest_len += 2 + (unsigned)strlen(entries[e].name) + 4 + 1;
 
     unsigned total = manifest_len + (unsigned)propsSize + (unsigned)compLen;
     unsigned char *packdata = (unsigned char *)autodbg::common::alloc(total);
@@ -438,6 +513,7 @@ int main(int argc, char **argv, char **envp)
         p += nlen;
         put_le32(p, entries[e].raw_size);
         p += 4;
+        *p++ = entries[e].kind;   /* D63：u8 kind（小端单字节） */
     }
     memcpy(p, props, propsSize);
     p += propsSize;

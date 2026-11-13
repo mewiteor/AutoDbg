@@ -3,6 +3,10 @@
  *
  * 来源：新写；布局见 payload.hpp 与 AGENTS.md §11.2。
  * 与旧实现的差异见 payload.hpp 头注释。
+ * T8 切片 a1（D63）：entry 在 raw_size 之后多一个 `u8 kind`（0 = module、1 = exec blob）；
+ *   本文件只多两件——读它 + 按 D11 的口径把它纳入边界校验（只允许 0 / 1），和按 kind 找 exec
+ *   条目的最小访问点 `find_exec()`。解压口径不变：blob 的字节也在同一条单流里，
+ *   「解压长度 == 各 raw_size 之和」的自检照旧。
  *
  * ❗解码必须自己提供 ELzmaStatus：`LzmaDecode` 入口无条件写 `*status`
  *   （PITFALLS.md K5），传 nullptr 必崩。
@@ -112,9 +116,25 @@ bool payload::open(const unsigned char *data, unsigned size, load_error *err)
             return false;
         }
 
+        /* D63：D11 没有 magic / 版本号，所以 kind 只能靠结构边界校验 */
+        if (off + 1 > size)
+        {
+            AUTODBG_PACK_FAIL(err, stage::payload, "kind truncated", i);
+            return false;
+        }
+        unsigned char kind = data[off];
+        off += 1;
+
+        if (kind > k_entry_kind_exec)
+        {
+            AUTODBG_PACK_FAIL(err, stage::payload, "kind out of range", kind);
+            return false;
+        }
+
         entries_[i].name       = name;
         entries_[i].name_len   = name_len;
         entries_[i].raw_size   = raw_size;
+        entries_[i].kind       = kind;
         entries_[i].raw_offset = raw_total;
         raw_total += raw_size;
     }
@@ -157,6 +177,19 @@ unsigned payload::raw_size(unsigned i) const
 unsigned payload::raw_offset(unsigned i) const
 {
     return (i < count_) ? entries_[i].raw_offset : 0;
+}
+
+unsigned char payload::kind(unsigned i) const
+{
+    return (i < count_) ? entries_[i].kind : k_entry_kind_module;
+}
+
+int payload::find_exec() const
+{
+    for (unsigned i = 0; i < count_; i++)
+        if (entries_[i].kind == k_entry_kind_exec)
+            return (int)i;
+    return -1;
 }
 
 int payload::find_n(const char *name, unsigned name_len) const

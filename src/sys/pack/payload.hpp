@@ -10,11 +10,14 @@
  * 与旧实现的差异：
  *   ① 单流（D14）：一次解压全部模块，而不是按名字单独解一个流；
  *   ② 全字段边界校验（§2.4 的 D11：无 magic / 无版本号，自检靠结构边界）；
- *   ③ **不做任何分配** —— 输出缓冲由调用方提供（启动器映射镜像后直接解进去）。
+ *   ③ **不做任何分配** —— 输出缓冲由调用方提供（启动器映射镜像后直接解进去）；
+ *   ④ T8 切片 a1（D63）：entry 加 `kind`（0 = module、1 = exec blob），`kind` 只允许 0 / 1，
+ *      其它走现有的 `AUTODBG_PACK_FAIL`（stage::payload）。blob 不是可映射模块，本层只认
+ *      「字节 + 长度」；谁拿它去落盘 / CreateProcess 由调用方决定（`handoff.cpp`）。
  *
  * 布局（小端）：
  *   u32 entry_count
- *   entry: u16 name_len / char name[name_len]（小写、无路径、**不带 NUL**）/ u32 raw_size
+ *   entry: u16 name_len / char name[name_len]（小写、无路径、**不带 NUL**）/ u32 raw_size / u8 kind
  *   u8 props[5]
  *   payload（单条 LZMA 流，各 entry 原始字节按顺序背靠背）
  * ========================================================================== */
@@ -24,6 +27,10 @@
 
 namespace autodbg::sys::pack
 {
+/* entry 类型（D63）：0 = 可被映射器接管的模块，1 = 落盘 + CreateProcess 的 exec blob */
+constexpr unsigned char k_entry_kind_module = 0;
+constexpr unsigned char k_entry_kind_exec   = 1;
+
 class payload
 {
 public:
@@ -44,12 +51,18 @@ public:
 
     unsigned raw_size(unsigned i) const;
 
+    /* 第 i 个 entry 的类型（k_entry_kind_module / k_entry_kind_exec）；越界返回 0 */
+    unsigned char kind(unsigned i) const;
+
     /* 第 i 个 entry 在「解压后的整包缓冲」里的偏移 */
     unsigned raw_offset(unsigned i) const;
 
     /* 按名字查（大小写敏感；载荷里的名字已由 tools/pack 转成小写）；找不到返回 -1 */
     int find(const char *name) const;
     int find_n(const char *name, unsigned name_len) const;
+
+    /* 按 kind 找第一条 entry（D63：handoff 要的是 `adbg64.bin` 这条 exec 条目）；找不到返回 -1 */
+    int find_exec() const;
 
     /* 把整包解压到 out（`out_size` 必须 == total_raw_size()）。
      * 返回 true 表示「解压成功且输出长度与 manifest 一致」——**逐字节内容**由调用方比对。 */
@@ -65,6 +78,7 @@ private:
         const char *name;      /* 指向 data 内，**不含 NUL** */
         unsigned    name_len;
         unsigned    raw_size;
+        unsigned char kind;      /* D63：0 = module、1 = exec blob */
         unsigned    raw_offset; /* 在解压结果里的起始偏移 */
     };
 
@@ -72,7 +86,7 @@ private:
     unsigned             size_;
 
     unsigned    count_;
-    entry       entries_[32];   /* 上限：一个包里最多 32 个模块（x86 4 个 / x64 2 个，足够） */
+    entry       entries_[32];   /* 上限：一个包里最多 32 个 entry（x86 = 4 模块 + 1 blob，x64 = 2） */
     unsigned    raw_total_;
 
     const unsigned char *props_;

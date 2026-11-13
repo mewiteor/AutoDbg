@@ -7,7 +7,8 @@
  *   帧头编解码（T2：定长头 / json 长度反推 / raw 长度前缀 / 全部拒绝路径）、PNG/BMP 编码、
  *   `decide_console_action`（T7.1 补上 plan.md §1.1 第 1 条欠着的三条：67 → 70；T7.3 从
  *   `scripting/lua/console_input.*` 搬进 `common/console_action.*`，消除 `common → scripting` 的反向依赖）、
- *   `console_style_enabled`（T7.3 切片 B：`help` 上色的三条判定，70 → 73）。
+ *   `console_style_enabled`（T7.3 切片 B：`help` 上色的三条判定，70 → 73）、
+ *   `decide_handoff_action`（T8 切片 a1 / D63：handoff 判定的四条 `handoff.decision-*`，73 → 77）。
  * ❗T5（D41/D44）删除了 HTTP 与 base64 两段：它们跟着 http.* / ase64.* 一起消失。
  * 说明：断言用 `strcmp`/`memcmp` 逐字节比较（跨架构/跨编译器稳定）；
  *   期望值都是**手写的字面量**，不要在这里用被测代码生成期望值（否则等于没测）。
@@ -17,6 +18,7 @@
 #include "frame.hpp"   /* T2：帧头编解码（plan_cli.md §2.1） */
 #include "console_action.hpp" /* T7.3：`decide_console_action`（纯判定、只依赖 windows.h；从 scripting/lua 搬来） */
 #include "console_style.hpp"  /* T7.3 切片 B：`console_style_enabled`（`help` 上色的纯判定） */
+#include "handoff_decision.hpp" /* T8 切片 a1（D63）：`decide_handoff_action`（纯判定，不碰 I/O、不碰 Lua） */
 #include "json_writer.hpp"
 #include "png_writer.hpp"
 #include "rand.hpp"
@@ -491,6 +493,32 @@ void test_console_style(test_ctx *t)
     check_bool(t, "console.style-not-console", !console_style_enabled(false, false), "管道/重定向 -> false");
 }
 
+/* -------------------- handoff 判定（T8 切片 a1 / D63） --------------------
+ * `decide_handoff_action` 是纯判定（四个 bool 进、一个 int 出），所以已定规则可以逐条断言。
+ * 期望值是手写字面量：1 = handoff（跑落盘的 exec 条目）、0 = 不 handoff（主 exe 自己跑）。
+ * 「host 不是 64 位」与「显式 --variant=legacy」两条规则合并成一条断言（写法同 `console.q-terminates`），
+ *   这样 4 条断言同时盖住 4 条规则与基线（基线必须能为 1，否则「都是 0」也能过）。 */
+void test_handoff_decision(test_ctx *t)
+{
+    /* 基线：64 位 host + 有 exec 条目 + 不是归主 exe 的选项 + 没显式 legacy -> 1 */
+    check_int(t, "handoff.decision.baseline-eligible",
+              decide_handoff_action(true, true, false, false), 1, "eligible -> handoff");
+
+    /* 规则 ①：-h / --list / --version / --selftest 归主 exe */
+    check_int(t, "handoff.decision.main-exe-option",
+              decide_handoff_action(true, true, true, false), 0, "main-exe option");
+
+    /* 规则 ②：载荷里没有 exec 条目（单架构 `make.bat a 86` 就是这种） */
+    check_int(t, "handoff.decision.no-exec-entry",
+              decide_handoff_action(true, false, false, false), 0, "no exec entry");
+
+    /* 规则 ③ + ④：host 不是 64 位（含 IsWow64Process 取不到的那一档）；显式 --variant=legacy */
+    bool host_not_64 = (decide_handoff_action(false, true, false, false) == 0);
+    bool legacy_wins = (decide_handoff_action(true, true, false, true) == 0);
+    check_bool(t, "handoff.decision.host-not-64-or-explicit-legacy", host_not_64 && legacy_wins,
+               "host 不是 64 或显式 legacy -> 0");
+}
+
 /* ------------------------------ PNG / BMP（截图编码，S4） ------------------------------ */
 void test_image(test_ctx *t)
 {
@@ -572,6 +600,7 @@ int run_selftests(selftest_report_fn report, void *ctx)
     test_frame(&t);
     test_console_action(&t);
     test_console_style(&t);
+    test_handoff_decision(&t);
     test_image(&t);
 
     {
