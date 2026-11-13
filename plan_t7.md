@@ -314,6 +314,7 @@ repl.state-member-parity     run() 重构后既有门禁全绿（逐字节验证
 3. **但内存与断点补丁只认 root**：`memory.cpp` 的 `read`/`write`/`VirtualProtectEx` 全用 `proc().hProcess`，且 `read(size_t addr, void*, size_t)` 签名里没有 pid；`apply_breakpoints_for_module` → `write()` → `proc().hProcess` ⇒ 断点记录有、补丁打到错的进程。需要按 pid 的句柄表（`OpenProcess` 全 w95；9x 不认 `PROCESS_QUERY_INFORMATION` 的降级已在 `util.cpp:690`）。
 4. **断点的进程维度只能落在新记录层**：`BreakpointInfo` 的 key 是 `(modname, rva)`，没有 pid，且布局不可动（§5 第 7 条）。线程句柄反而没问题——`CREATE_THREAD`/`CREATE_PROCESS` 给的 `hThread` 是调试器拥有的有效句柄。
 5. **pump 的多 session 口径**：`pump(sess, timeout)` = 先看 sess 的 `hits()` queue；空则读一条事件；事件属于 sess → dispatch；属于别的 session → 入它自己的 queue 并返回归属（❗不在名义上 pump A 的时候跑 B 的 callback）。被忽略的 session 会停在事件未应答状态（`cont()` 的 `DBG_EVENT_UNHANDLED` 就是为此存在）⇒ 脚本必须显式 drain 每个 session，不能靠引擎自动继续。
+   ❗**这一条已被 §10.1 / D57 收紧**：分派是「读事件」的一部分（`cont` 必须作用在已分派的事件上，否则 EIP--/re-arm/记录都没做），所以**不存在「推迟分派」的选项**；能做到的是「`d:pump` 不**返回**别人的事件」。另：每个 session 最多一个未应答事件（OS 会挂起该进程的线程直到 `ContinueDebugEvent`）⇒ 所谓 queue 深度恒为 1，存一个原始 `DEBUG_EVENT` 就够。
 6. **契约名继续作用于默认 session**（29 个名字一个字不改），多 session 走 session 对象的方法（新名字，§5 第 6 条允许）⇒ 门禁必须有一条逐字节对照：`session.default-parity`。
 7. **一棵树只能有一个调试器**（子进程自动归同一个）⇒ session 不能跨进程；要拆必须显式 `DebugActiveProcessStop`（NT+；9x 没有，D47 降级）⇒ 分派在 `Run`/`Attach` 时定，不可迁移。9x 上还有另一条硬后果：不能 attach 已运行进程（case 30）⇒ 98 上 session 只能由 CreateProcess 建立，session 生命周期 = 执行生命周期，不能跨调用恢复。
 8. 回调里不能 pump（§2.3）⇒ 跨 session 比较只能在两边都停住时做；跑着的 session 只能读内存，不能读 context（`SuspendThread` 明确不提供）。
@@ -325,19 +326,60 @@ route.child-process            被调试进程创建的子进程 → 事件归�
 route.child-handle             读子进程必须用该进程的句柄，不是 root 的
 route.same-name-two-processes  list_modules() 能区分同名多实例
 route.other-session-queued     B 的事件入 queue；A 仍能读内存；B 停在未应答状态
+route.both-stopped             两个 session 同时停在各自的 (modname, rva) 上（§10.1 的 rendezvous）
+pump.dispatch-attribution      dbg.pump 返回 ev.session；d:pump 不返回别人的事件（D57）
+pump.cache-first               d.stop 非空时 d:pump 立即返回（不阻塞）
+pump.one-pending-per-session   一个 session 不会有两个未应答事件；第二次 cont 返回 nil
+bp.deferred-arm                create → bp（模块未加载）→ pump 到 CREATE_PROCESS → 命中（延迟武装）
+remote.proxy-parity            远端 session 代理与本地 session 的方法面/返回值形状一致（需不同位数）
+sugar.run-all                  dbglib.run_all 返回每 session 的结果表；超时/提前退出是值
+sugar.wait-all                 dbglib.wait_all(pred, timeout)：两边同时停住后才返回，没等到就报错
 pump.reentry-rejected          回调里 pump（已有）
 session.tree-key               pid-set 归属
 session.one-exec-connection    一执行连接一 session（其它连接只能走 control）
 session.idle-reclaim / session.cap
 session.default-parity         契约名与 sess: 方法逐字节一致
 ```
+
+### 10.1 单进程 vs 每 session 一进程（备选方案，已拍板：D56）
+
+> 这一节之前没进过任何 plan（`plan_bootloader.md` 只有一行指向 §10 的「进程树路由」），所以把结论写下来，
+> 免得下次再讨论一遍。
+
+**前提**：`WaitForDebugEvent` 是**进程级**的 —— 一个调试器进程只有一个事件流；`Run`/`dbg.pump` 的循环
+独占它，`current_session()` 也只有一个全局实例。所以「两个 session 各自阻塞等自己的目标」在**单进程**里
+根本不成立，只能用「读一条 -> 按归属分派 -> 过滤返回值」的轮询模型。
+
+| 维度 | 单进程 + 树路由（主line） | 每 session 一进程 |
+| --- | --- | --- |
+| 等待模型 | 一个事件流 + 轮询/过滤（`dbg.pump` 是唯一的「等」） | 每个进程各自 `WaitForDebugEvent`，`pump` 真的能独立阻塞 |
+| 位数 | **受限于调试器自身** | ✅ 32 位会话用 `AutoDbg_86`、64 位会话用 `AutoDbg_64` |
+| `context()`/栈 | 零 IPC（同一份内存） | 每次 RPC（毫秒级） |
+| 崩溃隔离 | 一个崩溃连坐所有目标 | ✅ 一个崩了不影响另一个（已 detach 的目标继续活着） |
+| 归因（§5） | 需 `event`/`out` 的 id 归因（proto 2） | ✅ 一条连接 = 一个 session，归因天然成立 |
+| 共享状态 | 天然同源（同一 Lua 状态） | 必须显式放控制器（upvalue / 全局） |
+| 生命周期 | 一个进程 | 需 job object / 退出兜底（T8 已议） |
+
+**硬理由（无法绕过）**：**位数**。实测：32 位调试器附 64 位目标 ⇒ `DebugActiveProcess` 返回
+ERROR_NOT_SUPPORTED（50）；而 x64 模块的 `parse_pe` 按编译期 `_WIN64` 判位数 ⇒ `AutoDbg_64` 也处理
+不了 32 位目标。所以「32 位版 vs 64 位版同一函数」这种 A/B 用例**只能靠两个进程**。其余收益（崩溃隔离、
+归因）都能用代理拿到，而单进程的 `context()` 零 IPC 与状态同源是实打实的好处。
+
+**结论（D56）**：
+1. 多 session 主line 仍是 **单进程 + 进程树路由**（本节 + §11.7 切片 C）；
+2. 跨位数 / 强隔离用 **远端 session 代理**：`dbg.remote('host:port', token)` 返回一个方法面与本地
+   session **完全相同**的对象（内部走现有 `--server` 帧 + `client.cpp`），于是脚本/REPL 写法不变 ——
+   `pump` 有时是 OS wait、有时是 socket wait；
+3. **不**为了「绕开 `WaitForDebugEvent`」做每 session 一进程 —— 它不消除异步协调，只把「一个事件流的
+   分派」换成「两个在途 RPC」；每进程一 session 的价值全在位数与隔离上，正好用代理覆盖。
+
 ---
 
-## 11. 对象化 API、命名、Help 与 session 生命周期（设计已拍板，D51–D55）
+## 11. 对象化 API、命名、Help 与 session 生命周期（设计已拍板，D51–D58）
 
 > 本节是 **T7.3 之后的方向**：`dbg` 从「一个全局表 + 一堆函数」变成「会话对象 + 普通事件表」，
 > 并顺带定下命名、帮助、能力探测与 session 归属。代码落地在 §11.7 的切片 A→D 里；
-> 已定的决策进 `AGENTS.md` §13（D51–D55）。
+> 已定的决策进 `AGENTS.md` §13（D51–D58）。
 
 ### 11.1 `close` 拆成 `detach` / `kill`（D51）
 
@@ -501,6 +543,8 @@ type  pid  tid  ea  modname  rva  code  first_chance  cont_code
 | **B** | help 上色（`core::print_styled` + 探测 + `NO_COLOR` + `--json` 口径） | ~80 行 | `help.no-color-when-piped` |
 | **C** | Session 对象（事件是**普通表**，无 Stop 对象）+ registry + `dbg.sessions/session/last/detach(pid)/kill(pid)`；29 名转薄转发；`Var` 退出新面 | ~550 行 | `session.*`（含 §10 那组 `route.*`）、`session.default-parity` |
 | **D** | REPL 本体（T7.5：`event` 帧 / `out.id` 归因 / proto 2 / ABI 5 / `=` 简写 / 多行 / 退出收尾报告） | 按 §8 | `repl.*` |
+| **C-remote** | `dbg.remote(host:port, token)` 远端 session 代理（方法面与本地相同，复用 `--server` + `client.cpp`）—— 跨位数 / 强隔离的唯一形态（D56） | ~200 行 | `remote.proxy-parity`（需两个位数） |
+| **sugar（T7.6）** | `dbglib.run_all`（batch/collect）与 `dbglib.wait_all(pred, timeout)`（rendezvous），只跑在 `dbg.pump` 与 `paused()` 上（D58） | ~120 行 | `sugar.run-all`、`sugar.wait-all` |
 
 顺序硬约束：**A 必须早于 C**（`detach`/`kill` 就是 Session 对象的方法）；**C 必须早于 D**（REPL 里
 人/AI 都按对象写）。29 个旧名在 C 期间转成对象 API 的薄转发（行为逐字节不变，`session.default-parity`
@@ -512,3 +556,74 @@ type  pid  tid  ea  modname  rva  code  first_chance  cont_code
 - `dbg` 表：`detach`（按 `DebugActiveProcessStop` 的可用性装）/ `kill` / `caps` / `help`，**删 `close`**；宿主侧收尾收拢成 `finish_session()`（unref 回调 + 释放 TCHAR 串 + 复位 started/paused/pid）。`detach` 前若停着未应答事件，先 `ContinueDebugEvent(pid, tid, DBG_CONTINUE)`。
 - 门禁：**新文件 `tools/server_test/e2e_dbg.ps1`**（本地模式、10 条）——`caps.arch-variant`、`caps.detach`、`detach.capability`（`dbg.detach ~= nil` 且 `dbg.close == nil`）、`help.index/group/topic/unknown-topic/plain-when-piped`、`kill.terminates`、`kill.state-reset`。`e2e_tcp.ps1` 的 `pump.attach-detach` 改成「留一个未应答事件再 detach」并断言 caps/表成员一致、目标仍活着；条数仍 56。
 - 本机实测：`e2e_dbg` 86 modern 10 / 86 legacy 10 / 64 modern 8（x64 无 fixture ⇒ `kill.*` SKIP）+ `e2e_tcp` 86/legacy 56、x64 48、`--selftest` 70（两架构）、导入表 13 产物、`e2e_json` 32、`e2e_gui` 21、`check_skill` 14、`nvim_smoke` 32 全绿。
+
+### 11.9 多 session 的脚本面（D57 / D58，随切片 C / T7.6）
+
+#### 11.9.1 pump 的两层（D57）
+
+| 原语 | 语义 |
+| --- | --- |
+| `dbg.pump([timeout])`（模块级、**进程级**） | 读一条事件 → **按归属分派**（记录 + 回调 + 引擎记账：EIP--/re-arm/DBGCode）→ 返回事件表（含 `ev.session`）。**这是唯一的「等」** |
+| `d:pump([timeout])` | **缓存优先**：`d.stop` 非空就立刻返回它（不阻塞）；否则循环 `dbg.pump` 直到出现属于 `d` 的事件（别人的**照常分派**，只是不返回）。 |
+| 「停住」 | 就是 `d.stop` 非空 / `d:paused()`，**不引入额外 flag**。 |
+
+两条不变量：
+
+1. **分派不能推迟**。`cont` 必须作用在已分派的事件上（已 EIP--、已 re-arm、已记录），所以§10.5 原先
+   「不跑 B 的 callback」只能收紧为「`d:pump` 不**返回**别人的事件」——回调在别人 pump 里跑是可接受的
+   （回调里禁止 pump/cont，不会嵌套）。
+2. **每个 session 最多一个未应答事件**：OS 会挂起该进程的线程直到 `ContinueDebugEvent` ⇒ 所谓队列
+   深度恒为 1，存一个原始 `DEBUG_EVENT` 就够，不需要队列结构。
+
+`d:bp` 同步改为**允许延迟武装**（D57）：模块未加载时只登记，`CREATE_PROCESS` / `LOAD_DLL` 时由
+`apply_breakpoints_for_module` 补 `0xCC`（core 本来就支持）—— 否则 `create → bp → pump` 这个最自然的
+顺序会被拒；「模块始终没加载」改在收尾（`detach`/`kill`）与 `bps()` 里报告，而不是命中时报
+`has_orignal_byte is zero!`。
+
+#### 11.9.2 三种模型与共享状态（D58）
+
+三种模型别混，区别是「停在哪里」：
+
+| 模型 | 形状 | 能做什么 | 不能做什么 |
+| --- | --- | --- | --- |
+| **batch**（`dbglib.run_all`） | `run_all{ {imagepath=...}, {imagepath=...} }` | 两边并行跑到结束/超时，各自回调往共享表里记，最后统一比较 | 停在断点上检查（autocont，回调返回即放行）、需要两边**同时**停住的判断 |
+| **rendezvous**（`dbglib.wait_all`） | `wait_all(pred, timeout)`，跑在 `dbg.pump` + `paused()` 上 | 两边同时停住 → 读 context/栈、比较内存 | 不用写循环（这是它的代价） |
+| **step**（REPL） | `dbg.pump(200)` / `a:pump()` 一行一行 | 人手逐步看 | 效率 |
+
+- 名字：**不用 `run`**（与契约名 `Run` 撞概念），用 `dbglib.run_all` / `dbglib.wait_all`；`dbglib` 是 T7.6
+  的新全局名（按文件名烘焙的约定允许）。
+- `run_all` 的返回值是**每 session 的结果表**（`{ok=, exit=, hits=, stopped_at=}`），超时/提前退出
+  是**值**，不让它静静提前返回。
+- **共享状态：脚本里用 upvalue 表**（`local shared = {}`），不要用全局 —— 全局会撞 29 个契约名与
+  烘焙的 `inspect/jsonx/moses`，且数据流在源码里看不见；**REPL 里反过来**：全局跨行存活，正是人要的。
+- 跨位数 / 强隔离：`dbg.remote('host:port', token)` 返回方法面与本地 session 完全相同的**代理**（D56），
+  所以三种模型中 `pump` 一律不需要分支。
+
+推荐脚本骨架（rendezvous，目标形态）：
+
+```lua
+local a = dbg.create{ imagepath = 'a.exe' }
+local b = dbg.create{ imagepath = 'b.exe' }
+a:bp('a.exe', 0x1028)                  -- 延迟武装，不用等模块加载
+b:bp('b.exe', 0x2010)
+local GOAL = { [a] = { 'a.exe', 0x1028 }, [b] = { 'b.exe', 0x2010 } }
+local t0 = os.time()
+while not (a:paused() and b:paused()) do
+    local ev = dbg.pump(200)                 -- 进程级：读一条并分派
+    if ev == nil then
+        if a:stopped() or b:stopped() then error('target exited early') end
+        if os.time() - t0 > 8 then error('timeout') end
+    else
+        local g = GOAL[ev.session]
+        local hit = g and ev.modname == g[1] and ev.rva == g[2]
+        if not hit then ev.session:cont() end   -- 到了目标断点就不放行（= 停住）
+    end
+end
+-- 两边都停住：context/栈只能在这时读（内存本来随时可读）
+local ca, cb = a:context(), b:context()
+a:cont(); b:cont(); a:detach(); b:detach()
+```
+
+必须写进 skill / help 的四条：每会话**有界超时** + `stopped()` 双判；跑着的会话只能读内存不能读
+context；两个会话都要显式收尾；命中武装断点时引擎已 EIP-- 并置 TF，所以 `ev.ea == context().eip`
+是**正常**的，不要自己再减 1。

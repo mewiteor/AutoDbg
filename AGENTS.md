@@ -497,8 +497,8 @@ payload              // 单条 LZMA 流：各模块原始字节按 entry 顺序�
 
 ## 13. 已定决策（不要再讨论/推翻；改之前先在 `PITFALLS.md` 查有没有相关坑）
 
-> **D51–D55 是 T7 余下切片的已定方向**：D51 / D53 的**切片 A 已落地**（`dbg.detach`/`dbg.kill`/`dbg.caps`/`help`，
-> `dbg.close` 已删），D52 / D54 / D55 待切片 C / D。进度以 `plan_t7.md` §11.7–§11.8 为准。
+> **D51–D58 是 T7 余下切片的已定方向**：D51 / D53 的**切片 A 已落地**（`dbg.detach`/`dbg.kill`/`dbg.caps`/`help`，
+> `dbg.close` 已删）；D52 / D54 / D55 / D57 待切片 C，D56 的代理与 D58 的糖在 C-remote / T7.6。进度以 `plan_t7.md` §11.7–§11.9 为准。
 
 | # | 议题 | 决策 |
 | --- | --- | --- |
@@ -557,3 +557,6 @@ payload              // 单条 LZMA 流：各模块原始字节按 entry 顺序�
 | D53 | 帮助与能力探测的分工 | **三方分工、互不包含**：语义/契约 → skill markdown（唯一 AI 契约文档，`check_skill` 门禁）；「这台机器上有什么」→ `dbg.caps()` 固定形状的普通表（按表成员生成，不引入第二真相源）；「现在敲什么」→ `help([topic])` 人类散文。`help` **只在真控制台才上色**（`GetConsoleMode` 探测 + `SetConsoleTextAttribute`，禁 ANSI/9x 不存在的 VT），落点是 core 的 `print_styled`；尊重 `--quiet` / `NO_COLOR`；`--json` 下走 stderr 且不上色。AI 的权威判据是 `dbg.<name> ~= nil`，`inspect(dbg)` 给人看、明确标注「机器别解析」 |
 | D54 | session 的归属与 GC | **`__gc` 不做任何副作用**（不 detach/kill：任意时机触发 + 不可门禁）；session 进 **C 侧 registry，作用域 = 一次执行**（执行结束清空 ⇒ D43 不破，跨调用仍无状态）；`dbg.sessions()` / `dbg.session(pid)` / `dbg.last()` / `dbg.detach(pid)` / `dbg.kill(pid)`；REPL 退出时打印未关闭的会话并逐个收尾。容器先用**侵入式链表线性扫**（个位数会话），**不上 RBTree**（零 CRT 下手写红黑树收益为零；真到几十个会话要的是哈希） |
 | D55 | `dbg` 对象化（**不做 Stop 对象**） | 照 `open_file` 的文件对象：`dbg.create{...}` / `dbg.attach(pid[,opts])` 返回 **Session**；`d:pump()` 返回**普通事件表**（无 metatable），同一张表缓存成 `d.stop`（nil = 没有未应答事件）。规则：① `d.root_pid`（树根）与 `e.pid`（事件真实进程）必须分开命名；② `e.code`（异常码）与 `e.cont_code`（core 算好的默认应答码）是两个字段，因此 **`dbg.code()` 取消**；③ 无「代次」——`pump` 返回的就是 `d.stop` 那张表，判「还是不是同一个」用表身份 `e == d.stop`，`d:cont()` 永远应答当前那个；④ `pump` 返回 nil **不清** `d.stop`，`d:cont()` 之后才清；`hits()` 是历史窗口的**副本**；⑤ 缺省 tid 只是便利，看别的线程必须显式 `d:context(tid)` / `d:stack(tid)`（**不要假设其它线程没意义**）；⑥ `d:context([tid[,t]])` 带表为**部分更新**，setter 必须返回 `true` / `nil, err`。事件表与 `hits()` 记录、协议 `event` 帧**同形**（可直接 `jsonx.encode`） |
+| D56 | 多 session 的形态 | **单进程 + 进程树路由是主line**（§10 / 切片 C）。**不为「绕开 `WaitForDebugEvent`」做每 session 一进程**——它不消除异步协调，只把「一个事件流的分派」换成「两个在途 RPC」。跨位数/强隔离用**远端 session 代理** `dbg.remote(host:port, token)`（方法面与本地 session 完全相同，复用 `--server` 帧 + `client.cpp`）：**位数是唯一无法绕过的硬理由**（32 位调试器附 64 位目标 = ERROR_NOT_SUPPORTED；x64 模块的 `parse_pe` 按编译期 `_WIN64` 判位数），其余收益（崩溃隔离、一条连接=一个 session 的天然归因）代理都能拿到，而单进程的 `context()` 零 IPC 与状态同源是实打实的好处 |
+| D57 | pump 的两层与「停住」 | `dbg.pump([timeout])`（模块级、**进程级**）= 读一条事件 -> **按归属分派**（记录 + 回调 + 引擎记账）-> 返回带 `ev.session` 的事件表；`d:pump([timeout])` = **缓存优先**（`d.stop` 非空立即返回）+ 过滤（别人的照常分派，只是不返回）。**分派不能推迟**（`cont` 必须作用在已 EIP--/已 re-arm/已记录的事件上），所以 §10.5 的「不跑 B 的 callback」收紧为「不**返回**别人的事件」。**停住 = `d.stop` 非空**，不引入 flag；每个 session 最多一个未应答事件（OS 挂起该进程线程）=> 缓存深度 1，存一个原始 `DEBUG_EVENT` 即可。`d:bp` **允许延迟武装**（模块未加载只登记，`CREATE_PROCESS`/`LOAD_DLL` 时补 `0xCC`），「始终没加载」改在收尾/`bps()` 报告 |
+| D58 | 多 session 的脚本糖 | 三种模型别混：**batch** `dbglib.run_all{...}`（并行跑到结束 + 每 session 结果表；autocont => **不能**在命中处检查）、**rendezvous** `dbglib.wait_all(pred, timeout)`（跑在 `dbg.pump` + `paused()` 上）、**step**（REPL 原语）。名字不用 `run`（与契约名 `Run` 撞概念）。共享状态：**脚本里用 upvalue 表**（全局会撞 29 个契约名与烘焙的 `inspect/jsonx/moses`，且数据流看不见），**REPL 里用全局**（跨行存活） |
