@@ -20,6 +20,11 @@
  * T7 切片 D2a（proto 2）：`script` 帧的 `id` 是**命令号** —— accept 线程把它随作业交给 worker，
  *   `run_one_script` 在跑这一段前 `stream_set_command_id(id)`、跑完清 0；`out` / `event` 帧
  *   据此归因。`result` 帧的 `id` 仍是退出码（两套含义不混）。
+ *
+ * T7 切片 D2b：`--repl --server`（`boot->repl_mode != 0`）在这里接上 —— 一条连信用一份
+ *   **不重建**的 `lua_State` + 引擎会话（`g_repl`，由 `worker_serve` 建/毁），每帧 `script`
+ *   帧 = REPL 的一行（或一个完整块）；`result` 帧的 `id` = **这一行的 Lua 错误码**。
+ *   ❗非 `--repl` 时 `g_repl == nullptr` ⇒ `exec_script` 的一次性语义（D43）一个字节不改。
  * ========================================================================== */
 #include "tcp_server.hpp"
 
@@ -27,6 +32,7 @@
 #include "exec.hpp"        /* exec_script：一次性执行（D22/D43） */
 #include "exec_guard.hpp"  /* guard_exec_begin / request_cancel / soft action */
 #include "output.hpp"      /* output_begin / output_end：stdout 收进缓冲并发 `out` 帧 */
+#include "repl.hpp"        /* T7 D2b：`--repl --server` 的连接级 state（repl_server_*） */
 #include "server_config.hpp" /* S0 解析 / D21 策略（T5：从 HTTP 的 server.cpp 抽出来） */
 #include "stream.hpp"      /* 帧协议（类型/版本/传输钩子/poll） */
 
@@ -78,6 +84,11 @@ BOOL WINAPI on_console_ctrl(DWORD type)
 const autodbg_boot   *g_boot      = nullptr;
 const server_config  *g_cfg       = nullptr;
 long long             g_exec_sock = -1;   /* 当前执行连接（stream.* 的 send/recv 用它） */
+
+/* `--repl --server`（T7 D2b）的连接级上下文：`lua_State` + 引擎会话在**整条连接**的生命周期内
+ * 不重建，所以它们不能由一次性的 `exec_script` 持有。`nullptr` = 非 `--repl`（每次 `script`
+ * 帧建/毁 state，D43 的无状态语义）。生命周期全在 `worker_serve`（建 → 每帧求值 → 毁）。 */
+autodbg::host::repl_server *g_repl = nullptr;
 
 /* ------------------------------------------------------------------ 帧 I/O（按 socket）
  * accept 线程与 worker 都可能写帧，但**目标不同**：控制连接 / 执行连接。
@@ -480,12 +491,14 @@ void on_stream_control(void *ctx, unsigned cmd, unsigned flags)
     control_dispatch(-1, cmd, nullptr);
 }
 
-/* 跑一次脚本（worker 线程体） */
 /* 跑一段脚本（流已开）：out 由 output 层直发，末尾补 result + end 帧。
  * ❗`end` 只结束**这一段**脚本，连接继续可用（一个连接可以发多个 script 帧）。
  * ❗T7 D2a：`cmd_id` = 这个 `script` 帧的 `id`（命令号）。它在本段执行期间是 `stream_command_id()`
  *   的值（`out` / `event` 帧据此归因），帧发完就清 0 —— 空闲期任何输出都是无归属的。
- *   `result` 帧的 `id` **仍是退出码**（u16 二补数），与命令号无关。 */
+ *   `result` 帧的 `id` **仍是退出码**（u16 二补数），与命令号无关。
+ * ❗T7 D2b：`g_repl` 非空（`--repl --server`）时求值发生在**连接级**的 state 上，本段只是
+ *   该 state 上的一条命令；`result.id` 因而 = **这一行的 Lua 错误码**（0 / 2 / 3），
+ *   `exec_script`（建/毁 state）在这个分支里根本不跑。 */
 void run_one_script(const unsigned char *src, size_t src_len, const char *chunkname, unsigned cmd_id,
                     const server_config &cfg)
 {
@@ -493,42 +506,55 @@ void run_one_script(const unsigned char *src, size_t src_len, const char *chunkn
 
     stream_set_command_id(cmd_id);
 
-    exec_request er;
-    er.src       = (const char *)src;
-    er.len       = src_len;
-    /* chunkname：脚本帧的 json 段（客户端给的文件名）。`@` 前缀让 Lua 按「文件」报位置
-     * （`你的文件:12: ...`）——不加的话错误信息会变成 `[string "x.lua"]:12`，插件就没法
-     * 把错误行塞进 quickfix 了。 */
-    char chunkbuf[132];
-    if (chunkname != nullptr && chunkname[0] != '\0')
+    output_begin(0, cfg.echo);
+    guard_exec_begin(cfg.timeout_sec);
+
+    exec_result r;
+
+    if (g_repl != nullptr)
     {
-        chunkbuf[0] = '@';
-        size_t ci = 0;
-        while (chunkname[ci] != '\0' && ci + 2 < sizeof chunkbuf)
-        {
-            chunkbuf[ci + 1] = chunkname[ci];
-            ci++;
-        }
-        chunkbuf[ci + 1] = '\0';
+        /* `--repl --server`（T7 D2b）：一帧 = REPL 的一行 / 一个完整块。
+         * `chunkname` 在这里没有意义 —— 错误位置固定报 `[string "=repl"]`（与本地 REPL 同口径）。 */
+        r = repl_server_chunk(g_repl, (const char *)src, src_len);
     }
     else
     {
-        const char *dflt = "@buffer.lua";
-        size_t      ci   = 0;
-        while (dflt[ci] != '\0' && ci + 1 < sizeof chunkbuf)
+        exec_request er;
+        er.src  = (const char *)src;
+        er.len  = src_len;
+        /* chunkname：脚本帧的 json 段（客户端给的文件名）。`@` 前缀让 Lua 按「文件」报位置
+         * （`你的文件:12: ...`）——不加的话错误信息会变成 `[string "x.lua"]:12`，插件就没法
+         * 把错误行塞进 quickfix 了。 */
+        char chunkbuf[132];
+        if (chunkname != nullptr && chunkname[0] != '\0')
         {
-            chunkbuf[ci] = dflt[ci];
-            ci++;
+            chunkbuf[0] = '@';
+            size_t ci = 0;
+            while (chunkname[ci] != '\0' && ci + 2 < sizeof chunkbuf)
+            {
+                chunkbuf[ci + 1] = chunkname[ci];
+                ci++;
+            }
+            chunkbuf[ci + 1] = '\0';
         }
-        chunkbuf[ci] = '\0';
-    }
-    er.chunkname = chunkbuf;
-    er.args      = nullptr;
-    er.argc      = 0;
+        else
+        {
+            const char *dflt = "@buffer.lua";
+            size_t      ci   = 0;
+            while (dflt[ci] != '\0' && ci + 1 < sizeof chunkbuf)
+            {
+                chunkbuf[ci] = dflt[ci];
+                ci++;
+            }
+            chunkbuf[ci] = '\0';
+        }
+        er.chunkname = chunkbuf;
+        er.args      = nullptr;
+        er.argc      = 0;
 
-    output_begin(0, cfg.echo);
-    guard_exec_begin(cfg.timeout_sec);
-    exec_result r = exec_script(er);
+        r = exec_script(er);
+    }
+
     output_snapshot snap = output_end();
     int             why  = guard_stop_reason();
     guard_exec_end();
@@ -591,6 +617,22 @@ void worker_serve(const job &j, const autodbg_boot *boot, const server_config &c
     }
     stream_set_control_handler(on_stream_control, nullptr);
 
+    /* T7 D2b：`--repl` 下这条连接的 `lua_State` + 引擎会话**只建一次**（跨帧存活）；
+     * 非 `--repl` 时 `g_repl` 保持 nullptr，下面走 `exec_script` 的一次性语义（D43）。 */
+    bool repl = (boot->repl_mode != 0);
+    if (repl)
+    {
+        g_repl = repl_server_begin();
+        if (g_repl == nullptr)
+        {
+            fail_conn(j.sock, "oom");
+            stream_set_control_handler(nullptr, nullptr);
+            stream_end();
+            g_exec_sock = -1;
+            return;
+        }
+    }
+
     /* 首帧（accept 线程已经确认它是 script） */
     run_one_script(j.src, j.src_len, (j.chunk[0] != '\0') ? j.chunk : nullptr, j.cmd_id, cfg);
 
@@ -636,6 +678,14 @@ void worker_serve(const job &j, const autodbg_boot *boot, const server_config &c
             break;
         }
         autodbg::common::release(buf);
+    }
+
+    /* T7 D2b：连接结束（对端关闭 / 空闲 / shutdown）→ 安全网（会话报告）→ `lua_close` → 释放会话。
+     * 这一步必须在 `stream_end()` 之前：报告走 stderr，与帧无关，但 `stream_*` 单例还指着这条连接。 */
+    if (g_repl != nullptr)
+    {
+        repl_server_end(g_repl);
+        g_repl = nullptr;
     }
 
     stream_set_control_handler(nullptr, nullptr);

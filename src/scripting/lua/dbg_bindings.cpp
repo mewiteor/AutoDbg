@@ -69,6 +69,11 @@
  *   例外：断点的 `on_exception` 通道不记（同一命中已经由 `on_breakpoint` 记过），但仍会调用户回调。
  *   `cont_code` 只能等 core 在 `pump` 末尾算完才知道 ⇒ 泵完再把「这一轮新产生的记录」补上。
  *
+ * 切片 D2b 对外只多了两个 C 接口：`dbg_open_session_count()` / `dbg_release_unclosed_sessions()`
+ *   （REPL 退出前的安全网，D54）。Lua 面**零改动** —— 它们不是给脚本用的，是给 `repl.cpp` 的收尾
+ *   用的；而 `d:detach()` / `d:kill()` 的引擎侧动作被抽成 `end_session_by_detach` /
+ *   `end_session_by_kill`，三处（两个 Lua 面 + 安全网）共用同一份，行为逐字节不变。
+ *
  * 回调：core 的回调签名带 `void *ctx`，这里传的是 **`SessionState*`**（不是 `lua_State*`）——
  *   每会话一份（C2a 的多会话路由就靠它）；`lua_State` 从 `st->L` 取。回调里出错**不**长跳穿 C++ 帧
  *   （D18）：`lua_pcall` 兜住，消息存起来，下一次 `pump` 把它作为第二返回值。
@@ -1726,14 +1731,13 @@ static void finish_session(SessionState *st)
     registry_remove(st);
 }
 
-/* `d:detach()`：恢复断点原字节 + `DebugActiveProcessStop`，**目标继续活着**（D51）。
- * ❗只有平台有这个导出时才会注册这个 key（`register_dbg_api` 里按能力装）。 */
-static int do_detach(lua_State *L, SessionState *st, int base)
+/* 会话收尾的**引擎侧动作**（`d:detach()` / `d:kill()` 与 REPL 的收尾报告共用同一份，T7 D2b）：
+ *   · `end_session_by_detach`：恢复断点原字节 + `DebugActiveProcessStop`，**目标继续活着**（D51）。
+ *     返回 false = 平台没有 `DebugActiveProcessStop`（detach 降级成 kill，会话**同样**已经关掉）。
+ *   · `end_session_by_kill`：终止目标（先恢复原字节 + 通知销毁，顺带把断点回调的 ref 还回来）。
+ * 两者都会 `finish_session`（释放 ref / 从 registry 摘掉）—— 调用方只管检查返回值。 */
+static bool end_session_by_detach(SessionState *st, const char **reason)
 {
-    (void)base;
-    if (g_in_callback) return reentry(L);
-    if (!st->started)  return fail(L, kErrNoSess);
-
     int r;
     {
         SessionScope scope(st);
@@ -1751,7 +1755,38 @@ static int do_detach(lua_State *L, SessionState *st, int base)
     }
     finish_session(st);
 
-    if (r != 0) return fail(L, "detach not supported on this platform");
+    if (r != 0)
+    {
+        if (reason != nullptr) *reason = "detach not supported on this platform";
+        return false;
+    }
+    return true;
+}
+
+static void end_session_by_kill(SessionState *st)
+{
+    {
+        SessionScope scope(st);
+        st->sess->detach_process(&st->cb); /* `end()` 在 to_detach 为假时不做这一步，所以这里显式做 */
+        st->sess->to_detach() = false;
+        st->sess->term()      = true;      /* `run_shutdown` 会 TerminateProcess / TerminateThread */
+        const char *err = nullptr;
+        st->sess->end(&err);               /* 返回值只有「detach 降级」一种含义 ⇒ kill 路径必然 0 */
+        (void)err;
+    }
+    finish_session(st);
+}
+
+/* `d:detach()`：恢复断点原字节 + `DebugActiveProcessStop`，**目标继续活着**（D51）。
+ * ❗只有平台有这个导出时才会注册这个 key（`register_dbg_api` 里按能力装）。 */
+static int do_detach(lua_State *L, SessionState *st, int base)
+{
+    (void)base;
+    if (g_in_callback) return reentry(L);
+    if (!st->started)  return fail(L, kErrNoSess);
+
+    const char *reason = nullptr;
+    if (!end_session_by_detach(st, &reason)) return fail(L, reason);
     lua_pushboolean(L, 1);
     return 1;
 }
@@ -1763,17 +1798,7 @@ static int do_kill(lua_State *L, SessionState *st, int base)
     if (g_in_callback) return reentry(L);
     if (!st->started)  return fail(L, kErrNoSess);
 
-    {
-        SessionScope scope(st);
-        st->sess->detach_process(&st->cb); /* `end()` 在 to_detach 为假时不做这一步，所以这里显式做 */
-        st->sess->to_detach() = false;
-        st->sess->term()      = true;      /* `run_shutdown` 会 TerminateProcess / TerminateThread */
-        const char *err = nullptr;
-        st->sess->end(&err);               /* 返回值只有「detach 降级」一种含义 ⇒ kill 路径必然 0 */
-        (void)err;
-    }
-    finish_session(st);
-
+    end_session_by_kill(st);
     lua_pushboolean(L, 1);
     return 1;
 }
@@ -2160,6 +2185,53 @@ bool dbg_paused() noexcept
 bool dbg_busy() noexcept
 {
     return g_sessions != nullptr;
+}
+
+/* registry 里还开着的会话数（REPL 退出报告用，T7 切片 D2b）。 */
+int dbg_open_session_count() noexcept
+{
+    int n = 0;
+    for (SessionState *st = g_sessions; st; st = st->next) n++;
+    return n;
+}
+
+/* REPL 退出前的安全网（D54 / T7 D2b）：registry 里**所有**还开着的会话逐个收尾。
+ * 有 `DebugActiveProcessStop` 就 detach（目标继续活着），没有（Win95/98）就退 kill
+ * —— 与 `--detach` 的降级口径一致。单个失败只打一行 stderr、继续收下一个。
+ * ❗调用点必须在 `lua_close` **之前**：会话的 callback ref / 事件表 ref 都挂在那份 state 上。 */
+int dbg_release_unclosed_sessions()
+{
+    int n = 0;
+
+    /* ❗每收尾一个就把它从 registry 摘掉（`finish_session`），所以每次都从表头取。 */
+    while (g_sessions != nullptr)
+    {
+        SessionState *st  = g_sessions;
+        DWORD         pid = st->root_pid;
+        n++;
+
+        const char *reason = nullptr;
+        bool        ok;
+        if (g_has_detach)
+        {
+            ok = end_session_by_detach(st, &reason);
+        }
+        else
+        {
+            end_session_by_kill(st);   /* 9x：能力缺席 ⇒ 退 kill（与 CLI 的 `--detach` 同一降级） */
+            ok = true;
+        }
+
+        if (!ok)
+        {
+            autodbg::core::ErrorS("repl: session ");
+            autodbg::core::ErrorF(TEXT("%lu"), (unsigned long)pid);
+            autodbg::core::ErrorS(" detach failed: ");
+            autodbg::core::ErrorS((reason != nullptr) ? reason : "unknown");
+            autodbg::core::ErrorS("\n");
+        }
+    }
+    return n;
 }
 
 void register_dbg_api(lua_State *L)

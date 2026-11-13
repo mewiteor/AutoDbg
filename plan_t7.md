@@ -548,14 +548,14 @@ type  pid  tid  ea  modname  rva  code  first_chance  cont_code
 | **C3** | 29 名转薄转发 + `Var` 退出新面（D52） | ~200 行 | `session.default-parity` |
 | **D1** ✅ 已落地 | REPL 本体（`--repl` + `boot.repl_mode` + ABI 4 → 5）：`ReadFile` 优先（管道可跑）/ `ReadConsoleW` 回退、≤250 ms 切片、`=` 简写、多行续行、退出码 = 最后一条命令、EOF → 0 | ~500 行（含门禁） | 新 `e2e_repl.ps1` 8 条（86 / 86 legacy / 64） |
 | **D2a** ✅ 已落地 | 协议 1 → **2**：`stream_frame_event = 16`（json = 命中记录，`id` = 命令号）+ `out` 帧 `id` = 命令号（`stream_set_command_id`）+ `result.id` 仍 = 退出码；客户端认并忽略 `event`；nvim 子模块同步 PROTO 2 | ~240 行 | `e2e_tcp` 56 → 58（`proto.out-id-attribution` / `proto.event-frame`），x64 50 |
-| **D2b** | `--repl` 与 `--server` 并存（每行一条命令、状态跨行存活）；`--repl --remote` 应从「静默忽略」改成报错退 2；REPL 退出时「N 个会话未关闭」报告（D54 的安全网） | ~200 行 | `repl.server-command-ids` / `repl.exit-report` / `repl.remote-exclusive` |
+| **D2b** ✅ 已落地 | `--repl` + `--server`（同一连接内 `lua_State` 跨命令存活，每条 `script` 帧 = 一块；`result.id` = 该行错误码）+ `--repl --remote` 报错退 2 + REPL 退出时的会话报告（D54 安全网，stderr + 逐个 detach） | ~380 行 | `e2e_repl` 8 → 10（`repl.remote-exclusive` / `repl.exit-report`）、`e2e_tcp` 58 → 59（`repl.server-state`） |
 | **C-remote** | `dbg.remote(host:port, token)` 远端 session 代理（方法面与本地相同，复用 `--server` + `client.cpp`）—— 跨位数 / 强隔离的唯一形态（D56） | ~200 行 | `remote.proxy-parity`（需两个位数） |
 | **sugar（T7.6）** ✅ 已落地 | `lualib/dbglib.lua`（烘焙成全局 `dbglib`）：`wait_all(goals[,opts])`（rendezvous）与 `run_all(params_list[,opts])`（batch/collect），纯 Lua、5.1 语法、只跑在 `dbg.pump`/`stopped()`/`paused()` 上（D58） | ~250 行 | `e2e_dbg` 21 → 23（`sugar.wait-all` / `sugar.run-all`） |
 
 顺序硬约束：**A 必须早于 C**（`detach`/`kill` 就是 Session 对象的方法）；**C 必须早于 D**（REPL 里
 人/AI 都按对象写）。29 个旧名在 C 期间转成对象 API 的薄转发（行为逐字节不变，`session.default-parity`
 守门），退役留给之后的 D 条目。
-### 11.8 切片 A / B / C1a / C1b / C2a / sugar / D1 / D2a 落地状态（已提交）
+### 11.8 切片 A / B / C1a / C1b / C2a / sugar / D1 / D2a / D2b 落地状态（已提交）
 
 - `src/common/platform.{hpp,cpp}`（新文件）：`is_win9x()` / `is_nt()`（`GetVersionExA` 的 `dwPlatformId`，与启动器 `detect_variant()` 同一判据）+ `arch_name` / `variant_name` / `flavor_name`（收拢一处，免得 caps / help / info 各写一份字符串）。❗为什么不用编译开关：`/DAUTODBG_WIN9X` 是「要能在 9x 上跑」的**构建约束**，legacy 产物在 Win11 上也跑；而 caps 报的是**这台机器**。
 - `src/scripting/lua/help_bindings.{hpp,cpp}`（新文件）：`help([topic])` 与 `dbg.help()` 共用 `kHelp[]` 一张表，`help('dbg')` 是**前缀匹配生成的成员列表**（不存在第二份）。输出走 `PrintS` ⇒ server 模式自动进 `out` 帧、本地进控制台/管道，本层不碰句柄。正文是**窄串字面量**（现代变体 UTF-8、legacy CP936，`PrintS` 各自转成 console 需要的形式）；**主题名与签名保持 ASCII**（门禁逐字匹配）。❗legacy 编译警告 **C4566** 的教训：`⇒` / `❗` 这类字符**不能出现在字符串字面量里**（CP936 表示不出），注释里可以 —— 帮助正文里一律用 `->` 与「注意：」。
@@ -618,6 +618,14 @@ type  pid  tid  ea  modname  rva  code  first_chance  cont_code
 - 门禁：`e2e_tcp` 56 → **58**（`proto.out-id-attribution`：`script` id 7 ⇒ `out` 帧 id 7、id 0 ⇒ 0、`result.id` 仍是退出码；`proto.event-frame`：`script` id 3 ⇒ 至少一帧 `type == 16` 且 `id == 3`、json 含 `rva`/`type`，且该帧不出现在 `--json` 信封里）。86 / 86 legacy / x64 全过（58/58/50）。
 - 实测两条帧样本（写进断言）：`out.id(script id 7)=[7,7]`；`event.id=3 event.json=[{"type":1,"pid":…,"modname":"ntdll.dll","rva":1151400,"code":2147483651,"first_chance":null,"dropped":0}]`。
 - 未做（D2b）：`--repl` + `--server` 的有状态 REPL（每行一条命令）、`--repl --remote` 报错、REPL 退出会话报告、nvim 侧的事件渲染。
+**切片 D2b（REPL 的 server 形态 + 退出安全网）**：
+
+- `--repl --server`：`repl_server_begin`（建引擎会话 + `create_state_with_libs` + **一次性**装 `print` 覆写与 `lua_sethook`）→ 每帧 `repl_server_chunk`（复用 D1 的 `repl_chunk_feed` / `repl_eval_chunk`，**不复制第二套**续行与错误码逻辑）→ 断开时 `repl_server_end`。`run_one_script` 里只有一个分支点（`g_repl != nullptr`），`output_begin`/`guard_exec_begin`/`result`+`end` 的发送全部共用 ⇒ **非 `--repl` 的 server 行为一个字节不变**（58 条既有断言即判据，D43 的无状态语义没破）。
+- server 侧一个帧 = **一个完整块**（`allow_continue=false`），所以不完整的输入直接是语法错 3（不是续行）；本地 REPL 仍是 `allow_continue=true` 的多行续行。`result` 帧的 `id` = **该行的 Lua 错误码**（0/2/3），`end` 照旧。
+- `--repl --remote` 从「静默忽略」改成启动器报错退 **2**；`--repl --server` 的那句临时报错删除。
+- **退出安全网（D54）**：`repl_unclosed_session_report()` 在 `lua_close` **之前**查 `dbg.sessions()`，非空就往 **stderr** 打 `repl: N unclosed session(s) - detaching` 并逐个按归属收尾（有 `DebugActiveProcessStop` 就 detach、没有就 kill；单个失败只再打一行）；**不改退出码**。`d:detach()`/`d:kill()` 与它共用同一对 C 助手（`end_session_by_detach` / `end_session_by_kill`），所以两条路径不会分叉。
+- 门禁：`e2e_repl` 8 → **10**（`repl.remote-exclusive`：`--repl --remote` 退 2；`repl.exit-report`：create 后 EOF ⇒ stderr 含 `unclosed session(s) - detaching`，x64 因 fixture 缺失 SKIP）；`e2e_tcp` 58 → **59**（`repl.server-state`：**新起一个 `--repl` server**，同一连接三帧 —— `x = 41 print(x)` ⇒ `out.id=1` 文本 `41`、`=x + 1` ⇒ `out.id=2` 文本 `42`（**跨命令状态存活**）、`local x =` ⇒ `result.id=3`）。既有 58 条仍跑原来的非 repl server。
+- 实测：`e2e_repl` 86 **10** / 86 legacy 10 / 64 9+1SKIP；`e2e_tcp` 86 **59** / 86 legacy 59 / x64 **51**；其余（dbg 23、json 32、gui 21、skill 14、nvim 32、selftest 73、导入表 13）全绿。手测：REPL 连接里 `while true do end` 的 cancel 仍生效（`ack.applied=true`、`result.flags=canceled`），下一帧仍在同一个 state 上求值。
 ### 11.9 多 session 的脚本面（D57 / D58，随切片 C / T7.6）
 
 #### 11.9.1 pump 的两层（D57）

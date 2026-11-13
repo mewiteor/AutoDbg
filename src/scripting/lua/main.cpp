@@ -496,7 +496,8 @@ extern "C" __declspec(dllexport) int __cdecl autodbg_run(const autodbg_boot *boo
     if (boot->server_mode != 0)
         return autodbg::server::tcp_server_main(boot);
     /* ---- T7 切片 D1：`--repl`（与上面两个同类：**不需要脚本**，也不碰命令行） ----
-     * `--repl` + `--server` 的形态属切片 D2（启动器现在就拒绝），所以这里不接 server。 */
+     * `--repl --server`（切片 D2b）已经在上面的 server 分支里接住了：`tcp_server_main` 看
+     * `boot->repl_mode` 决定是「连级 state + 每帧一行」还是「每次 script 建/毁 state」。 */
     if (boot->repl_mode != 0)
         return run_repl_mode();
 

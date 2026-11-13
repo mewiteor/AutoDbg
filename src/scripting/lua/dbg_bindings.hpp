@@ -44,6 +44,16 @@ bool        dbg_paused() noexcept;
 /* `dbg_busy()` = registry 非空（**存在** dbg 会话）。`Run` / `Attach` 在它为真时拒绝 —— 这是比
  * `dbg_paused()` 更严的那个判据（a live session 就是与契约名不可混用的状态）。 */
 bool        dbg_busy() noexcept;
+
+/* ---- REPL 退出时的会话报告（T7 切片 D2b，D54 的安全网） ----
+ * `dbg_open_session_count()`：registry 里还开着的会话数。
+ * `dbg_release_unclosed_sessions()`：把还开着的会话逐个收尾（有 `DebugActiveProcessStop` 就
+ *   detach —— 目标继续活着；没有（Win95/98）就退 kill，与 `--detach` 的降级口径一致），单个失败
+ *   只打 stderr、继续；返回收尾的个数。落地见 `repl.cpp` 的 `repl_unclosed_session_report`
+ *   （本地 REPL 与服务端 REPL 都在 `lua_close` **之前**调它）。 */
+int         dbg_open_session_count() noexcept;
+int         dbg_release_unclosed_sessions();
+
 const char *dbg_error_reentry() noexcept;
 const char *dbg_error_paused()  noexcept;
 const char *dbg_error_busy()    noexcept;

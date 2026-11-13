@@ -37,6 +37,8 @@
 #   ⑯ T7.3 `dbg` 状态机（`pump.*`，8 条；只在 x86 跑 —— fixture 是 x86-only）
 #   ⑰ T7 D2a（proto 2）：`out` 帧的**命令号归因**（= script 帧的 id）与 `event` 帧（16：命中记录
 #      实时发给执行连接；`id` = 命令号；**不进** `--json` 信封）
+#   ⑱ T7 D2b：`--repl --server`（每条 `script` 帧 = REPL 的一行，`lua_State` 跨帧存活；
+#      `result` 帧的 `id` = 这一行的 Lua 错误码）—— 与默认 server 行为互不污染（另起一个 server）
 # =============================================================================
 [CmdletBinding()]
 param(
@@ -209,6 +211,25 @@ function Run-Client([string[]]$ClientArgs, [int]$TimeoutMs = 25000)
     $o = if (Test-Path $out) { Get-Content $out -Raw } else { '' }
     $e = if (Test-Path $err) { Get-Content $err -Raw } else { '' }
     return [pscustomobject]@{ code = $(if ($p.HasExited) { $p.ExitCode } else { -999 }); out = $o; err = $e }
+}
+
+# 发一条 **REPL 命令**（`--repl --server` 口径：一帧 `script` = 一行 / 一个完整块），收到 `end` 为止。
+# 返回该命令产生的 `out` 帧（id + 拼接后的文本）与 `result` 帧（id = 这一行的 Lua 错误码）。
+function Send-ReplLine($s, [int]$Id, [string]$Src)
+{
+    Send-Frame $s 11 0 $Id '' ([System.Text.Encoding]::UTF8.GetBytes($Src))
+    $ids  = New-Object System.Collections.Generic.List[int]
+    $text = ''
+    $res  = $null
+    for ($i = 0; $i -lt 16; $i++)
+    {
+        $f = Recv-Frame $s
+        if ($null -eq $f) { break }
+        if ($f.type -eq 4) { $ids.Add($f.id); $text += $f.data }
+        elseif ($f.type -eq 5) { $res = $f }
+        elseif ($f.type -eq 14) { break }
+    }
+    return [pscustomobject]@{ outIds = $ids; outText = $text; result = $res }
 }
 
 # ---------------------------------------------------------------- ① 握手成功
@@ -1005,6 +1026,38 @@ With-Server @('--server-timeout=20000') {
         $ej -and $keys -eq $wantKeys) `
         ("event.id=" + $(if ($evf) { $evf.id } else { 'none' }) + " event.json=[" + $(if ($evf) { $evf.json } else { '' }) +
          "] json.keys=[" + $keys + "]")
+}
+
+Write-Output ''
+
+# ---------------- ⑱ T7 D2b：`--repl --server` 的状态跨帧存活（1 条） ----------------
+# `--repl` 下 server 的 `lua_State`（与引擎会话）在**一条连接**内不重建：
+#   · 每次 `script` 帧 = REPL 的一行（或一个完整块），在该 state 上求值；
+#   · `out` 帧的 `id` = 命令号（D2a 已有），`result` 帧的 `id` = **这一行的 Lua 错误码**（0/2/3）。
+# 判据：第一条命令赋值 + 打印 `41`（`out.id = 1`），第二条 `=x + 1` 读到上一帧的全局 x 并打 `42`
+# （`out.id = 2`，`result.id = 0`）；第三条故意语法错→ `result.id = 3`（错误码口径）。
+# ❗第一条写成 `x = 41 print(x)` 而不是光 `x = 41`：赋值不产生任何输出，就断不到它自己的 `out.id`。
+# ❗非 `--repl` 时第二次 `script` 看到的是**全新**的 state（D43 无状态）⇒ x 不存在，本断言永远过不了。
+With-Server @('--repl') {
+    param($c)
+    $s = $c.GetStream()
+    Send-Frame $s 10 0 2 '' $null
+    $null = Recv-Frame $s
+
+    $f1 = Send-ReplLine $s 1 'x = 41 print(x)'
+    $f2 = Send-ReplLine $s 2 '=x + 1'
+    $f3 = Send-ReplLine $s 3 'local x ='
+
+    $ok1 = ($f1.outIds.Count -gt 0) -and (@($f1.outIds | Where-Object { $_ -ne 1 }).Count -eq 0)
+    $ok2 = ($f2.outIds.Count -gt 0) -and (@($f2.outIds | Where-Object { $_ -ne 2 }).Count -eq 0)
+    $rid1 = if ($f1.result) { $f1.result.id } else { 'none' }
+    $rid2 = if ($f2.result) { $f2.result.id } else { 'none' }
+    $rid3 = if ($f3.result) { $f3.result.id } else { 'none' }
+    Check 'repl.server-state' ($ok1 -and $f1.outText -match '41' -and $ok2 -and $f2.outText -match '42' -and
+        $rid1 -eq 0 -and $rid2 -eq 0 -and $rid3 -eq 3) `
+        ("out.id(cmd1)=[" + ($f1.outIds -join ',') + "] text1=[$($f1.outText -replace "`r?`n", '|')] " +
+         "out.id(cmd2)=[" + ($f2.outIds -join ',') + "] text2=[$($f2.outText -replace "`r?`n", '|')] " +
+         "result.id(cmd1/cmd2/cmd3)=$rid1/$rid2/$rid3")
 }
 
 Write-Output ("e2e_tcp: variant={0} pass={1} fail={2}" -f $(if ($Variant) { $Variant } else { 'auto' }), $script:pass, $script:fail)

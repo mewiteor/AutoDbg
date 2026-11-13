@@ -631,7 +631,7 @@ void print_usage()
     out("      --server-log=<path>      diagnostic log file\n");
     out("      --server-no-echo         do not echo executed output to console\n");
     out("      (--json/--out are mutually exclusive with --server, exit code 2)\n");
-    out("      (--repl is mutually exclusive with --json/--out, and with --server until D2)\n\n");
+    out("      (--repl excludes --json/--out and --remote; --repl --server = stateful repl)\n\n");
     out("client (raw tcp, D42):\n");
     out("      --remote=<host:port>   run the script on a remote server (default port 8642)\n");
     out("      --remote-token=<hex>    token for the handshake (loopback needs none)\n");
@@ -919,9 +919,11 @@ extern "C" int launcher_main(int argc, char **argv)
         return 2;
     }
 
-    /* ---- T7 切片 D1：`--repl` 的两条互斥 ----
+    /* ---- T7 切片 D1/D2b：`--repl` 的两条互斥 ----
      * ① `--json` / `--out`：D50 要求 stdout **只有那一行**，REPL 的输出没法塞进信封；
-     * ② `--server`：REPL 跑在 server 上（帧 + 命令归因）是切片 D2 的活，本切片只报错、不静默忽略。 */
+     * ② `--remote`：REPL 的输入是**本进程的 stdin**，远程客户端不转发 stdin（它只发 `script` 帧）
+     *    ⇒ 两者叠加只会让 `--remote` 被静默忽略。D2b 改成显式报错（与 `--json` 同一风格）。
+     * `--repl --server` 是**支持**的（D2b）：一条连信用一份不重建的 state，每帧 `script` = 一行。 */
     if (repl_mode)
     {
         if (json_mode)
@@ -929,9 +931,9 @@ extern "C" int launcher_main(int argc, char **argv)
             out_err("launcher: --repl cannot be combined with --json/--out\n");
             return 2;
         }
-        if (server_mode)
+        if (remote_host != nullptr)
         {
-            out_err("launcher: --repl with --server lands in D2\n");
+            out_err("launcher: --repl cannot be combined with --remote\n");
             return 2;
         }
     }

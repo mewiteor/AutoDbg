@@ -8,7 +8,7 @@
 # 用法：pwsh -File tools/server_test/e2e_repl.ps1 [-Render 64|86] [-Variant ''|modern|legacy]
 # 退出码：0 = 全过；1 = 有失败；2 = 前置缺失（产物不存在 / x64+legacy 组合）
 #
-# 覆盖（8 条，全部纯本地）：
+# 覆盖（10 条，均为纯本地）：
 #   repl.stdin-piped          `print(1+1)` → stdout 有 `2`、退出码 0、**stdout 里零提示符**
 #                             （管道下打提示符会污染所有人的输出比对，§4 第 4 条）
 #   repl.multi-line           `for i=1,2 do` / `print(i)` / `end` → `1` 与 `2`（§11.6 第 2 条）
@@ -20,6 +20,12 @@
 #   repl.json-exclusive       `--repl --json` → 启动器报错、退出码 2（D50：那一行独占 stdout）
 #   repl.state-shared         `=dbg.caps().arch` → `x86` / `x64`：证明 REPL 与脚本路径共用
 #                             同一份 `lua_State`（`dbg`/`gui`/`open_file`/`help` 都在）
+#   repl.remote-exclusive     **D2b**：`--repl --remote=<host:port>` → 启动器报错、退出码 2
+#                             （D1 里这条是「静默忽略」，现在不再静默）
+#   repl.exit-report          **D2b**：`dbg.create{ imagepath = <fixture> }` 后 EOF → stderr 含
+#                             `unclosed session` 与 `detaching`（D54 的安全网），退出码仍是 0；
+#                             且进程没漏（fixture 是 8 轮后自退的靶子）。只在 x86 跑（fixture 是
+#                             x86-only，`parse_pe` 按编译期 `_WIN64` 判位数）。
 #
 # ❗喂 stdin 的两种写法都试过，这里用 **`Start-Process -RedirectStandardInput <file>`**：
 #   · 稳：退出码走 `$p.ExitCode`、stdout/stderr 各自落文件（与 `e2e_dbg.ps1` 的 `Run-Local`
@@ -155,6 +161,42 @@ $want = if ($Render -eq '64') { 'x64' } else { 'x86' }
 $r = Run-Repl "=dbg.caps().arch`n"
 Check 'repl.state-shared' ($r.code -eq 0 -and $r.out -match "(?m)^$want\s*$") `
     "want=$want code=$($r.code) out=[$($r.out)] err=[$($r.err)]"
+
+# ---------------------------------------------------------------- ⑨ `--repl` 与 `--remote` 互斥
+# D2b：`--remote` 是「把脚本送到远端 server 去跑」，它不转发 stdin；与 `--repl` 叠加只会让
+# `--remote` 被静默忽略（D1 的行为）⇒ 现在显式报错、退出码 2（与 `--repl --json` 同一风格）。
+# `--repl --server` 是**可用**的（D2b），它的断言在 e2e_tcp.ps1 的 `repl.server-state`。
+$r = Run-Repl "=1+1`n" @('--remote=127.0.0.1:1')
+Check 'repl.remote-exclusive' ($r.code -eq 2 -and $r.err -match '--repl cannot be combined with --remote') `
+    "code=$($r.code) out=[$($r.out)] err=[$($r.err)]"
+
+# ---------------------------------------------------------------- ⑩ 退出时的会话报告（D54 安全网）
+# 退出前（`lua_close` 之前）查 `dbg.sessions()`：>0 就先打一行 `repl: N unclosed session(s) -
+# detaching`，再逐个 `d:detach()`（没有 `DebugActiveProcessStop` 的平台退 `d:kill()`）。
+# 这条**不改退出码**（仍是「最后一条命令的码」= 0），报告只进 stderr。
+# 只用 x86 fixture（`.out/fixtures/x86_loop.exe`，8 轮后自退）：x64 的 `parse_pe` 按编译期
+# `_WIN64` 判位数 ⇒ 32 位靶子在 64 位产物下建不起来。
+if ($Render -ne '86')
+{
+    Write-Output 'SKIP: repl.exit-report 只在 x86 跑（fixture 是 x86-only）'
+}
+else
+{
+    $fx = Join-Path $Root '.out/fixtures/x86_loop.exe'
+    if (-not (Test-Path $fx))
+    {
+        Bad 'repl.exit-report' '先 make.bat a 86 生成 .out/fixtures/x86_loop.exe'
+    }
+    else
+    {
+        $fxLua = $fx.Replace('\', '/')
+        # `=d ~= nil` 既证明 create 成功，又让最后一条命令的码保持 0（= 退出码口径的旁证）。
+        $r = Run-Repl "d = dbg.create{ imagepath = '$fxLua' }`n=d ~= nil`n"
+        Check 'repl.exit-report' ($r.code -eq 0 -and $r.out -match '(?m)^true\s*$' -and `
+            $r.err -match 'unclosed session' -and $r.err -match 'detaching') `
+            "code=$($r.code) out=[$($r.out)] err=[$($r.err)]"
+    }
+}
 
 # ---------------------------------------------------------------- 汇总
 Write-Output ("repl e2e ({0}{1}): {2} passed, {3} failed" -f $Render, $(if ($Variant) { ", $Variant" } else { '' }), $script:pass, $script:fail)

@@ -1,30 +1,42 @@
 ﻿/* =============================================================================
- * src/scripting/lua/repl.cpp —— 模块侧 REPL 主循环（T7 切片 D1，plan_t7.md §11.7 的 D 行）
+ * src/scripting/lua/repl.cpp —— 模块侧 REPL（T7 切片 D1 主循环 + D2b 服务端形态）
  *
  * 来源：新写（§4.3–4.5 的口径 + §11.6 的四个「对人的缺口」）。仓库原先没有 REPL。
  * 与旧实现的差异：无。
  *
- * 形状（三段，读 → 求值 → 打结果）：
+ * 形状（本地三段：读 → 求值 → 打结果）：
  *   ① `repl_input` 把 stdin 的字节流切成行：先 `ReadFile`（**管道可跑**，门禁靠它），
  *      失败且是真控制台时回退 `ReadConsoleW`；每次「等可读」都是 ≤100 ms 的切片，片间
  *      `guard_poll_control()`（S13：REPL 的输入不能无限阻塞）。
- *   ② `eval_chunk` 把累积的 chunk 交给 `luaL_loadbuffer(L, …, "=repl")` + `lua_pcall`：
- *      「在 EOF 处」的语法错 = 还没输完 ⇒ 继续读行（多行续行）；其它语法错 / 运行错 ⇒
- *      打到 stderr 并把退出码记成 Lua 的码（3 / 2）。
+ *   ② `repl_chunk_feed` + `repl_eval_chunk` 把累积的 chunk 交给 `luaL_loadbuffer(L, …, "=repl")`
+ *      + `lua_pcall`：「在 EOF 处」的语法错 = 还没输完 ⇒ 继续读行（多行续行）；其它语法错 /
+ *      运行错 ⇒ 打到 stderr 并把退出码记成 Lua 的码（3 / 2）。
  *   ③ 结果用**全局 `print`** 打（`lua_getglobal(L, "print")` + 轮转参数）——server 模式下
  *      宿主会覆写 `print`（`output.cpp`），于是结果自动进 `out` 帧；本层不认识任何传输。
  *
+ * 切片 D2b（`--repl --server`）：求值那一半（`repl_chunk_*` / `repl_eval_chunk`）从本地循环里
+ *   抽出来，给服务端复用**同一份** `=` 简写 / 续行判定 / 错误码口径；服务端不再复制第二套。
+ *   `repl_server_begin/chunk/end` 把 `lua_State` 与引擎会话的生命周期从「一次执行」拉长到
+ *   「一条连接」（每次 `script` 帧 = 一行 / 一个完整块），非 `--repl` 的 server 路径一个字不改。
+ *
+ * 两条路径的收尾都过 `repl_unclosed_session_report`（D54 的安全网）：`lua_close` **之前**把
+ *   registry 里没关的会话 detach（平台没有 `DebugActiveProcessStop` 时退 kill），报告只进
+ *   stderr，**不改退出码**（仍是「最后一条命令的码」）。
+ *
  * 退出码（`AGENTS.md` §3 的口径不变）：EOF → 返回**最后一条命令**的码；干净的 EOF 是 0。
- * ❗`--repl` + `--server` 属切片 D2（launcher 现在就拒绝），所以本文件没有归因/帧逻辑。
  * ❗**本地取消不提供**（§11.6 第 4 条，已定）：`dbg` 的 `on_wait_timeout` 有意不读控制台，
  *   所以本地 REPL 里长 `pump` 无法 Ctrl+C —— 这是决定，不是 bug。计数钩子照装（纯 Lua
  *   死循环在 server 口径里能被 cancel 打断），本地模式下它是纯开销可忽略的空转。
  * ========================================================================== */
 #include "repl.hpp"
 
-#include "exec_guard.hpp" /* guard_poll_control / guard_install_lua_hook（S13 / D32） */
+#include "dbg_bindings.hpp" /* D54 安全网：dbg_open_session_count / dbg_release_unclosed_sessions */
+#include "exec_guard.hpp"   /* guard_poll_control / guard_install_lua_hook（S13 / D32） */
+#include "output.hpp"       /* install_print_override（server 的 `print` 进 `out` 帧） */
+#include "state.hpp"        /* create_state_with_libs（与脚本路径同一个建状态入口） */
 
-#include "core/util.hpp" /* PrintS / ErrorS / ErrorN（输出分流：控制台 vs 管道） */
+#include "core/core.hpp" /* DebuggerSession / set_current_session */
+#include "core/util.hpp" /* PrintS / ErrorS / ErrorN / ErrorF（输出分流：控制台 vs 管道） */
 
 #include <windows.h>
 
@@ -38,9 +50,8 @@ constexpr DWORD k_read_slice_ms = 100;
 /* 一片的字节数 / 宽字符数。控制台路径先读宽字符再转 UTF-8，最坏 1 宽字符 → 3 字节。 */
 constexpr unsigned k_read_cap = 1024;
 
-/* 一行与一个待求值 chunk 的上限。REPL 里超长行没有意义；超了就截断（Lua 会报语法错）。 */
-constexpr unsigned k_line_cap  = 4096;
-constexpr unsigned k_chunk_cap = 4096;
+/* 一行的上限（chunk 的上限是 `k_repl_chunk_cap`，在头文件里）。 */
+constexpr unsigned k_line_cap = 4096;
 
 const char k_prompt[]      = "autodbg> ";
 const char k_prompt_cont[] = "   ...> ";
@@ -196,7 +207,9 @@ int read_line(repl_input *in, char *line, unsigned cap)
 }
 
 /* 打一条 Lua 错误（`where` = "syntax" / "runtime"，只进 stderr）。
- * 两种变体的 `lua_tolstring` 都给 UTF-8 字节；`ErrorN` 在 UNICODE 构建里先转宽字符。 */
+ * 两种变体的 `lua_tolstring` 都给 UTF-8 字节；`ErrorN` 在 UNICODE 构建里先转宽字符。
+ * ❗server 模式下 stderr 已经被 `output_begin` 装成 sink ⇒ 这条消息进 `out` 帧的 stderr 桶
+ *   （`flags` bit0 = 1），客户端因此能看见 REPL 的报错。 */
 void report_error(lua_State *L, const char *where)
 {
     size_t      n   = 0;
@@ -260,10 +273,56 @@ void print_results(lua_State *L, int base)
     }
 }
 
-/* 求值一次累积的 chunk。返回 1 = 还没输完（调用方继续读下一行）；0 = 已处理。
- * `allow_continue`：false = 调用方已经到 EOF，此时「没输完」要按**语法错**上报
- * （退出码 3），而不是等永远不会来的下一行。`last_code` 只在返回 0 时更新。 */
-int eval_chunk(lua_State *L, const char *chunk, size_t len, bool allow_continue, int *last_code)
+/* 往 chunk 里追加，返回 false = 超过上限（调用方按语法错处理）。 */
+bool chunk_append(char *chunk, unsigned *len, const char *s, unsigned n)
+{
+    if (*len + n >= k_repl_chunk_cap)
+        return false;
+    for (unsigned i = 0; i < n; i++)
+        chunk[(*len)++] = s[i];
+    return true;
+}
+
+unsigned cstr_len(const char *s)
+{
+    unsigned n = 0;
+    while (s[n] != '\0')
+        n++;
+    return n;
+}
+
+/* D54 的安全网（本地与服务端共用）：把 registry 里**没关**的会话收尾，报告只进 stderr。
+ * ❗必须在 `lua_close` **之前**调：会话的 callback ref / 事件表 ref 都挂在这个 state 上。
+ * ❗不改退出码（退出码仍是「最后一条命令的码」）；单个会话失败只打一行、继续。 */
+void repl_unclosed_session_report()
+{
+    int n = dbg_open_session_count();
+    if (n <= 0)
+        return;
+
+    autodbg::core::ErrorF(TEXT("repl: %d unclosed session(s) - detaching\n"), n);
+    (void)dbg_release_unclosed_sessions();
+}
+} /* namespace */
+
+void repl_chunk_reset(repl_chunk *c)
+{
+    c->len = 0;
+}
+
+bool repl_chunk_feed(repl_chunk *c, const char *text, unsigned len)
+{
+    if (len > 0 && c->len == 0 && text[0] == '=')
+    {
+        /* `=expr` ⇒ `return expr`（§11.6 第 1 条；只在 chunk 为空时生效） */
+        return chunk_append(c->buf, &c->len, "return ", 7) &&
+               chunk_append(c->buf, &c->len, text + 1, len - 1);
+    }
+    return chunk_append(c->buf, &c->len, text, len) &&
+           chunk_append(c->buf, &c->len, "\n", 1);
+}
+
+int repl_eval_chunk(lua_State *L, const char *chunk, size_t len, bool allow_continue, int *last_code)
 {
     int status = luaL_loadbuffer(L, chunk, len, "=repl");
 
@@ -297,37 +356,6 @@ int eval_chunk(lua_State *L, const char *chunk, size_t len, bool allow_continue,
     return 0;
 }
 
-/* 往 chunk 里追加，返回 false = 超过上限（调用方按语法错处理）。 */
-bool chunk_append(char *chunk, unsigned *len, const char *s, unsigned n)
-{
-    if (*len + n >= k_chunk_cap)
-        return false;
-    for (unsigned i = 0; i < n; i++)
-        chunk[(*len)++] = s[i];
-    return true;
-}
-
-unsigned cstr_len(const char *s)
-{
-    unsigned n = 0;
-    while (s[n] != '\0')
-        n++;
-    return n;
-}
-
-unsigned cstr_copy(char *dst, const char *src, unsigned cap)
-{
-    unsigned n = 0;
-    while (src[n] != '\0' && n + 1 < cap)
-    {
-        dst[n] = src[n];
-        n++;
-    }
-    dst[n] = '\0';
-    return n;
-}
-} /* namespace */
-
 int run_repl(lua_State *L)
 {
     if (L == nullptr)
@@ -336,21 +364,22 @@ int run_repl(lua_State *L)
     repl_input in;
     init_input(&in);
 
-    DWORD out_mode   = 0;
+    DWORD out_mode    = 0;
     bool  show_prompt = (GetConsoleMode(GetStdHandle(STD_OUTPUT_HANDLE), &out_mode) != 0);
 
     /* S13 的第②个注入点：纯 Lua 死循环靠计数钩子插话（本地模式下它只是空转）。 */
     guard_install_lua_hook(L);
 
-    char     line[k_line_cap];
-    char     chunk[k_chunk_cap];
-    unsigned chunk_len = 0;
-    int      last_code = 0;
+    char       line[k_line_cap];
+    repl_chunk chunk;
+    int        last_code = 0;
+
+    repl_chunk_reset(&chunk);
 
     for (;;)
     {
         if (show_prompt)
-            autodbg::core::PrintS((chunk_len != 0) ? k_prompt_cont : k_prompt);
+            autodbg::core::PrintS((chunk.len != 0) ? k_prompt_cont : k_prompt);
 
         int got = read_line(&in, line, (unsigned)(sizeof line));
         if (got < 0)
@@ -360,44 +389,116 @@ int run_repl(lua_State *L)
         }
 
         bool eof_now = (got == 0);
-        if (eof_now && chunk_len == 0)
+        if (eof_now && chunk.len == 0)
             break; /* 干净的 EOF：退出码 = 最后一条命令的码（没跑过任何命令 = 0） */
 
         if (!eof_now)
         {
-            unsigned n = cstr_len(line);
-            if (chunk_len == 0 && n > 0 && line[0] == '=')
-            {
-                /* `=expr` ⇒ `return expr`（§11.6 第 1 条；只在 chunk 为空时生效） */
-                if (!chunk_append(chunk, &chunk_len, "return ", 7) ||
-                    !chunk_append(chunk, &chunk_len, line + 1, n - 1))
-                {
-                    autodbg::core::ErrorS("repl: line too long\n");
-                    last_code  = LUA_ERRSYNTAX;
-                    chunk_len  = 0;
-                    continue;
-                }
-            }
-            else if (!chunk_append(chunk, &chunk_len, line, n) ||
-                     !chunk_append(chunk, &chunk_len, "\n", 1))
+            if (!repl_chunk_feed(&chunk, line, cstr_len(line)))
             {
                 autodbg::core::ErrorS("repl: line too long\n");
                 last_code = LUA_ERRSYNTAX;
-                chunk_len = 0;
+                repl_chunk_reset(&chunk);
                 continue;
             }
 
-            if (eval_chunk(L, chunk, chunk_len, true, &last_code) == 0)
-                chunk_len = 0;
+            if (repl_eval_chunk(L, chunk.buf, chunk.len, true, &last_code) == 0)
+                repl_chunk_reset(&chunk);
             continue;
         }
 
         /* EOF 但还有没输完的 chunk：让「在 EOF 处」的语法错真的报出来（退出码 3）。 */
-        (void)eval_chunk(L, chunk, chunk_len, false, &last_code);
-        chunk_len = 0;
+        (void)repl_eval_chunk(L, chunk.buf, chunk.len, false, &last_code);
+        repl_chunk_reset(&chunk);
         break;
     }
 
+    /* D54 安全网：`lua_close`（调用方）之前把没关的会话收尾；不影响退出码。 */
+    repl_unclosed_session_report();
     return last_code;
+}
+
+/* ------------------------------------------------------------------ `--repl --server`（D2b） */
+
+repl_server *repl_server_begin()
+{
+    repl_server *r = new repl_server;
+    r->L           = nullptr;
+    r->sess        = new autodbg::core::DebuggerSession();
+
+    /* 会话与脚本路径同口径（`exec_script` 也是这样挂的）：旧契约名走 `current_session()`。 */
+    autodbg::core::set_current_session(r->sess);
+    r->L = create_state_with_libs();
+    if (r->L == nullptr)
+    {
+        autodbg::core::ErrorS("repl(server): cannot create lua state\n");
+        delete r->sess;
+        delete r;
+        autodbg::core::set_current_session(nullptr);
+        return nullptr;
+    }
+
+    /* 两件装具只在**连接**期装一次（不是每帧）：
+     *   · `print` 覆写 —— 脚本的输出要进 `out` 帧（D30）；sink 本身仍按帧开关。
+     *   · 计数钩子 —— 纯 Lua 死循环靠它被 `--cancel` 打断（D32）。 */
+    install_print_override(r->L);
+    guard_install_lua_hook(r->L);
+    return r;
+}
+
+exec_result repl_server_chunk(repl_server *r, const char *src, size_t len)
+{
+    exec_result out;
+    out.code       = -1;
+    out.loaded     = false;
+    out.oom        = false;
+    out.elapsed_ms = 0;
+    out.error[0]   = '\0';
+
+    if (r == nullptr || r->L == nullptr)
+    {
+        out.oom = true;
+        return out;
+    }
+
+    /* 一次 `script` 帧 = **一行 / 一个完整块** ⇒ 不做跨帧的续行累积（`allow_continue = false`）：
+     * 「没输完」在这里就是语法错（3），而不是等一条永远不会来的下一帧。
+     * `=` 简写与错误码口径走本地 REPL 的同一份实现（`repl_chunk_feed` / `repl_eval_chunk`）。 */
+    repl_chunk chunk;
+    repl_chunk_reset(&chunk);
+    if (!repl_chunk_feed(&chunk, src, (unsigned)len))
+    {
+        autodbg::core::ErrorS("repl: line too long\n");
+        out.code = LUA_ERRSYNTAX;
+        return out;
+    }
+
+    DWORD t0  = GetTickCount();
+    int   last = 0;
+    (void)repl_eval_chunk(r->L, chunk.buf, chunk.len, false, &last);
+    out.elapsed_ms = GetTickCount() - t0;
+
+    out.code   = last;
+    out.loaded = (last != LUA_ERRSYNTAX);
+    return out;
+}
+
+void repl_server_end(repl_server *r)
+{
+    if (r == nullptr)
+        return;
+
+    if (r->L != nullptr)
+    {
+        /* D54 安全网先跑（会话的 ref 挂在这个 state 上），然后才是 D1 的顺序：close → 释放会话。 */
+        repl_unclosed_session_report();
+        lua_close(r->L);
+        r->L = nullptr;
+    }
+
+    delete r->sess;
+    r->sess = nullptr;
+    autodbg::core::set_current_session(nullptr);
+    delete r;
 }
 } /* namespace autodbg::host */
