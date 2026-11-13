@@ -450,7 +450,7 @@ static int run_repl_mode()
     s_session = new autodbg::core::DebuggerSession();
     autodbg::core::set_current_session(s_session);
 
-    lua_State *L = create_state_with_libs();
+    lua_State *L = create_state_with_libs(/*repl=*/true);   /* C1d：REPL 不注册全局 `V` */
     int        r = -1;
     if (L == nullptr)
         ErrorS("repl: cannot create lua state\n");

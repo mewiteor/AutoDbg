@@ -13,6 +13,8 @@
  *   · **数据面（C1b）**：read / read_u8 / read_u16 / read_u32 / read_u64 / read_str / write /
  *     context（读 + 部分更新）/ stack / mods / threads —— 一律 `nil, err` 报错（D55 第 4 条），
  *     键名与帧字段跟 `GetContext` / `StackTrace` 同源；
+ *   · **C1d**：`v(addr)`（会话绑定的 `Var`，解引用一律走本会话的引擎）+ `context()` **全变体**
+ *     （与 `GetContext` 逐字段同型，见 dbg_bindings.cpp 的类型口径块）；
  *   · 对象字段：`stop`（当前未应答的事件表，与 `pump` 返回的是**同一张表**）/ `root_pid` / `kind` /
  *     `state`（`running` / `stopped` / `exited`）；
  *   · 模块级保留 create / attach / pump / cont / step / eip / arm / hits / dropped / setcap / stopped /
@@ -32,12 +34,61 @@
  *   "pump cannot be called from a callback"      —— 回调里调状态机
  *   "cannot run while a dbg session exists (detach/kill it first)" —— **存在** dbg 会话时调 `Run`/`Attach`
  * （后者被 bindings.cpp 的 `lua_run` / `lua_attach` 用：两条路径都独占整个进程的事件流，不能与 `dbg` 共存。）
+ *
+ * 切片 C1d 的两处对外增量：
+ *   · **回调上下文**（`CallbackScope` + `cb_active/cb_session/cb_pid`）：引擎正在调用户回调这件事
+ *     跨 `bindings.cpp`（`Run`/`Attach` 那条）与本文件（`dbg` 那条）两层共享 —— `V()` 靠它找会话；
+ *   · **`d:v(addr)`**：会话绑定的 `Var`（`Var` 的载荷因此带 `DebuggerSession*`，见 bindings.cpp）。
  * ========================================================================== */
+#include <windows.h>   /* DWORD（`CallbackScope` / `dbg_session_alive` 的形参）*/
+#include <stdint.h>    /* uint64_t（`arg_num_or_lv`）*/
 #include <lua.hpp>
+
+namespace autodbg::core
+{
+class DebuggerSession;
+}
 
 namespace autodbg::host
 {
 void register_dbg_api(lua_State *L);
+
+/* ---------------- 回调上下文（T7 切片 C1d） ----------------
+ *
+ * 「引擎此刻正在执行用户回调」是一个**跨两层的全局事实**（单线程串行 ⇒ 不需要 TLS，也不许用
+ * `thread_local`：手工映射的模块不分配 TLS 槽，AGENTS.md §11.5）。置位点有两处：
+ *   · `dbg_bindings.cpp` 的 `call_user`（`dbg` 会话的回调派发，会话与 pid 都是现成的）；
+ *   · `bindings.cpp` 的每个 `lua_on_*` 适配器（`Run`/`Attach` 那条，会话 = 当前会话）。
+ * 两处都用栈上 RAII（`CallbackScope`）包住，回调的**可见签名一个字不变**。
+ *
+ * 用途：`V()` / `Var:<method>` 要「用哪个引擎去读写」—— 回调里只有唯一答案（引擎正在跑这个脚本的
+ * 那个会话），顶层/REPL 里**没有**答案。之前那种「猜 `current_session()`」正是本切片要消灭的歧义
+ * （顶层猜到的可能是宿主会话，也可能是一个随手 `create` 出来的会话）。 */
+class CallbackScope
+{
+public:
+    CallbackScope(core::DebuggerSession *sess, DWORD pid) noexcept;
+    ~CallbackScope() noexcept;
+    CallbackScope(const CallbackScope &)            = delete;
+    CallbackScope &operator=(const CallbackScope &) = delete;
+
+private:
+    core::DebuggerSession *prev_sess;
+    DWORD                  prev_pid;
+};
+
+/* 现在有没有用户回调在跑；在跑时它的会话与事件 pid（没有则是 nullptr / 0）。 */
+bool                   cb_active() noexcept;
+core::DebuggerSession *cb_session() noexcept;
+DWORD                  cb_pid() noexcept;
+
+/* 地址类实参的两种收法（number 与 LuaVariant）—— 会话方法与 **`V()`** 共用同一份语义。
+ * ❗`lv_check` 自己的严格语义不动：29 个契约名依赖它。 */
+bool arg_num_or_lv(lua_State *L, int idx, uint64_t *out);
+
+/* `d:v()` 绑定的引擎会话是否还活着（收尾 detach/kill 之后会话会从 registry 摘掉、之后被释放）。
+ * 只**比较**指针、不解引用 ⇒ 对着已释放的会话调 `Var` 方法是干净的错误而不是 UAF。 */
+bool dbg_session_alive(const core::DebuggerSession *sess) noexcept;
 
 /* `dbg_paused()` = **任一**会话停着一个未应答事件（C2a：不再只是默认会话；没有会话 = 没停着事件）。 */
 bool        dbg_paused() noexcept;

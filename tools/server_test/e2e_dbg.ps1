@@ -8,7 +8,7 @@
 # 用法：pwsh -File tools/server_test/e2e_dbg.ps1 [-Render 64|86] [-Variant ''|modern|legacy]
 # 退出码：0 = 全过；1 = 有失败；2 = 前置缺失（产物不存在 / x64+legacy 组合）
 #
-# 覆盖（切片 A + C1a + C1b）：
+# 覆盖（切片 A + C1a + C1b + C1c + C1d）：
 #   caps.*            这台机器/build 的事实：arch / variant / flavor / win9x / attach / detach / hits_cap
 #   detach.capability `dbg.detach` 存在且 `dbg.close` **已删**（D51：无隐式回退，能力缺席就是 nil）
 #   help.*            help() / help('dbg') / help('dbg.pump') / 未知主题 / 管道下纯文本（无 ESC）
@@ -27,8 +27,21 @@
 #                        type(ev.ea)=='userdata' 且 tostring 以 0x 开头、type(ev.rva)=='number'、
 #                        type(d:mods()[1].base)=='userdata'、type(d:read_u32(base))=='number'、
 #                        type(d:read_u64(base))=='userdata'、type(d:context().Cip)=='userdata'、
-#                        type(d:context().EFlags)=='number'；jsonx.encode(变体) 走 `.val`（无 `e+`）
-#                        ⇒ 精确；同一现场再验证「29 名直接吃 variant」：ReadMemory(ev.ea, U32(4))
+#                        type(d:context().EFlags)=='userdata'（**C1d**：context() 全变体，与 GetContext 同型）；
+#                        jsonx.encode(变体) 走 `.val`（无 `e+`）⇒ 精确；
+#                        同一现场再验证「29 名直接吃 variant」：ReadMemory(ev.ea, U32(4))
+#   var.callback-only（C1d）—— `V()` **只在调试回调里可用**：顶层 `V(0x401000)` 得到 nil + 固定文案
+#                        （"V() is only usable inside a debug callback; use d:v(addr) or d:read*/d:write instead"）；
+#                        在 `d:arm` 的回调里 `V(ev.ea - 4):to('I')` 能读到 fixture 那条
+#                        `mov eax, 0x50474244` 的立即数（证明回调上下文里的会话就是本会话的引擎）
+#   context.all-variant（C1d）—— `d:context()` 读侧**全变体**：EFlags / ContextFlags 都是 LuaVariant，
+#                        且 `EFlags.val` 与契约名 `GetContext(U32(tid)).EFlags.val` 逐字节一致
+#   var.d-v-bound（C1d）—— `d:v(addr)` 是**会话绑定**的 Var：两个同名实例各停在自己的 site，
+#                        各自的 `a:v(a_base + SITE - 4):to('I')` / `b:v(b_base + SITE - 4)` 都读到
+#                        0x50474244；把 A 的立即数改成 0x504742AA 之后 A 读到新值、**B 不变**
+#                        ⇒ 解引用走的确实是各自会话的引擎（绑定没串）。
+#                        ❗判据不用「两个 base 不等」：ASLR 只有 8 bit 熵、偶尔会撞上；
+#                          「改 A 不动 B」在 base 相同的情况下也成立，且绑定串了就必然失败。
 #   session.default-parity（C2a 回归门禁，plan_t7.md §11.9.1）—— 同一脚本里用**契约名**与**会话方法**
 #                       读同一个事实并逐字节比对：dbg 会话活着时，29 个契约名必须作用在**同一个**引擎上
 #                       （而不是宿主那个空会话）：
@@ -62,8 +75,10 @@
 #     remote.data-plane      `d:read(m.base, 4)` = 四字节 PE 头 / `d:read_u16` 是 number
 #                            （字节走 `__hex`、LuaVariant 走 `__u64` 十进制串，见 dbglib.lua 的文件头）
 #     remote.teardown        `d:kill()` 真终止那个 64 位目标（PowerShell 用 Get-Process 复查）
-# ❗session.* / kill.* / C2a 的 4 条 / sugar.* 的 2 条 / remote.* 的 4 条都需要 x86 宿主（前四段还要
-#   x86 fixture）⇒ x64 上这几段整段 SKIP（8 条）。x86（含 legacy）是 **29** 条（C1c 加了 session.lv-types）。
+# ❗session.* / kill.* / C2a 的 4 条 / sugar.* 的 2 条 / remote.* 的 4 条 / var.* + context.all-variant
+#   都需要 x86 宿主（前几段还要 x86 fixture）⇒ x64 上这几段整段 SKIP（8 条）。
+#   x86（含 legacy）是 **32** 条（C1c 加了 session.lv-types；C1d 加了 var.callback-only /
+#   context.all-variant / var.d-v-bound）。
 # =============================================================================
 [CmdletBinding()]
 param(
@@ -405,7 +420,7 @@ local u8_num   = type(d:read_u8(base)) == 'number'
 local u32_num  = type(d:read_u32(base)) == 'number'
 local u64_obj  = type(d:read_u64(base)) == 'userdata'
 local cip_obj  = type(ctx.Cip) == 'userdata'
-local efl_num  = type(ctx.EFlags) == 'number'
+local efl_obj  = type(ctx.EFlags) == 'userdata'   -- C1d：context() 全变体（与 GetContext 同型）
 
 -- jsonx：userdata 分支直接吐 `.val`（十进制、精确）⇒ 15 位的值不会变成 `1.40699e+14`；
 -- 对照的**普通 number** 走 `%.14g`，必然带 `e+` —— 这就是 C1c 的第 ② 条动机。
@@ -423,7 +438,7 @@ print('lv_ea=' .. tostring(ea_obj) .. ' ea_hex=' .. tostring(ea_hex) ..
       ' rva_num=' .. tostring(rva_num) .. ' base_obj=' .. tostring(base_obj) ..
       ' size_num=' .. tostring(size_num))
 print('lv_regs=' .. tostring(u8_num) .. '/' .. tostring(u32_num) .. '/' .. tostring(u64_obj) ..
-      ' cip_obj=' .. tostring(cip_obj) .. ' eflags_num=' .. tostring(efl_num))
+      ' cip_obj=' .. tostring(cip_obj) .. ' eflags_obj=' .. tostring(efl_obj))
 print('lv_json=u64:' .. jv .. ' u64big:' .. ju .. ' num:' .. jn .. ' precise=' .. tostring(precise))
 print('lv_29=' .. tostring(mem29))
 print('kill=' .. tostring(d:kill()))
@@ -431,9 +446,110 @@ print('kill=' .. tostring(d:kill()))
     $r = Run-Local $s_lv
     Check 'session.lv-types' ($r.out -match 'lv_obj=true' -and `
         $r.out -match 'lv_ea=true ea_hex=true rva_num=true base_obj=true size_num=true' -and `
-        $r.out -match 'lv_regs=true/true/true cip_obj=true eflags_num=true' -and `
+        $r.out -match 'lv_regs=true/true/true cip_obj=true eflags_obj=true' -and `
         $r.out -match 'precise=true' -and $r.out -match 'lv_29=true' -and $r.out -match 'kill=true') `
         "新面的地址类值 = LuaVariant（ev.ea / mods().base / read_u64 / context().Cip）、小整数 = number（ev.rva / mods().size / read_u8|u32 / EFlags）；jsonx.encode(变体) 精确（无 e+）且 ReadMemory(ev.ea, U32(4)) 能通；out=[$($r.out)]"
+    # ------------------------------------------ ⑤d 回调上下文 + 会话绑定的 Var（C1d）
+    # `V()` 只在**调试回调**里可用（那时「用哪个引擎」有唯一答案）；顶层/REPL 里没有这个答案 ⇒
+    # 固定文案，改用 `d:v(addr)` / `d:read*` / `d:write`。`context()` 同时改成**全变体**（与
+    # `GetContext` 逐字段同型）⇒ 这里一并断言 `EFlags` 的类型与数值。
+    $s_var = Write-Lua 'var_empty.lua' @"
+local EXE = '$fxLua'
+local SITE = $($site.site)
+-- 类型归一：LuaVariant 取 `.val`（十进制串），大整数不赌 `__eq`（dbg_bindings.cpp 的 C1c 口径块）
+local function dec(v)
+    if type(v) == 'userdata' or type(v) == 'table' then return tostring(v.val) end
+    return tostring(v)
+end
+
+-- ① 顶层：V() 不可用（固定文案；返回**值**不是 error，所以 pcall 之外直接拿两个返回值）
+local tv, terr = V(0x401000)
+print('vc_top=' .. tostring(tv) .. ' err=' .. tostring(terr))
+
+-- ② 回调里：V(ev.ea - 4):to('I') 必须读到 fixture 那条 `mov eax, 0x50474244` 的立即数
+local d = dbg.create{ imagepath = EXE }
+print('vc_obj=' .. tostring(d ~= nil))
+if not d then return end
+local cbhex = 'none'
+d:arm('x86_loop.exe', SITE, function(ev)
+    -- 回调里 pcall 一次：即使断言失败也要让 fixure 继续跑到收尾（不让错误进 cb_error）
+    local ok, v = pcall(function() return V(ev.ea - 4):to('I') end)
+    if ok and v ~= nil then cbhex = v.hex end
+end)
+local ev
+for i = 1, 40 do
+    ev = d:pump(3000)
+    if ev == nil then break end
+    if ev.rva == SITE then break end
+    d:cont(ev.cont_code)
+end
+print('vc_hit=' .. tostring(ev ~= nil and ev.rva == SITE) .. ' vc_cb=' .. cbhex)
+
+-- ③ context() 全变体：EFlags 是 LV_U32 变体，且与契约名 GetContext(tid) 同值
+--    ❗GetContext 的第 1 个参数要 LuaVariant（29 名的 lv_check 严格），所以是 U32(ev.tid)
+local ctx  = d:context()
+local gctx = GetContext(U32(ev.tid))
+print('ca_eflags=' .. type(ctx.EFlags) .. ' ca_cflags=' .. type(ctx.ContextFlags) ..
+      ' ca_same=' .. tostring(dec(ctx.EFlags) == dec(gctx.EFlags)) ..
+      ' ca_val=' .. dec(ctx.EFlags))
+print('kill=' .. tostring(d:kill()))
+"@
+    $r = Run-Local $s_var
+    Check 'var.callback-only' ($r.out -match 'vc_top=nil err=V\(\) is only usable inside a debug callback; use d:v\(addr\) or d:read\*/d:write instead' -and `
+        $r.out -match 'vc_hit=true vc_cb=50474244' -and $r.out -match 'kill=true') `
+        "V() 只在调试回调里可用（顶层 get nil + 固定文案）；回调里 V(ev.ea - 4):to('I') 读到 0x50474244；out=[$($r.out)]"
+    Check 'context.all-variant' ($r.out -match 'ca_eflags=userdata ca_cflags=userdata ca_same=true') `
+        "d:context() 全变体：EFlags/ContextFlags 都是 LuaVariant，且 EFlags.val 与 GetContext(tid) 一致；out=[$($r.out)]"
+
+    # ------------------------------------------ ⑤e 会话绑定的 Var（C1d：`d:v(addr)`）
+    # 两个同名实例（= 两个进程）各自停在自己的 site；`d:v` 的解引用必须走**自己的人会话**。
+    # 判据不靠「两个 base 不等」（ASLR 只有 8 bit 熵，偶尔会撞上），而是「改 A 的内存不动 B 的读值」
+    # —— 这在 base 相同的情况下也成立，且只要绑定串了它就必然失败（更强也更稳）。
+    $s_dv = Write-Lua 'dvar.lua' @"
+local EXE = '$fxLua'
+local SITE = $($site.site)
+local a, ea = dbg.create{ imagepath = EXE }
+local b, eb = dbg.create{ imagepath = EXE }
+print('dv_obj=' .. tostring(a ~= nil) .. '/' .. tostring(b ~= nil) .. ' err=' .. tostring(ea) .. '|' .. tostring(eb))
+if not a or not b then return end
+print('dv_arm=' .. tostring(a:arm('x86_loop.exe', SITE, function() end)) .. '/' ..
+                   tostring(b:arm('x86_loop.exe', SITE, function() end)))
+local rounds = 0
+while not (a:paused() and b:paused()) do
+    rounds = rounds + 1
+    if rounds > 200 then break end
+    if a:stopped() or b:stopped() then break end
+    local ev = dbg.pump(300, false)
+    if ev ~= nil and ev.rva ~= SITE then ev.session:cont() end
+end
+print('dv_both=' .. tostring(a:paused() and b:paused()))
+local ab, bb
+for _, m in ipairs(a:mods()) do if m.name and string.lower(m.name):find('x86_loop.exe', 1, true) then ab = m.base end end
+for _, m in ipairs(b:mods()) do if m.name and string.lower(m.name):find('x86_loop.exe', 1, true) then bb = m.base end end
+print('dv_base=' .. tostring(ab ~= nil and bb ~= nil) .. ' differ=' .. tostring(ab ~= nil and bb ~= nil and ab.val ~= bb.val) ..
+      ' a=' .. tostring(ab and ab.hex) .. ' b=' .. tostring(bb and bb.hex))
+if ab == nil or bb == nil then print('kill=' .. tostring(a:kill()) .. '/' .. tostring(b:kill())) return end
+
+-- 两边各自读同一个 RVA（-4 = 那条 mov 的立即数首字节）⇒ 都必须是 0x50474244
+local ah1 = a:v(ab + SITE - 4):to('I').hex
+local bh1 = b:v(bb + SITE - 4):to('I').hex
+-- 把 A 的立即数改掉 ⇒ A 读 0x504742AA，B 必须仍是 0x50474244（绑定没串的硬证据）
+a:v(ab + SITE - 4):write(U32(0x504742AA))
+local ah2 = a:v(ab + SITE - 4):to('I').hex
+local bh2 = b:v(bb + SITE - 4):to('I').hex
+print('dv_read=' .. ah1 .. '/' .. bh1 .. ' after=' .. ah2 .. '/' .. bh2)
+-- 派生 Var（off / 索引链）仍绑在同一个会话上
+local off = a:v(ab + SITE - 8)
+print('dv_off=' .. tostring(off:to('I').hex))
+print('kill=' .. tostring(a:kill()) .. '/' .. tostring(b:kill()) .. ' left=' .. #dbg.sessions())
+"@
+    $r = Run-Local $s_dv 90000
+    Check 'var.d-v-bound' ($r.out -match 'dv_obj=true/true' -and $r.out -match 'dv_arm=true/true' -and `
+        $r.out -match 'dv_both=true' -and $r.out -match 'dv_base=true' -and `
+        $r.out -match 'dv_read=50474244/50474244 after=504742AA/50474244' -and `
+        $r.out -match 'kill=true/true left=0') `
+        "d:v 的解引用走**自己绑定的**会话：两边各自读到 0x50474244；改 A 的立即数后 A 变 0x504742AA 而 B 不动（绑定没串）；out=[$($r.out)]"
+
 
     # ------------------------------------------ ⑤b 契约名 vs 会话方法（C2a 回归：default-parity）
     # 现场：dbg 会话活着（`g_default == st`）且**停住**在 fixture 的 int3 上。此时 29 个契约名走的

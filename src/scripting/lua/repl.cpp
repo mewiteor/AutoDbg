@@ -433,7 +433,7 @@ repl_server *repl_server_begin()
 
     /* 会话与脚本路径同口径（`exec_script` 也是这样挂的）：旧契约名走 `current_session()`。 */
     autodbg::core::set_current_session(r->sess);
-    r->L = create_state_with_libs();
+    r->L = create_state_with_libs(/*repl=*/true);   /* C1d：REPL 不注册全局 `V`（见 state.hpp） */
     if (r->L == nullptr)
     {
         autodbg::core::ErrorS("repl(server): cannot create lua state\n");

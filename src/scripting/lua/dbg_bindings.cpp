@@ -26,6 +26,16 @@
  *   `write` 的 `addr` 与 `d:context(tid, t)` 的字段值都**同时收** number 与 LuaVariant。
  *   `d:arm` 的 rva 与 `ev.rva` **仍是普通 number**（D57：门禁大量依赖 `ev.rva == 0x1028`）。
  *
+ * 切片 C1d（回调上下文 + 会话绑定的 Var + `context()` 全变体）：
+ *   ① `d:context()` 从「按 kind 分流」改成**全变体**，与 29 名的 `GetContext` 逐字段同型
+ *      （U32 → `LV_U32`、U64 → `LV_U64`、UPTR → `LV_UZ`、M128 → `{ Low, High }`）；setter 仍两种都收。
+ *   ② 新增 `d:v(addr)`：**会话绑定**的 `Var`（`Var` 的载荷因此带 `DebuggerSession*`，见 `bindings.cpp`）。
+ *      `V()` 同时收紧为「只在调试回调里可用」（顶层/REPL 报固定文案），REPL 里干脆不注册它。
+ *   ③ 支撑 ② 的是一个**跨两层的回调上下文**（`CallbackScope` + `cb_active/cb_session/cb_pid`）：
+ *      置位点是本文件的 `call_user` 与 `bindings.cpp` 的 17 个 `PCALL` 点。理由：`Var` 需要一个
+ *      「引擎正在跑这个脚本的会话」，而 `current_session()` 只是「最近一次 create/attach」的代理
+ *      —— 顶层猜它就是歧义。
+ *
  * 切片 C2a（多会话 + **进程级事件路由**，plan_t7.md §10 / §11.9.1 / D57）：
  *   ① **每个会话自带引擎会话**（`new core::DebuggerSession`；`release_state` 释放）—— 之前所有会话共用
  *      宿主挂给 core 的那一份，多会话会互相踩状态。
@@ -129,6 +139,37 @@ namespace autodbg::host
 using autodbg::core::utf8_to_utf16;   /* util.hpp 的 TCHAR 宏展开成这两个名字（所以要在本 TU 里可见） */
 using autodbg::core::utf16_to_utf8;
 using autodbg::common::release;       /* free_from_tchar 宏（UNICODE 下才真释放） */
+
+/* ---------------- 地址类实参的两种收法（C1c 起；C1d 起 `V()` 也用它） ----------------
+ * 放在匿名 namespace **之外**：`bindings.cpp` 的 `V()` / `Var:*` 要用同一份语义（声明在
+ * dbg_bindings.hpp）。`push_ea` 仍留在下面（它只给本文件会话面用）。 */
+
+/* userdata 是不是 LuaVariant：比较元表，**不**用 `luaL_checkudata`（它会 `lua_error` 长跳，
+ * 而这里要的是「判假后由调用方当值报错」；会话句柄 / 连接句柄也是 userdata）。 */
+static bool is_lua_variant(lua_State *L, int idx)
+{
+    if (!lua_getmetatable(L, idx)) return false;
+    luaL_getmetatable(L, "LuaVariant");
+    bool same = lua_rawequal(L, -1, -2) != 0;
+    lua_pop(L, 2);
+    return same;
+}
+
+/* 地址类实参：number 与 LuaVariant **都收**（C1c）。
+ * ❗`lv_check` 本身不动 —— 29 个契约名依赖它的严格语义（`ReadMemory` 只吃 UZ）。
+ * number 一侧仍用 `lua_isnumber`（与改前一致：数字串也照旧收）。 */
+bool arg_num_or_lv(lua_State *L, int idx, uint64_t *out)
+{
+    if (lua_type(L, idx) == LUA_TUSERDATA)
+    {
+        if (!is_lua_variant(L, idx)) return false;
+        *out = (uint64_t)lv_check(L, idx, LV_ANY)->val.uz;   /* `uz` 随架构展开成 u32/u64 */
+        return true;
+    }
+    if (!lua_isnumber(L, idx)) return false;
+    *out = (uint64_t)lua_tointeger(L, idx);
+    return true;
+}
 
 namespace
 {
@@ -269,6 +310,15 @@ static void sync_current_session()
 /* 引擎此刻是否正在执行用户回调（单线程串行 ⇒ 这是一个全局事实，与具体会话无关）：
  * 回调里再调状态机一律拒（plan_t7.md §2.3）。 */
 bool g_in_callback = false;
+
+/* ---------------- 回调上下文（T7 切片 C1d） ----------------
+ * “引擎正在调用户回调”在**两层**都要知道（`dbg` 的 `call_user` 与 `Run`/`Attach` 的
+ * `lua_on_*`），而 `V()` / `Var:*` 靠它决定用哪个引擎。实现是**模块级的一份**（不是
+ * thread_local、也不是函数内非平凡 static —— §11.5 / PITFALLS M10）：执行严格串行，
+ * 嵌套由 `CallbackScope` 存/还原上一层来实现。没在回调里时 `sess == nullptr`。
+ * 置位/还原的公开面（`CallbackScope` 与三个查询）在匿名 namespace 之外。 */
+core::DebuggerSession *g_cb_sess = nullptr;
+DWORD                  g_cb_pid  = 0;
 
 static int fail(lua_State *L, const char *msg)
 {
@@ -437,16 +487,20 @@ static void copy_name(char *out, size_t cap, LPCTSTR name)
 #endif
 }
 
-/* ---------------- 类型统一（T7 切片 C1c）：地址类值 = LuaVariant，小整数 = number ----------------
+/* ---------------- 类型统一（T7 切片 C1c + C1d）：地址类值 = LuaVariant，小整数 = number --------
  *
  * 口径（写一次，下面各处的注释引用这里）：
  *   地址 / 指针 / 指针宽的寄存器值 ⇒ **LuaVariant**（`LV_UZ` = x86 的 U32 / x64 的 U64）：
  *     `ev.ea`、`hits()[i].ea`、`mods()[i].base`、`stack()[i].ea`、`d:context()` 里
  *     `ctx_kind::UPTR` 的字段（`Cax…Cip` / `Dr0-Dr7` / x64 的 `R8-R15` 与 home 槽）、`d:eip()`；
  *   **小整数 ⇒ 普通 number**：`pid/tid/type/code/cont_code/first_chance/rva/hits/dropped/size/index`、
- *     `d:read_u8|u16|u32`、`ctx_kind::U32` 的字段（`EFlags/ContextFlags/Seg*`）与 `U64` 的字段
- *     （`VectorControl`/`DebugControl`）、`dbg.sessions()` 的 `root_pid`、`dbg.caps()`、`d:arm` 的 rva；
+ *     `d:read_u8|u16|u32`、`dbg.sessions()` 的 `root_pid`、`dbg.caps()`、`d:arm` 的 rva；
  *   `d:read_u64()` 是 **`LV_U64`**（宽度由函数名给出；x86 上 `LV_UZ` 是 4 字节，装不下 64 位读值）。
+ *   ❗**C1d**：`d:context()` 从「按 kind 分流（UPTR 变体、U32/U64 number）」改成**全变体** ——
+ *     U32 → `LV_U32`、U64 → `LV_U64`、UPTR → `LV_UZ`、M128 → `{ Low = LV_U64, High = LV_U64 }`，
+ *     与 29 名里的 `GetContext` **逐字段同型**（那份实现就是参照）。理由很硬：同一个引擎字段
+ *     在两个 API 上必须是同一个型，否则「`d:context().EFlags` 拿去给 `SetContext` / 做算术」这种
+ *     最自然的写法会因为宽度/类型不匹配而出错（§9.9 的「跨类型比较 + 宽度不匹配」）。
  *
  * 为什么不是「一律普通整数」（§2.1 第 3 条的旧口径就此反转，三条理由）：
  *   ① 与 29 个契约名天然互通：`ReadMemory(ev.ea, 4)` / `Ea2ModnameRva(ev.ea)` 本来就吃 LuaVariant，
@@ -461,38 +515,11 @@ static void copy_name(char *out, size_t cap, LPCTSTR name)
  *   一律用 `.val`（十进制串）或 `tostring`（hex），不要赌 `==`。
  * ------------------------------------------------------------------------------------------- */
 
-/* userdata 是不是 LuaVariant：比较元表，**不**用 `luaL_checkudata`（它会 `lua_error` 长跳，
- * 而这里要的是「判假后由调用方当值报错」；会话句柄 / 连接句柄也是 userdata）。 */
-static bool is_lua_variant(lua_State *L, int idx)
-{
-    if (!lua_getmetatable(L, idx)) return false;
-    luaL_getmetatable(L, "LuaVariant");
-    bool same = lua_rawequal(L, -1, -2) != 0;
-    lua_pop(L, 2);
-    return same;
-}
-
 /* 地址类的值怎么推给 Lua：`LV_UZ` = 指针宽（x86 = U32 / x64 = U64）。`size_t` 与 `val.uz`
  * 在两种架构上宽度一致 ⇒ 直接赋值，不需要按 `_WIN64` 分叉。 */
 static void push_ea(lua_State *L, size_t v)
 {
     lv_push(L, LV_UZ)->val.uz = v;
-}
-
-/* 地址类实参：number 与 LuaVariant **都收**（C1c）。
- * ❗`lv_check` 本身不动 —— 29 个契约名依赖它的严格语义（`ReadMemory` 只吃 UZ）。
- * number 一侧仍用 `lua_isnumber`（与改前一致：数字串也照旧收）。 */
-static bool arg_num_or_lv(lua_State *L, int idx, uint64_t *out)
-{
-    if (lua_type(L, idx) == LUA_TUSERDATA)
-    {
-        if (!is_lua_variant(L, idx)) return false;
-        *out = (uint64_t)lv_check(L, idx, LV_ANY)->val.uz;   /* `uz` 随架构展开成 u32/u64 */
-        return true;
-    }
-    if (!lua_isnumber(L, idx)) return false;
-    *out = (uint64_t)lua_tointeger(L, idx);
-    return true;
 }
 
 /* ---------------- 命中窗口 ---------------- */
@@ -661,16 +688,21 @@ static void call_user(SessionState *st, int ref, DWORD pid, DWORD tid, size_t ea
     lua_pushinteger(L, (lua_Integer)rva);  lua_setfield(L, -2, "rva");
 
     g_in_callback = true;
-    if (lua_pcall(L, 1, 0, 0) != 0)
+    /* C1d：同一个事实的第二个面向 —— 本会话的回调上下文（`V()`/`Var:*` 靠它找引擎）。
+     * 置在这里而不是每个 `h_*` 里：所有用户回调都走 `call_user` 这一个口。 */
     {
-        const char *msg = lua_tostring(L, -1);
-        size_t i = 0;
-        if (msg)
+        CallbackScope cbctx(st->sess, pid);
+        if (lua_pcall(L, 1, 0, 0) != 0)
         {
-            for (; msg[i] && i < sizeof(st->cb_error) - 1; i++) st->cb_error[i] = msg[i];
+            const char *msg = lua_tostring(L, -1);
+            size_t      i   = 0;
+            if (msg)
+            {
+                for (; msg[i] && i < sizeof(st->cb_error) - 1; i++) st->cb_error[i] = msg[i];
+            }
+            st->cb_error[i] = 0;
+            lua_pop(L, 1);
         }
-        st->cb_error[i] = 0;
-        lua_pop(L, 1);
     }
     g_in_callback = false;
 }
@@ -923,7 +955,8 @@ static DWORD arg_tid(lua_State *L, SessionState *st, int base)
 
 /* 64 位值怎么推给 Lua：Lua 5.5（含 x86 构建）与 x64 的 LuaJIT 的 `lua_Integer` 都是 64 位 ⇒ 整数；
  * x86 的 LuaJIT 是 32 位 ptrdiff_t ⇒ 走 double（2^53 以内精确，读内存的值实际都在这个范围内）。
- * 判据与 `variant.cpp` 的 `set_lv_integer` 同一条（D52：新面只用普通整数）。 */
+ * 判据与 `variant.cpp` 的 `set_lv_integer` 同一条（D52：小整数用普通整数）。
+ * ❗C1d 起只有 `d:read_u8|u16|u32` 走这里：`d:context()` 全变体、`d:read_u64` 是 `LV_U64`。 */
 static void push_u64(lua_State *L, uint64_t v)
 {
     if (sizeof(lua_Integer) >= 8) lua_pushinteger(L, (lua_Integer)v);
@@ -1113,19 +1146,23 @@ static int do_context(lua_State *L, SessionState *st, int base)
         lua_createtable(L, 0, (int)count);
         for (size_t i = 0; i < count; i++)
         {
+            /* C1d：读侧**逐字段同型**于 `GetContext`（`bindings.cpp::lua_get_context` 就是那份参照
+             * 实现）：U32 → `LV_U32`、U64 → `LV_U64`、UPTR → `LV_UZ`、M128 → `{ Low, High }` 两个
+             * `LV_U64`。两边同一套列（`core::context_fields`）且同一套类型 ⇒ 脚本不再需要
+             * “这个键是数字还是变体”的知识。 */
             const BYTE *p = (const BYTE *)&ctx + fields[i].offset;
             switch (fields[i].kind)
             {
-            case core::ctx_kind::U32 : lua_pushinteger(L, (lua_Integer)(*(const uint32_t *)p)); break;
-            case core::ctx_kind::U64 : push_u64(L, *(const uint64_t *)p); break;
-            case core::ctx_kind::UPTR: push_ea(L, *(const size_t *)p); break;   /* C1c：指针宽 ⇒ LuaVariant */
+            case core::ctx_kind::U32 : lv_push(L, LV_U32)->val.u32 = *(const uint32_t *)p; break;
+            case core::ctx_kind::U64 : lv_push(L, LV_U64)->val.u64 = *(const uint64_t *)p; break;
+            case core::ctx_kind::UPTR: lv_push(L, LV_UZ)->val.uz = *(const size_t *)p; break;
             case core::ctx_kind::M128:
             {
-                /* M128A = { Low, High }（与 `GetContext` 暴露的两个 64 位半部同名） */
+                /* M128A = { Low, High }（与 `GetContext` 暴露的两个 64 位半部同名同型） */
                 const uint64_t *q = (const uint64_t *)p;
                 lua_createtable(L, 0, 2);
-                push_u64(L, q[0]); lua_setfield(L, -2, "Low");
-                push_u64(L, q[1]); lua_setfield(L, -2, "High");
+                lv_push(L, LV_U64)->val.u64 = q[0]; lua_setfield(L, -2, "Low");
+                lv_push(L, LV_U64)->val.u64 = q[1]; lua_setfield(L, -2, "High");
                 break;
             }
             }
@@ -1136,7 +1173,8 @@ static int do_context(lua_State *L, SessionState *st, int base)
 
     /* setter：只写表里出现的键（`nil` = 不改；**未知键按 `SetContext` 的既有口径忽略**）；
      * 值不是数字/地址（M128 不是 {Low, High}）⇒ 指名报错，**一个字节都不写**（不写半套）。
-     * ❗读与写用**同一套**列：UPTR 收 number 也收 LuaVariant（`arg_num_or_lv`），其余只收数字。 */
+     * ❗读与写用**同一套**列：每个字段**继续两种都收**（number 与 LuaVariant），M128 的
+     *   `Low`/`High` 也一样 —— 部分更新是老脚本的常见写法，不能因为读侧变成变体就把写侧收紧。 */
     for (size_t i = 0; i < count; i++)
     {
         lua_getfield(L, base + 1, fields[i].name);
@@ -2219,6 +2257,27 @@ static int session_threads(lua_State *L)
     return do_threads(L, st);
 }
 
+/* `d:v(addr)` —— **会话绑定**的 `Var`（T7 切片 C1d）。
+ * 与 29 名里的 `V()` 的区别只有一个：用哪个引擎。`V()` 靠回调上下文（顶层/REPL 根本没有答案，
+ * 直接报固定错误）；这里靠**自己绑定的那个会话**，所以它不受「当前会话」影响、也不需要 `SessionScope`。
+ * `addr` 收 number 也收 LuaVariant（`arg_num_or_lv`）；解引用（`[...]` / `:to` / `:write` …）
+ * 全在 `bindings.cpp` 的 `Var` 方法里，走的都是这个会话。
+ * ❗**代理（`dbg.remote`）暂不支持**：`Var` 载荷带本机引擎指针，过不了线（`lualib/dbglib.lua`
+ *   的 `SESSION_METHODS` 是白名单，`v` 不在里面 ⇒ 代理上调用会得到 unknown method）。 */
+static int session_v(lua_State *L)
+{
+    SessionState *st = self(L);
+    if (!st) return fail(L, kErrNoSess);
+    if (!st->started) return fail(L, kErrNoSess);
+
+    uint64_t a64 = 0;
+    if (!arg_num_or_lv(L, 2, &a64)) return fail(L, "d:v: addr (number or LuaVariant) expected");
+    if (!a64) return fail(L, "d:v: addr must be positive");
+
+    push_bound_var(L, (size_t)a64, st->sess);
+    return 1;
+}
+
 static int session_detach(lua_State *L)
 {
     SessionState *st = self(L);
@@ -2236,7 +2295,7 @@ static int session_kill(lua_State *L)
 /* 每个执行建一份的方法表（`__index` 落到它上面；`detach` 按平台能力装） */
 static void push_methods(lua_State *L, bool has_detach)
 {
-    lua_createtable(L, 0, 24);
+    lua_createtable(L, 0, 25);
     lua_pushcfunction(L, session_pump);    lua_setfield(L, -2, "pump");
     lua_pushcfunction(L, session_cont);    lua_setfield(L, -2, "cont");
     lua_pushcfunction(L, session_step);    lua_setfield(L, -2, "step");
@@ -2261,6 +2320,7 @@ static void push_methods(lua_State *L, bool has_detach)
     lua_pushcfunction(L, session_stack);    lua_setfield(L, -2, "stack");
     lua_pushcfunction(L, session_mods);     lua_setfield(L, -2, "mods");
     lua_pushcfunction(L, session_threads);  lua_setfield(L, -2, "threads");
+    lua_pushcfunction(L, session_v);        lua_setfield(L, -2, "v");   /* C1d：会话绑定的 Var */
     if (has_detach) { lua_pushcfunction(L, session_detach); lua_setfield(L, -2, "detach"); }
     lua_pushcfunction(L, session_kill);    lua_setfield(L, -2, "kill");
 }
@@ -2276,6 +2336,38 @@ static void push_handle_table(lua_State *L)
 }
 
 } /* anonymous namespace */
+
+/* ---------------- 回调上下文（T7 切片 C1d）：置位/还原与三个查询 ----------------
+ * 置位点：`call_user`（`dbg` 会话的回调派发）与 `bindings.cpp` 的每个 `lua_on_*`
+ * （`Run`/`Attach` 的回调派发）。都用栈上 RAII 包住 `lua_pcall` —— **回调的可见签名不变**。 */
+CallbackScope::CallbackScope(core::DebuggerSession *sess, DWORD pid) noexcept
+    : prev_sess(g_cb_sess), prev_pid(g_cb_pid)
+{
+    g_cb_sess = sess;
+    g_cb_pid  = pid;
+}
+
+CallbackScope::~CallbackScope() noexcept
+{
+    g_cb_sess = prev_sess;
+    g_cb_pid  = prev_pid;
+}
+
+bool cb_active() noexcept { return g_cb_sess != nullptr; }
+
+core::DebuggerSession *cb_session() noexcept { return g_cb_sess; }
+
+DWORD cb_pid() noexcept { return g_cb_pid; }
+
+bool dbg_session_alive(const core::DebuggerSession *sess) noexcept
+{
+    if (sess == nullptr) return false;
+    for (SessionState *st = g_sessions; st; st = st->next)
+    {
+        if (st->sess == sess && st->started) return true;
+    }
+    return false;
+}
 
 const char *dbg_error_reentry() noexcept { return kErrReentry; }
 const char *dbg_error_paused()  noexcept { return kErrPaused; }

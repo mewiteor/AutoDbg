@@ -31,8 +31,11 @@ int my_loadfile(lua_State *L, LPCTSTR path);
 int lua_reset_dir(lua_State *L);
 
 /* 建状态 → 注册 → 烘焙库（与 run_script_file 前半段逐字一致；S0 的 server/exec 用）
- * 返回 nullptr = `luaL_newstate()` 失败。 */
-lua_State *create_state_with_libs(void);
+ * 返回 nullptr = `luaL_newstate()` 失败。
+ * `repl = true`：**REPL 口径** —— 不注册全局 `V`（T7 切片 C1d：`V()` 只在调试回调里可用，
+ *   而 REPL 是一条条敲语句的地方，留着只会让人以为它在顶层能用；`d:v(addr)` 才是那边的入口）。
+ *   其余全局（含 `Var` 元表）一模一样。 */
+lua_State *create_state_with_libs(bool repl = false);
 
 /* pcall 的返回值 → JSON 片段（T1/D50 的口径，`--json` 信封与协议 `result` 帧的 `value`
  * **共用这一份**，不写第二套）：`base` = 函数 push 之前的栈顶。

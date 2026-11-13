@@ -290,13 +290,13 @@ const char *encode_returns(lua_State *L, int base)
  * **内存里的源码**（不落盘，D26），但状态初始化必须与文件路径完全相同，
  * 否则全局库/注册表会分叉。返回 nullptr = `luaL_newstate()` 失败。
  * ========================================================================== */
-lua_State *create_state_with_libs(void)
+lua_State *create_state_with_libs(bool repl)
 {
     lua_State *L = luaL_newstate();
     if (L == nullptr)
         return nullptr;
     luaL_openlibs(L);
-    register_lua_api(L); /* P4.2：注册表已搬到 registry.cpp（含 Var / FindMemoryContext 元表与 lv_init） */
+    register_lua_api(L, repl); /* P4.2：注册表已搬到 registry.cpp（含 Var / FindMemoryContext 元表与 lv_init） */
 
     for (size_t i = 0; i < all_bytecodes_count; i++)
     {

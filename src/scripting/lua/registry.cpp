@@ -60,7 +60,7 @@ int lua_autodbg_info(lua_State *L)
 }
 } /* namespace */
 
-void register_lua_api(lua_State *L)
+void register_lua_api(lua_State *L, bool repl)
 {
     lua_register(L, "Run", lua_run);
     lua_register(L, "Attach", lua_attach);
@@ -73,7 +73,10 @@ void register_lua_api(lua_State *L)
     lua_register(L, "DelHardwareBreakpoint", lua_del_hardware_breakpoint);
     lua_register(L, "ReadMemory", lua_read_memory);
     lua_register(L, "WriteMemory", lua_write_memory);
-    lua_register(L, "V", lua_v);
+    /* T7 切片 C1d：`V()` 只在**调试回调**里可用（顶层/REPL 没有「当前会话」这个答案）。
+     * REPL 里干脆不注册：人对着提示符敲 `V` 时，`nil` 比一条固定错误更诚实；脚本里保留它
+     * （29 名冻结），顶层调用得到 `nil, "<固定文案>"`。 */
+    if (!repl) lua_register(L, "V", lua_v);
     lua_register(L, "GetContext", lua_get_context);
     lua_register(L, "SetContext", lua_set_context);
     lua_register(L, "Ea2ModnameRva", lua_ea2_modname_rva);

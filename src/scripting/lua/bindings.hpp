@@ -58,4 +58,13 @@ int lua_var_write(lua_State *L);
 int lua_var_writes(lua_State *L);
 int lua_write_memory(lua_State *L);
 
+/* T7 切片 C1d：`Var` 的载荷是 `{ base, DebuggerSession* }` —— 本入口造一个**会话绑定**的 Var
+ * （`d:v(addr)` 用它）。`sess == nullptr` 只在 `V()` 里出现（那时规则是「仅回调上下文可用」）。
+ * 载荷的形状与解引用规则归 `bindings.cpp`（唯一真相源），`dbg_bindings.cpp` 只负责传指针。 */
+namespace autodbg::core
+{
+class DebuggerSession;
+}
+void push_bound_var(lua_State *L, size_t base, autodbg::core::DebuggerSession *sess);
+
 #endif /* AUTODBG_SCRIPTING_LUA_BINDINGS_HPP */

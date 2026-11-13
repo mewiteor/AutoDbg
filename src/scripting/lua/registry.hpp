@@ -8,6 +8,10 @@
  * ========================================================================== */
 #include <lua.hpp>
 
-void register_lua_api(lua_State *L);
+/* 注册「脚本能看到的东西」。
+ * `repl = true`：REPL 口径 —— **不注册全局 `V`**（T7 切片 C1d：`V()` 只在调试回调里可用，
+ *   顶层/REPL 里它只会报固定错误；`Var` 元表与 `d:v(addr)` 照旧在）。其余 28 个契约名、
+ *   `gui` / `dbg` / `help` / `open_file` / `_autodbg_info` 一模一样。 */
+void register_lua_api(lua_State *L, bool repl = false);
 
 #endif /* AUTODBG_SCRIPTING_LUA_REGISTRY_HPP */

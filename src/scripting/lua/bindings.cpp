@@ -74,6 +74,12 @@ using autodbg::common::unique_handle; /* P6.1 */
 using autodbg::scripting::lua::get_lua_str;
 using autodbg::scripting::lua::lua_type_error;
 using autodbg::scripting::lua::str2integer;
+/* T7 切片 C1d：`V()` / `Var:*` 的会话来源与地址类实参的两种收法（实现都在 dbg_bindings.cpp）。 */
+using autodbg::host::arg_num_or_lv;
+using autodbg::host::CallbackScope;
+using autodbg::host::cb_active;
+using autodbg::host::cb_session;
+using autodbg::host::dbg_session_alive;
 
 /* P6.4：引擎函数已从「全局自由函数」改成 `autodbg::core` 里的会话成员（各模块头保留了同名转发）→
  * 这里用选择性 using 保持调用点可读。
@@ -636,6 +642,9 @@ struct LuaDebugAdapter
 static void lua_on_any_debug_event(void *ctx, const core::DebugEvent &ev)
 {
     LuaDebugAdapter *a = (LuaDebugAdapter *)ctx;
+    /* C1d：回调上下文 —— 引擎正在跑用户回调，`V()` / `Var:*` 靠它取会话。
+     * run 这条路径上「会话」就是宿主挂的当前会话（与 `S()` 同源，但允许还没挂）。 */
+    CallbackScope cbctx(autodbg::core::current_session_or_null(), ev.pid);
     if (a->on_any_debug_event == LUA_NOREF)
         return;
     int n = pcall_pre(a->L);
@@ -655,6 +664,9 @@ static void lua_on_any_debug_event(void *ctx, const core::DebugEvent &ev)
 static void lua_on_exception(void *ctx, const core::ExceptionEvent &ev)
 {
     LuaDebugAdapter *a = (LuaDebugAdapter *)ctx;
+    /* C1d：回调上下文 —— 引擎正在跑用户回调，`V()` / `Var:*` 靠它取会话。
+     * run 这条路径上「会话」就是宿主挂的当前会话（与 `S()` 同源，但允许还没挂）。 */
+    CallbackScope cbctx(autodbg::core::current_session_or_null(), ev.pid);
     if (a->on_exception == LUA_NOREF)
         return;
     int n = pcall_pre(a->L);
@@ -676,6 +688,9 @@ static void lua_on_exception(void *ctx, const core::ExceptionEvent &ev)
 static void lua_on_breakpoint(void *ctx, const core::BreakpointEvent &ev)
 {
     LuaDebugAdapter *a = (LuaDebugAdapter *)ctx;
+    /* C1d：回调上下文 —— 引擎正在跑用户回调，`V()` / `Var:*` 靠它取会话。
+     * run 这条路径上「会话」就是宿主挂的当前会话（与 `S()` 同源，但允许还没挂）。 */
+    CallbackScope cbctx(autodbg::core::current_session_or_null(), ev.pid);
     if (a->on_breakpoint == LUA_NOREF)
         return;
     int n = pcall_pre(a->L);
@@ -696,6 +711,9 @@ static void lua_on_breakpoint(void *ctx, const core::BreakpointEvent &ev)
 static void lua_on_first_breakpoint(void *ctx, const core::FirstBreakpointEvent &ev)
 {
     LuaDebugAdapter *a = (LuaDebugAdapter *)ctx;
+    /* C1d：回调上下文 —— 引擎正在跑用户回调，`V()` / `Var:*` 靠它取会话。
+     * run 这条路径上「会话」就是宿主挂的当前会话（与 `S()` 同源，但允许还没挂）。 */
+    CallbackScope cbctx(autodbg::core::current_session_or_null(), ev.pid);
     if (a->callback == LUA_NOREF)
         return;
     int n = pcall_pre(a->L);
@@ -710,6 +728,9 @@ static void lua_on_first_breakpoint(void *ctx, const core::FirstBreakpointEvent 
 static void lua_on_single_step(void *ctx, const core::StepEvent &ev)
 {
     LuaDebugAdapter *a = (LuaDebugAdapter *)ctx;
+    /* C1d：回调上下文 —— 引擎正在跑用户回调，`V()` / `Var:*` 靠它取会话。
+     * run 这条路径上「会话」就是宿主挂的当前会话（与 `S()` 同源，但允许还没挂）。 */
+    CallbackScope cbctx(autodbg::core::current_session_or_null(), ev.pid);
     if (a->on_single_step == LUA_NOREF)
         return;
     int n = pcall_pre(a->L);
@@ -731,6 +752,9 @@ static void lua_on_single_step(void *ctx, const core::StepEvent &ev)
 static void lua_on_breakpoint_callback(void *ctx, const core::BreakpointCallbackEvent &ev)
 {
     LuaDebugAdapter *a        = (LuaDebugAdapter *)ctx;
+    /* C1d：回调上下文 —— 引擎正在跑用户回调，`V()` / `Var:*` 靠它取会话。
+     * run 这条路径上「会话」就是宿主挂的当前会话（与 `S()` 同源，但允许还没挂）。 */
+    CallbackScope cbctx(autodbg::core::current_session_or_null(), ev.pid);
     int              callback = token_ref(ev.callback);
     if (callback == LUA_NOREF)
         return;
@@ -765,6 +789,9 @@ static void lua_on_breakpoint_callback(void *ctx, const core::BreakpointCallback
 static void lua_on_hw_breakpoint_callback(void *ctx, const core::HwBreakpointCallbackEvent &ev)
 {
     LuaDebugAdapter *a        = (LuaDebugAdapter *)ctx;
+    /* C1d：回调上下文 —— 引擎正在跑用户回调，`V()` / `Var:*` 靠它取会话。
+     * run 这条路径上「会话」就是宿主挂的当前会话（与 `S()` 同源，但允许还没挂）。 */
+    CallbackScope cbctx(autodbg::core::current_session_or_null(), ev.pid);
     int              callback = token_ref(ev.callback);
     if (callback == LUA_NOREF)
         return;
@@ -789,6 +816,9 @@ static void lua_on_hw_breakpoint_callback(void *ctx, const core::HwBreakpointCal
 static void lua_on_user_exception(void *ctx, const core::UserExceptionEvent &ev)
 {
     LuaDebugAdapter *a = (LuaDebugAdapter *)ctx;
+    /* C1d：回调上下文 —— 引擎正在跑用户回调，`V()` / `Var:*` 靠它取会话。
+     * run 这条路径上「会话」就是宿主挂的当前会话（与 `S()` 同源，但允许还没挂）。 */
+    CallbackScope cbctx(autodbg::core::current_session_or_null(), ev.pid);
     if (a->exception_callback == LUA_NOREF)
         return;
     int n = pcall_pre(a->L);
@@ -814,6 +844,9 @@ static void lua_on_user_exception(void *ctx, const core::UserExceptionEvent &ev)
 static void lua_on_create_thread(void *ctx, const core::ThreadEvent &ev)
 {
     LuaDebugAdapter *a = (LuaDebugAdapter *)ctx;
+    /* C1d：回调上下文 —— 引擎正在跑用户回调，`V()` / `Var:*` 靠它取会话。
+     * run 这条路径上「会话」就是宿主挂的当前会话（与 `S()` 同源，但允许还没挂）。 */
+    CallbackScope cbctx(autodbg::core::current_session_or_null(), ev.pid);
     if (a->on_create_thread == LUA_NOREF)
         return;
     int n = pcall_pre(a->L);
@@ -833,6 +866,9 @@ static void lua_on_create_thread(void *ctx, const core::ThreadEvent &ev)
 static void lua_on_create_process(void *ctx, const core::ProcessEvent &ev)
 {
     LuaDebugAdapter *a = (LuaDebugAdapter *)ctx;
+    /* C1d：回调上下文 —— 引擎正在跑用户回调，`V()` / `Var:*` 靠它取会话。
+     * run 这条路径上「会话」就是宿主挂的当前会话（与 `S()` 同源，但允许还没挂）。 */
+    CallbackScope cbctx(autodbg::core::current_session_or_null(), ev.pid);
     if (a->on_create_process == LUA_NOREF)
         return;
     int n = pcall_pre(a->L);
@@ -862,6 +898,9 @@ static void lua_on_create_process(void *ctx, const core::ProcessEvent &ev)
 static void lua_on_exit_thread(void *ctx, const core::ExitEvent &ev)
 {
     LuaDebugAdapter *a = (LuaDebugAdapter *)ctx;
+    /* C1d：回调上下文 —— 引擎正在跑用户回调，`V()` / `Var:*` 靠它取会话。
+     * run 这条路径上「会话」就是宿主挂的当前会话（与 `S()` 同源，但允许还没挂）。 */
+    CallbackScope cbctx(autodbg::core::current_session_or_null(), ev.pid);
     if (a->on_exit_thread == LUA_NOREF)
         return;
     int n = pcall_pre(a->L);
@@ -881,6 +920,9 @@ static void lua_on_exit_thread(void *ctx, const core::ExitEvent &ev)
 static void lua_on_exit_process(void *ctx, const core::ExitEvent &ev)
 {
     LuaDebugAdapter *a = (LuaDebugAdapter *)ctx;
+    /* C1d：回调上下文 —— 引擎正在跑用户回调，`V()` / `Var:*` 靠它取会话。
+     * run 这条路径上「会话」就是宿主挂的当前会话（与 `S()` 同源，但允许还没挂）。 */
+    CallbackScope cbctx(autodbg::core::current_session_or_null(), ev.pid);
     if (a->on_exit_process == LUA_NOREF)
         return;
     int n = pcall_pre(a->L);
@@ -900,6 +942,9 @@ static void lua_on_exit_process(void *ctx, const core::ExitEvent &ev)
 static void lua_on_load_dll(void *ctx, const core::DllEvent &ev)
 {
     LuaDebugAdapter *a = (LuaDebugAdapter *)ctx;
+    /* C1d：回调上下文 —— 引擎正在跑用户回调，`V()` / `Var:*` 靠它取会话。
+     * run 这条路径上「会话」就是宿主挂的当前会话（与 `S()` 同源，但允许还没挂）。 */
+    CallbackScope cbctx(autodbg::core::current_session_or_null(), ev.pid);
     if (a->on_load_dll == LUA_NOREF)
         return;
     int n = pcall_pre(a->L);
@@ -926,6 +971,9 @@ static void lua_on_load_dll(void *ctx, const core::DllEvent &ev)
 static void lua_on_unload_dll(void *ctx, const core::DllEvent &ev)
 {
     LuaDebugAdapter *a = (LuaDebugAdapter *)ctx;
+    /* C1d：回调上下文 —— 引擎正在跑用户回调，`V()` / `Var:*` 靠它取会话。
+     * run 这条路径上「会话」就是宿主挂的当前会话（与 `S()` 同源，但允许还没挂）。 */
+    CallbackScope cbctx(autodbg::core::current_session_or_null(), ev.pid);
     if (a->on_unload_dll == LUA_NOREF)
         return;
     int n = pcall_pre(a->L);
@@ -946,6 +994,9 @@ static void lua_on_unload_dll(void *ctx, const core::DllEvent &ev)
 static void lua_on_output_debug_string(void *ctx, const core::OutputDebugStringEvent &ev)
 {
     LuaDebugAdapter *a = (LuaDebugAdapter *)ctx;
+    /* C1d：回调上下文 —— 引擎正在跑用户回调，`V()` / `Var:*` 靠它取会话。
+     * run 这条路径上「会话」就是宿主挂的当前会话（与 `S()` 同源，但允许还没挂）。 */
+    CallbackScope cbctx(autodbg::core::current_session_or_null(), ev.pid);
     if (a->on_output_debug_string == LUA_NOREF)
         return;
     int n = pcall_pre(a->L);
@@ -981,6 +1032,9 @@ static void lua_on_output_debug_string(void *ctx, const core::OutputDebugStringE
 static void lua_on_rip(void *ctx, const core::DebugEvent &ev)
 {
     LuaDebugAdapter *a = (LuaDebugAdapter *)ctx;
+    /* C1d：回调上下文 —— 引擎正在跑用户回调，`V()` / `Var:*` 靠它取会话。
+     * run 这条路径上「会话」就是宿主挂的当前会话（与 `S()` 同源，但允许还没挂）。 */
+    CallbackScope cbctx(autodbg::core::current_session_or_null(), ev.pid);
     if (a->on_rip == LUA_NOREF)
         return;
     int n = pcall_pre(a->L);
@@ -1385,6 +1439,9 @@ static int CheckConsoleInput(struct lua_State *L, int on_console_event, bool can
             {
                 if (on_console_event != LUA_NOREF && num_events > 0)
                 {
+                    /* C1d：这也是一个用户回调（`on_console_event`，在 `on_wait_timeout` 里被调）。
+                     * 没有 pid 可报（控制台事件不挂在目标进程上）⇒ pid = 0。 */
+                    CallbackScope cbctx(autodbg::core::current_session_or_null(), 0);
                     int n = pcall_pre(L);
                     lua_rawgeti(L, LUA_REGISTRYINDEX, on_console_event);
                     luaL_checktype(L, -1, LUA_TFUNCTION);
@@ -1883,26 +1940,94 @@ int lua_force_kill(lua_State *L)
     return 0;
 }
 
-static void V(lua_State *L, size_t data)
+/* ---------------- `Var` 的载荷（T7 切片 C1d） ----------------
+ *
+ * 载荷 = `{ base, sess }`：
+ *   · `base` 是地址（`Var` 的所有方法都以它为起点）；
+ *   · `sess` 是**用哪个引擎去读写**。两个构造者就是两条路径：
+ *       `V(addr)`    —— 29 名里的老名字，**只在调试回调里可用**（`sess = nullptr` 就是
+ *                       「按回调上下文现取」，那个上下文是 `CallbackScope` 置的）；
+ *       `d:v(addr)`  —— 会话方法，`sess` = 该会话的引擎，不受「当前会话」影响。
+ *
+ * 为什么要消灭「猜当前会话」：C2a 起每个 `dbg` 会话自带引擎，而 `current_session()` 只是
+ *   「最近一次 create/attach」的代理 ⇒ 顶层调 `V()` 读到的可能是宿主会话、也可能是别的会话，
+ *   取决于脚本此前干过什么。回调上下文里没有这个歧义（引擎正在跑这个脚本的会话）；
+ *   顶层/REPL 里**根本没有答案** ⇒ 报固定文案，让人改用 `d:v(addr)` / `d:read*` / `d:write`。
+ * 这是本切片对 29 名唯一的改动（只有 `V` 的行为变了，其余一个字节不动）：
+ *   `V(addr)` 的参数也从「只吃 LuaVariant」宽到 number 与 LuaVariant 都收（与 `d:v` 同一套）。 */
+const char *const kVarNoCallback =
+    "V() is only usable inside a debug callback; use d:v(addr) or d:read*/d:write instead";
+/* `d:v` 绑定的会话已经收尾（detach/kill）之后再用同一个 Var ⇒ 报这个，而不是对已释放的引擎读写。 */
+const char *const kVarSessClosed = "Var: the session bound by d:v() is closed (detach/kill)";
+
+struct VarPayload
 {
-    lua_newuserdata(L, sizeof(size_t));
-    __movsb((BYTE *)lua_touserdata(L, -1), (const BYTE *)&data, sizeof(size_t));
+    size_t                 base;
+    core::DebuggerSession *sess;   /* nullptr ⇒ 仅回调上下文可用（V() 的产物） */
+};
+
+/* 造一个 Var（`d:v` 与 V() 共用；载荷的解读规则只在下面三个 helper 里）。 */
+void push_bound_var(lua_State *L, size_t base, core::DebuggerSession *sess)
+{
+    VarPayload *p = (VarPayload *)lua_newuserdata(L, sizeof(VarPayload));
+    p->base       = base;
+    p->sess       = sess;
     luaL_getmetatable(L, "Var");
     lua_setmetatable(L, -2);
+}
+
+/* `Var` 方法的统一入口：取载荷（参数错照旧由 `luaL_checkudata` 抛）。 */
+static void var_payload(lua_State *L, int idx, size_t *base, core::DebuggerSession **sess)
+{
+    VarPayload *p = (VarPayload *)luaL_checkudata(L, idx, "Var");
+    *base         = p->base;
+    *sess         = p->sess;
+}
+
+/* 这个 Var 当前该用哪个引擎：显式绑定的会话 → 回调上下文 → 都没有就报错（固定文案）。
+ * ❗不去问 `current_session()`：那正是本切片要消灭的那一层歧义。 */
+static core::DebuggerSession *var_session(lua_State *L, core::DebuggerSession *sess)
+{
+    if (sess != nullptr)
+    {
+        if (dbg_session_alive(sess)) return sess;
+        lua_pushstring(L, kVarSessClosed);
+        lua_error(L);
+        return nullptr;   /* 不可达：lua_error 是长跳 */
+    }
+    if (cb_active()) return cb_session();
+    lua_pushstring(L, kVarNoCallback);
+    lua_error(L);
+    return nullptr;
 }
 
 /* M.Var implementation */
 int lua_v(lua_State *L)
 {
-    V(L, lv_check(L, 1, LV_UZ)->val.uz);
+    /* C1d：`V()` 只在**回调上下文**里可用 —— 顶层/REPL 里没有「当前会话」这个答案，不猜，报错。
+     * ❗返回值是值（`nil, msg`）而不是 error：顶层那句最自然的探测 `local v, e = V(addr)` 能直接看到原因。 */
+    uint64_t addr = 0;
+    if (!arg_num_or_lv(L, 1, &addr))
+    {
+        lua_pushstring(L, "V(addr: number or LuaVariant): Var");
+        return lua_error(L);
+    }
+    if (!cb_active())
+    {
+        lua_pushnil(L);
+        lua_pushstring(L, kVarNoCallback);
+        return 2;
+    }
+    push_bound_var(L, (size_t)addr, nullptr);
     return 1;
 }
 
 int lua_var_index(lua_State *L)
 {
     /* 获取self和key */
-    void  *ud   = luaL_checkudata(L, 1, "Var");
-    size_t base = *(size_t *)ud;
+    size_t                 base = 0;
+    core::DebuggerSession *sess = nullptr;
+    var_payload(L, 1, &base, &sess);
 
     size_t addr = 0;
     if (lua_type(L, 2) == LUA_TUSERDATA)
@@ -1921,10 +2046,11 @@ int lua_var_index(lua_State *L)
         addr = base + (SSIZE_T)lua_tointeger(L, 2);
     if (addr)
     {
-        /* 读取指针大小的数据 */
-        size_t ptr_value;
-        if (S().read(addr, &ptr_value, sizeof(size_t)))
-            V(L, ptr_value);
+        /* 读取指针大小的数据（用**本 Var 的**引擎；指针追下去得到的还是同一个 Var） */
+        core::DebuggerSession *eng = var_session(L, sess);
+        size_t                 ptr_value;
+        if (eng->read(addr, &ptr_value, sizeof(size_t)))
+            push_bound_var(L, ptr_value, sess);
         else
             lua_pushnil(L);
         return 1;
@@ -1945,8 +2071,9 @@ int lua_var_index(lua_State *L)
 int lua_var_off(lua_State *L)
 {
     /* 获取self和key */
-    void  *ud   = luaL_checkudata(L, 1, "Var");
-    size_t base = *(size_t *)ud;
+    size_t                 base = 0;
+    core::DebuggerSession *sess = nullptr;
+    var_payload(L, 1, &base, &sess);
     if (!base)
     {
         lua_pushnil(L);
@@ -1968,14 +2095,15 @@ int lua_var_off(lua_State *L)
     }
     else if (lua_type(L, 2) == LUA_TNUMBER)
         addr = base + (SSIZE_T)lua_tointeger(L, 2);
-    V(L, addr);
+    push_bound_var(L, addr, sess);   /* 派生 Var 继续用同一个引擎（`d:v` 的绑定不会在链条里丢掉） */
     return 1;
 }
 
 int lua_var_to(lua_State *L)
 {
-    void  *ud   = luaL_checkudata(L, 1, "Var");
-    size_t base = *(size_t *)ud;
+    size_t                 base = 0;
+    core::DebuggerSession *sess = nullptr;
+    var_payload(L, 1, &base, &sess);
     if (!base)
         return 0;
 
@@ -2056,9 +2184,10 @@ int lua_var_to(lua_State *L)
     default: lua_pushliteral(L, "不支持的类型"); return lua_error(L);
     }
 
-    struct LuaVariant *lv = lv_push(L, type);
+    core::DebuggerSession *eng = var_session(L, sess);   /* 用本 Var 的引擎（不是 current_session） */
+    struct LuaVariant      *lv  = lv_push(L, type);
 
-    if (!S().read(addr, lv->buf, type_size))
+    if (!eng->read(addr, lv->buf, type_size))
     {
         lua_pop(L, 1);
         luaL_traceback(L, L, NULL, 1);
@@ -2075,8 +2204,9 @@ int lua_var_to(lua_State *L)
 
 int lua_var_tos(lua_State *L)
 {
-    void  *ud   = luaL_checkudata(L, 1, "Var");
-    size_t base = *(size_t *)ud;
+    size_t                 base = 0;
+    core::DebuggerSession *sess = nullptr;
+    var_payload(L, 1, &base, &sess);
     if (!base)
         return 0;
 
@@ -2168,6 +2298,9 @@ int lua_var_tos(lua_State *L)
     default : lua_pushliteral(L, "不支持的类型"); return lua_error(L);
     }
 
+    /* 引擎在 alloc 之前解析：`var_session` 报错走的是 `lua_error`（长跳），不能让它跳过 `free_` */
+    core::DebuggerSession *eng = var_session(L, sess);
+
     size_t total_size = type_size * count;
     void  *buffer     = alloc_(total_size);
     if (!buffer)
@@ -2176,7 +2309,7 @@ int lua_var_tos(lua_State *L)
         return lua_error(L);
     }
 
-    if (!S().read(addr, buffer, total_size))
+    if (!eng->read(addr, buffer, total_size))
     {
         free_(buffer);
 
@@ -2218,8 +2351,9 @@ int lua_var_tos(lua_State *L)
 
 int lua_var_sto(lua_State *L)
 {
-    void  *ud   = luaL_checkudata(L, 1, "Var");
-    size_t base = *(size_t *)ud;
+    size_t                 base = 0;
+    core::DebuggerSession *sess = nullptr;
+    var_payload(L, 1, &base, &sess);
     if (!base)
         return 0;
 
@@ -2305,6 +2439,9 @@ int lua_var_sto(lua_State *L)
     default : lua_pushliteral(L, "不支持的类型"); return lua_error(L);
     }
 
+    /* 引擎在 alloc 之前解析：`var_session` 报错走的是 `lua_error`（长跳），不能让它跳过 `free_` */
+    core::DebuggerSession *eng = var_session(L, sess);
+
     size_t total_size = type_size * count;
     void  *buffer     = alloc_(total_size);
     if (!buffer)
@@ -2313,7 +2450,7 @@ int lua_var_sto(lua_State *L)
         return lua_error(L);
     }
 
-    if (!S().read(addr, buffer, total_size))
+    if (!eng->read(addr, buffer, total_size))
     {
         free_(buffer);
 
@@ -2371,8 +2508,9 @@ int lua_var_sto(lua_State *L)
 
 int lua_var_write(lua_State *L)
 {
-    void  *ud   = luaL_checkudata(L, 1, "Var");
-    size_t base = *(size_t *)ud;
+    size_t                 base = 0;
+    core::DebuggerSession *sess = nullptr;
+    var_payload(L, 1, &base, &sess);
     if (!base)
         return 0;
 
@@ -2415,7 +2553,7 @@ int lua_var_write(lua_State *L)
         return lua_error(L);
     }
 
-    if (!S().write(addr, lv_val->buf, type_size, false))
+    if (!var_session(L, sess)->write(addr, lv_val->buf, type_size, false))
     {
         luaL_traceback(L, L, NULL, 1);
         size_t n;
@@ -2430,8 +2568,9 @@ int lua_var_write(lua_State *L)
 
 int lua_var_writes(lua_State *L)
 {
-    void  *ud   = luaL_checkudata(L, 1, "Var");
-    size_t base = *(size_t *)ud;
+    size_t                 base = 0;
+    core::DebuggerSession *sess = nullptr;
+    var_payload(L, 1, &base, &sess);
     if (!base)
         return 0;
 
@@ -2479,6 +2618,8 @@ int lua_var_writes(lua_State *L)
     else if (lua_type(L, 3) == LUA_TNUMBER)
         addr += (SSIZE_T)lua_tointeger(L, 3);
 
+    core::DebuggerSession *eng = var_session(L, sess);   /* 同 `tos`：alloc 之前解析 */
+
     char *buf = (char *)alloc_(allsize);
     char *p   = buf;
     for (int i = 1; i <= (int)n; i++)
@@ -2498,7 +2639,7 @@ int lua_var_writes(lua_State *L)
         p += size;
     }
 
-    bool b = S().write(addr, buf, allsize, false);
+    bool b = eng->write(addr, buf, allsize, false);
     free_(buf);
 
     if (!b)
@@ -2516,8 +2657,9 @@ int lua_var_writes(lua_State *L)
 
 int lua_var_swrite(lua_State *L)
 {
-    void  *ud   = luaL_checkudata(L, 1, "Var");
-    size_t base = *(size_t *)ud;
+    size_t                 base = 0;
+    core::DebuggerSession *sess = nullptr;
+    var_payload(L, 1, &base, &sess);
     if (!base)
         return 0;
 
@@ -2549,7 +2691,7 @@ int lua_var_swrite(lua_State *L)
     else if (lua_type(L, 3) == LUA_TNUMBER)
         addr += (SSIZE_T)lua_tointeger(L, 3);
 
-    if (!S().write(addr, val, n, false))
+    if (!var_session(L, sess)->write(addr, val, n, false))
     {
         luaL_traceback(L, L, NULL, 1);
         size_t n;

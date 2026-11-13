@@ -8,7 +8,7 @@
 # 用法：pwsh -File tools/server_test/e2e_repl.ps1 [-Render 64|86] [-Variant ''|modern|legacy]
 # 退出码：0 = 全过；1 = 有失败；2 = 前置缺失（产物不存在 / x64+legacy 组合）
 #
-# 覆盖（10 条，均为纯本地）：
+# 覆盖（11 条，均为纯本地）：
 #   repl.stdin-piped          `print(1+1)` → stdout 有 `2`、退出码 0、**stdout 里零提示符**
 #                             （管道下打提示符会污染所有人的输出比对，§4 第 4 条）
 #   repl.multi-line           `for i=1,2 do` / `print(i)` / `end` → `1` 与 `2`（§11.6 第 2 条）
@@ -26,6 +26,9 @@
 #                             `unclosed session` 与 `detaching`（D54 的安全网），退出码仍是 0；
 #                             且进程没漏（fixture 是 8 轮后自退的靶子）。只在 x86 跑（fixture 是
 #                             x86-only，`parse_pe` 按编译期 `_WIN64` 判位数）。
+#   repl.no-v                 **C1d**：REPL 里**不注册**全局 `V`（`V()` 只在调试回调里可用；
+#                             顶层/REPL 没有「当前会话」这个答案）⇒ `type(V)` 是 `nil`，
+#                             入口是会话绑定的 `d:v(addr)`。脚本路径仍保留 `V`（29 名冻结）。
 #
 # ❗喂 stdin 的两种写法都试过，这里用 **`Start-Process -RedirectStandardInput <file>`**：
 #   · 稳：退出码走 `$p.ExitCode`、stdout/stderr 各自落文件（与 `e2e_dbg.ps1` 的 `Run-Local`
@@ -197,6 +200,14 @@ else
             "code=$($r.code) out=[$($r.out)] err=[$($r.err)]"
     }
 }
+
+# ---------------------------------------------------------------- ⑪ REPL 不注册 `V`（C1d）
+# `V()` 只在**调试回调**里可用：顶层/REPL 里没有「当前会话」这个答案（C2a 起每个 dbg 会话自带
+# 引擎，`current_session()` 只是「最近一次 create/attach」的代理）⇒ REPL 里干脆不注册它，
+# 让人对提示符敲 `V` 时立刻看到 `nil`，而不是一条固定错误。会话里的入口是 `d:v(addr)`。
+$r = Run-Repl "=tostring(V) .. '/' .. type(V)`n"
+Check 'repl.no-v' ($r.code -eq 0 -and $r.out -match '(?m)^nil/nil\s*$') `
+    "REPL 里 V 必须不存在（type(V) == 'nil'）；code=$($r.code) out=[$($r.out)] err=[$($r.err)]"
 
 # ---------------------------------------------------------------- 汇总
 Write-Output ("repl e2e ({0}{1}): {2} passed, {3} failed" -f $Render, $(if ($Variant) { ", $Variant" } else { '' }), $script:pass, $script:fail)

@@ -188,6 +188,21 @@ const HelpEntry kHelp[] = {
         "dbg.caps() -> { arch, variant, flavor, win9x, attach, detach, hits_cap }\n"
         "布尔能力按**表成员**生成，所以「detach 在不在」的权威判据仍是 dbg.detach ~= nil。\n",
     },
+    {
+        "dbg.v",
+        "会话绑定的 Var（`V` 的按会话版）：解引用走**这个会话**的引擎",
+        "local v = d:v(addr)              -- addr 收 number 也收 LuaVariant（ev.ea + 4 之类）\n"
+        "v:to('I')                         -- 读 4 字节（V 的全部方法：to/tos/sto/write/writes/swrite/off/[]）\n"
+        "d:v(base + 0x10):write(U32(0))    -- 写：走的仍是 d 的引擎\n"
+        "\n"
+        "为什么需要它：`V(addr)` 只在**调试回调**里可用（回调里「用哪个引擎」有唯一答案）；\n"
+        "顶层/REPL 里没有这个答案，`V` 会报固定文案 —— 那时用 d:v(addr)（或 d:read* / d:write）。\n"
+        "REPL 里全局 `V` **根本不注册**，d:v 才是那边的入口。\n"
+        "`V(addr)` / `d:v(addr)` 产出的 Var 载荷里带着引擎指针，所以：\n"
+        "  · 只对**本地会话**有效（`--repl --server` 那条连接里同样本地，能用）；\n"
+        "  · `dbg.remote` 的代理**暂不支持** d:v（Var 过不了线，代理的方法白名单里没有 v）；\n"
+        "  · 会话收尾（detach/kill）之后再用同一个 Var ⇒ 报「session bound by d:v() is closed」。\n",
+    },
     {"dbg.help", "打印 dbg 这一节（等价于 help('dbg')）", nullptr},
     {
         "dbg.remote",
