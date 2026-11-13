@@ -107,6 +107,14 @@
 3. `--selftest` **归主 exe**（拍板）：与 `-h` / `--list` / `--version` 同侧，不触发落盘、不 handoff；判定本身是纯函数 `decide_handoff_action`（`src/common/handoff_decision.*`），4 条自测 `handoff.decision-*` → selftest **77**。
 4. `handoff.job-nested-fails-clean` 用 `Add-Type` P/Invoke 建 job 并把主 exe assign 进去（`CreateJobObject` / `AssignProcessToJobObject` 是 wxp+，本机可用）——已定。
 
+### (a) 的落地状态
+
+- **(a1) 已落地**：manifest entry 的 `kind`（`module`/`exec`）、`pack` 的 `--blob`/`--no-blob`、`payload` 的 `kind()`/`find_exec()`、`--list` 的 `kind=` 口径、`decide_handoff_action` 纯判定（selftest 73 → 77）、`make.bat` 的 pack 边与「`a` 不再构建」。
+- **(a2) 已落地**：`src/sys/pack/handoff.{hpp,cpp}`（单一 tmpdir 路径 + 内容一致不重写 + 被锁不清写 + 只读目录报错 + `CreateProcess`（引号口径 = `autodbg_split_cmdline_a/w` 的逆过程）+ job（`KILL_ON_JOB_CLOSE`，dynapi + 干净降级）+ 退出码透传 + env）、`src/common/base_dir.{hpp,cpp}`（纯函数 + selftest 4 条 = 81）、`launcher.cpp` 调用点（`--version` 的 arch 改按 host）、`src/scripting/lua/file_stream.cpp`（`open_file` 走 `base_dir()`）、门禁 `tools/boot_test/e2e_boot.ps1`。handoff 的报错口径与启动器一致（`--quiet` 只 stderr，否则 + `MessageBoxA`），所以门禁一律带 `--quiet`。
+- **拍板 A（门禁口径）**：排障/门禁开关 `--no-handoff`（只在启动器解析，不占 boot 字段，ABI 保持 5、proto 保持 2；判定多了一条规则 ⑤）。WOW64 四件做完之前，跑 32 位 fixture 的门禁在 64 位 host 上必须带它（`PITFALLS.md` M12）：`e2e_dbg` / `e2e_repl` 全程带，`e2e_tcp` 只在 server 那侧带（client 只送帧 ⇒ 顺带把进程边界测了一遍），`e2e_boot.ps1` 多一条 `handoff.no-handoff-switch` 直接断开关生效（14 → **15**）。
+- **切片顺序待定**：(c) 可能要先于 (b) —— 单一 exe 交付后，64 位 host 上执行的恒是 x64 半份，WOW64 四件没做完就调不了最常见的 32 位逆向目标，交付面功能上不完整；(b) 本身只剩改名与门禁路径口径，便宜。
+- **未做（属于 (b)）**：主 exe 改名 `AutoDbg.exe`（D63）——现在还产出 `AutoDbg_86.exe`；改名要一次改完（`make.bat` + `scan_dir.py` + 各 e2e 的 exe 路径 + nvim 的 PATH 查找（D39/D64）+ skill `references/cli.md`）。
+
 
 ---
 
@@ -131,7 +139,10 @@ list.blob-entry-kind             --list 能区分 module / exec
 boot.no-wow64-branch             98 上：dynapi 取不到 → 不 exec（这是 9x 唯一能覆盖的 handoff 断言）
 boot.is-x86                      主 exe 必须是 32 位 PE（便携性前提）
 handoff.non-exe-name             CreateProcess 按 PE 头判断、不看扩展名（若用 `.bin` 必须先实测）
+handoff.no-handoff-switch        本来会 handoff 的组合上，开关把执行留在 x86 半份（拍板 A，第 15 条）
 ```
+
+已落地（`e2e_boot.ps1`，15 条，modern 与 legacy 都过）：`handoff.cmdline-passthrough`、`handoff.exit-code`（0 / -1 / 2 / 3）、`handoff.no-stdout`、`handoff.identical-no-rewrite`、`handoff.job-kill-on-close`、`handoff.job-nested-fails-clean`、`handoff.no-dialog`（靠「无对话框也能跑」间接断）、`handoff.script-relative-base`（用 `open_file` 而不是 `io.open`，且 CWD 故意是另一个目录）、`handoff.ro-media`、`version.no-extract`、`version.parity.main-vs-exec`（只对 `--version` 实际报出的字段，proto 不在版本行里）、`list.blob-entry-kind`、`handoff.no-handoff-switch`、`boot.is-x86`。未落地：`boot.no-wow6-branch`（要 98 guest）、`handoff.non-exe-name`（归 (b)）。
 
 ---
 
@@ -146,7 +157,7 @@ handoff.non-exe-name             CreateProcess 按 PE 头判断、不看扩展�
 7. 落盘文件的复用口径：同一 build 串能否跨进程共享（两个主 exe 实例）→ 只读共享还是加锁。
 8. nvim 的 local mode（D39）PATH 查找要加「host 位宽」档；quickfix / 临时文件口径不变。
 9. `check_skill` 的 `references/cli.md` 要加一节「产物与位数 + 找不到 x64 半时的行为」（这是 CLI 口径下唯一对外契约文档）。
-10. 空窗期口径：WOW64 四件完成前，64 位 host 上跑 x64 产物调试 32 位目标必须**明确失败**（不是跑但结果错）→ 一条断言 `wow64.target-unsupported`。
+10. 空窗期口径：WOW64 四件完成前，64 位 host 上跑 x64 产物调试 32 位目标必须**明确失败**（不是跑但结果错）→ 一条断言 `wow64.target-unsupported`。门禁这一侧已按拍板 A 绕过去（跑 32 位 fixture 时带 `--no-handoff`，见 §5.5 与 `PITFALLS.md` M12）；`wow64.target-unsupported` 本身仍未实现，属 (c)。
 
 ---
 

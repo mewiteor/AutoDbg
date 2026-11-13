@@ -42,6 +42,7 @@
 | K10 | `GetVersionExA` 报 `C4996` | 该 API 被标记废弃 | 用 `#pragma warning(push/disable/pop)` 局部包住（本项目确实需要它区分 9x） |
 | K11 | `GetProcAddress` 取到的 Win32 API 一调就 `0xC0000005`（**只在 x86**，x64 正常） | 函数指针 typedef 没写 `WINAPI`（x86 上 Win32 导出是 **stdcall**）或**参数个数与真实 API 不一致** → 栈不平衡 | typedef 一律写成 `unsigned long (WINAPI *)(真实参数表)`，参数个数与 SDK 原型**逐个一致**（不能“多传一个没用到的”）；x64 只有一种调用约定，测不出来 |
 | K12 | legacy（ANSI）变体 `Run()` 随机 `0xC0000005`（同一脚本有时能跑完，**只在 `--variant=legacy` 上出现**，modern/x64 正常） | 拷 TCHAR 路径用了 `__movsw`（`CopyMem2` 的语义）：它按 **2 字节** 一个单元拷，而 ANSI 构建的 `TCHAR` 是 1 字节，分配只有 `len * sizeof(TCHAR)` 字节 → 每拷一次就溢出半个缓冲，堆被写坏 | 按 `sizeof(TCHAR)` 选搬运指令：`#ifdef _UNICODE` → `__movsw(…, len)`，否则 `__movsb(…, len)`（`debug_loop.cpp` 的 CREATE_PROCESS / LOAD_DLL 两处）。这类 bug 在“长度恒为 0”的旧路径上不会发作，一旦上游开始返回真名字就立刻显形 |
+| K13 | 照 `autodbg_split_cmdline_a/w` 反推「把 token 拼回 command line」时，引号前的反斜杠 run 写成 2k 个 | splitter 对「n 个反斜杠 + `"`」发 `n/2` 个反斜杠，且 n 为偶时那个引号只是**开关引号状态**（不是字面量）→ 2k 之后引号被当边界用掉 | 引号前的 run 写 **2k+1**（奇数才让引号成为字面量），紧跟闭合引号的末尾 run 写 **2k**。Windows 文件名里不能出现 `"`，所以这条对路径类 token 不可达，是防御性实现；门禁直接判的是空格与反斜杠（`handoff.cmdline-passthrough`） |
 
 ## L. Lua / LuaJIT / lualib 烘焙
 
@@ -75,6 +76,8 @@
 | M9 | 回退链打印出的 DLL 名/符号名是乱码 | `unmap()` 之后那些字符串指向已释放的镜像 | `load_error` 内置 `text[64]`，`AUTODBG_PACK_FAIL_STR` 先把名字拷出来 |
 | M10 | 手工映射模块链接报 `LNK2001/LNK2019 _tls_index` | **函数内**静态对象（尤其带非平凡构造/动态初始化）会被 MSVC 用线程安全初始化（`_Init_thread_*`）实现 → 引用静态 TLS，而映射器不分配 TLS 槽 | 改成**文件/命名空间作用域**的静态对象 + 惰性标志（模块是单线程执行，不需要函数内惰性初始化）。（`static args_holder s_args;` 与 `static send_input_fn fn = get_proc_as<...>()` 各踩过一次） |
 | M11 | 想把参数/状态放进 `__declspec(thread)` | 映射器不分配 TLS 槽 | 硬禁止：线程局部状态一律显式传参或宿主侧 `TlsAlloc` 封装（AGENTS.md §11.5） |
+| M12 | 64 位 host 上跑 x86 主 exe（handoff 后真正执行的是落盘的 x64 半份），调试 32 位 fixture 直接 `is not 64bit PE: 14C` | x64 半份的 `parse_pe` 按**编译期** `_WIN64` 判位数；WOW64 线程的 `GetThreadContext` 也无效（要 `Wow64Get/SetThreadContext`）、`stack_trace` 需要 EBP 链、PEB/TEB 要按位宽访问 —— 这四件属于 T8 (c) | (c) 之前，跑 32 位目标的门禁一律带 `--no-handoff`（排障/门禁开关，只在启动器解析，不占 boot 字段，ABI 仍 5、proto 仍 2）把执行留在 x86 半份；开关本身由 `e2e_boot.ps1` 的 `handoff.no-handoff-switch` 断（第 15 条）。`wow64.target-unsupported` 的显式拒绝同属 (c) |
+| M13 | 零 CRT 下写 job object 时 `C2039 "BasicLimits"` / `"JobObjectLimitFlags"` | 影子头里 `JOBOBJECT_EXTENDED_LIMIT_INFORMATION` 的字段是 `BasicLimitInformation`（不是 `BasicLimits`），标志字段是 `LimitFlags`（不是 `JobObjectLimitFlags`）——零 CRT 下没有别的声明来源，影子头必须逐项对齐 SDK | 按 SDK 字段名写；`CreateJobObjectW` / `AssignProcessToJobObject` / `SetInformationJobObject` 一律走 dynapi，嵌套分配失败干净降级（只剩 `WaitForSingleObject`），不设 limit（D63） |
 
 ## N. neovim 插件
 
@@ -182,3 +185,7 @@
 | X10 | `e2e_tcp.ps1` 里发空帧时报 `AddRange` 参数为 null | PowerShell 把**空数组**绑成「缺参」（`List.AddRange(@())` → collection 为 null） | 帧编码改用逐字节 `foreach + List.Add`；写这种自己编帧的脚本时不要用 `AddRange` 传可能为空的数组 |
 | X11 | 门禁脚本里 `Run({cmdline='C:\Windows\…'})` 一律 `exit=3`（`invalid escape sequence`） | PowerShell **here-string 是字面的**：写进去的 `C:\Windows` 到 Lua 眼里就是非法转义（双引号字符串才会被 PS 处理） | 命令行走 Lua 长括号：`[[C:\Windows\System32\cmd.exe]] .. ' /c …'`；另外 `Recv-Frame` 的 `Stream.Read` 要 `try/catch`，否则读超时会把整个脚本炸掉而不是报 FAIL |
 | X12 | legacy 变体在 Win95 上映射/加载失败，`api_check` 报 `kernel32.dll GetFileSizeEx` | `GetFileSizeEx` 是 NT4/98 才有的（Win95 没有）；写代码时习惯性用它读文件大小 | 用 `GetFileSize`（Win95 有）或 `SetFilePointer(…, FILE_END)`；新增任何 file/process API 后先跑 `uv --directory tools/api_check run scan_dir.py`（它会按产物自动选 w95/wxp/w7 口径） |
+| X13 | 门禁里 `Check 'name' (cond) ("..." -f ...)` 报 `ParserError: 表达式中缺少右括号` | `Check` 是函数调用，换行续写后紧跟的 `-f` 被当成**参数**而不是格式化运算符 | 先把 detail 算进变量再调用 `Check`；同理 `Get-Content` 可能返回 `$null`，不能对 null 调方法，先判 null |
+| X14 | 门禁断「字面 `back\slash` 被逐字节还原」时永远匹配不到 | `-match 'back\s'` 里的单个 `\s` 是正则的空白类，不是两个字符 | 写 `back\\slash`；逐字节口径一律用 `[byte[]]` 比对（`e2e_boot.ps1` 的 `Contains-Bytes`）——同一中文串在 modern（UTF-8）与 legacy（GBK 执行字符集）下字节不同，两种都要收 |
+| X15 | `Add-Type` 报 `CS0105: “System.Runtime.InteropServices”的 using 指令以前在此命名空间中出现过` | `-UsingNamespace` 里同一命名空间写了两遍 | 只写一次 |
+| X16 | handoff 的错误在门禁里断不到（脚本挂住或只看到弹窗） | handoff 的报错口径与启动器一致：`--quiet` 只走 stderr，否则**同时弹 `MessageBoxA`**；模态弹窗在 headless 门禁里无法断言 | `e2e_boot.ps1` 一律带 `--quiet`（每个直接 `Start-Process` 的调用也要显式加）；断言读的是 raw 文件字节（`outf`/`errf`），不是字符串 |

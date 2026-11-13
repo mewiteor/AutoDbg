@@ -82,23 +82,24 @@ make.bat i <dir>         :: 指定输出目录（默认 .out）
 ```
 
 - 无脚本参数时弹文件对话框（启动器里的 `GetOpenFileNameW`，9x 降级 A 版）选脚本。
-- 选项（启动器层）：`-h` / `--help`（打 usage 后退出 0）、`--version`（版本/ABI/架构后退出 0；版本串来自构建期的 `git describe`，见 §1）、`--flavor=lua|luajit`（默认 lua 5.5）、`--variant=modern|legacy`（仅排障；正常靠平台探测 + 映射失败回退）、`--list`（列出载荷里的模块）、`--module-dir=<dir>`（调试：从磁盘取同名 DLL，仍走内存映射）、`--quiet`（关错误弹窗）、`--selftest`（跑纯函数自测）、`--repl`（REPL：stdin 喂**合法 Lua 语句**，不需要脚本；与 `--json`/`--out`/`--remote` 互斥 → 启动器退 2；**与 `--server` 可并存**：同一连接内 `lua_State` 跨命令存活，每条 `script` 帧 = 一行/一个完整块）、`--json` / `--out=<path>`（机器可读结果信封，§12.6；两者互斥于 `--server`，同时给 → 启动器报错、退出码 2）、`--server[=tcp]`（raw TCP 帧；`--server=http` 已随 D41 删除并报错）及其 `--server-*` 子选项（§12.1）、**客户端（T3/D42）**：`--remote=<host:port>`、`--remote-token=<hex>`、`--pid=<n>`、`--read-timeout=<ms>`、`--max-frame=<bytes>`、`--cancel` / `--kill` / `--detach` / `--health`（这四条离开 `--remote` → 启动器报错、退出码 2；带 `--remote` 时 `--version` 变成「查 server 版本」）。
+- 选项（启动器层）：`-h` / `--help`（打 usage 后退出 0）、`--version`（版本/ABI/架构后退出 0；版本串来自构建期的 `git describe`，见 §1）、`--flavor=lua|luajit`（默认 lua 5.5）、`--variant=modern|legacy`（仅排障；正常靠平台探测 + 映射失败回退）、`--list`（列出载荷里的模块）、`--module-dir=<dir>`（调试：从磁盘取同名 DLL，仍走内存映射）、`--quiet`（关错误弹窗；handoff 的报错与启动器同一口径：`--quiet` 只走 stderr，否则同时弹 `MessageBoxA`）、`--no-handoff`（T8/D63 的排障与门禁开关：64 位 host 上有 exec blob 时本来会 handoff，这个开关让主 exe 自己跑 x86 半份；只在启动器解析，不占 boot 字段）、`--selftest`（跑纯函数自测）、`--repl`（REPL：stdin 喂**合法 Lua 语句**，不需要脚本；与 `--json`/`--out`/`--remote` 互斥 → 启动器退 2；**与 `--server` 可并存**：同一连接内 `lua_State` 跨命令存活，每条 `script` 帧 = 一行/一个完整块）、`--json` / `--out=<path>`（机器可读结果信封，§12.6；两者互斥于 `--server`，同时给 → 启动器报错、退出码 2）、`--server[=tcp]`（raw TCP 帧；`--server=http` 已随 D41 删除并报错）及其 `--server-*` 子选项（§12.1）、**客户端（T3/D42）**：`--remote=<host:port>`、`--remote-token=<hex>`、`--pid=<n>`、`--read-timeout=<ms>`、`--max-frame=<bytes>`、`--cancel` / `--kill` / `--detach` / `--health`（这四条离开 `--remote` → 启动器报错、退出码 2；带 `--remote` 时 `--version` 变成「查 server 版本」）。
   启动器的输出一律 **ASCII**（它走 `WriteFile` 写字节，中文在 CP936 控制台上会乱码；模块那边走 `WriteConsoleW` 才例外）。
 - **脚本首行标记**也能选 flavor：`--!lua` / `--!luajit`（优先级：命令行 > 首行标记 > 字节码 magic > 默认 lua）。
   其它 `--!xxx` 一律报错退出（D9）；例外：`--!autodbg` / `--!adbg` 是**编辑器侧标记**
   （远程地址 / exe / 架构），launcher 会**跳过它继续看下一行**（所以同一份脚本既能被 nvim 插件跑，
   也能直接命令行跑；`PITFALLS.md` N9）。
 - `state.cpp` **不再**往脚本目录写任何文件（`cdebugger.d.lua` / `.luarc.json` 已移除）：编辑器补全改由 neovim 插件的 LuaLS 注解库提供（§12.5）。
+- **基准目录**（T8 a2/D63）：环境变量 `AUTODBG_BASE_DIR`（handoff 时由主 exe 写入 = 主 exe 所在目录，**无尾分隔符**；child 继承），`open_file` 的相对路径按它解析（取不到就用主 exe 目录本身，两者都取不到则原样用路径，不算失败）；`io.open` 仍按 CWD；`images` 登记的仍是调用者给的原串。
 - 脚本参数从 `argv[2..]` 压入 Lua；退出码：`0` = 成功；**脚本不存在/无法打开** → `-1`；脚本的**语法错误**是 Lua 的 `LUA_ERRSYNTAX`（Lua 5.5 = **3**）、**运行时错误**是 `LUA_ERRRUN`（= **2**）——两者**透传 Lua 错误码**（启动器与引擎不另外发明）；启动器自己的错误为 `2`（另有 `--list` / `--selftest` / `/shutdown` 等正常返回 0）。
 
 ## 4. 测试与门禁
 
-本仓库自带**十条**可复跑的验证链（都不需要额外的机器）：
+本仓库自带**十一条**可复跑的验证链（都不需要额外的机器）：
 
 | 链 | 入口 | 说明 |
 | --- | --- | --- |
 | 导入表门禁 | `uv --directory tools/api_check run scan_dir.py` | 扫 `.out` 下全部产物，按产物自动选口径（`AutoDbgLegacy_*` 与启动器 → `w95`、`.out/fixtures/` 下的 fixture → `w95`（fixture 里禁止 NT-only 调用）、其余 x86 → `wxp`、x64 → `w7`），有目标系统不可用的导入就打印并返回 1。单文件用法：`uv --directory tools/api_check run main.py <exe\|dll> <w95\|w98\|w982\|wxp>`（x64 免第二个参数）。当前实测 **14 产物**（12 个产物 + `.out/fixtures/` 的 `x86_loop`、`x86_spawn`，两个 fixture 都走 w95） |
-| 纯函数自测 | `.out\AutoDbg_<arch>.exe --selftest` | 覆盖 `json_writer` / `png_writer` / `dbl2str` / **帧编解码** / **`decide_console_action`**（T7.1）等纯计算层（基线 70 → T1/D50 转义 +11 = 81 → T2 帧编解码 +20 = 101 → T5 删 `http`/`base64` 两段后 = 67 → **T7.1 补 `decide_console_action` 三条 = 70** → **T7.3 切片 B 补 `console_style_enabled` 三条 = 73** → **T8 a1 补 `decide_handoff_action` 四条 = 77**） |
+| 纯函数自测 | `.out\AutoDbg_<arch>.exe --selftest` | 覆盖 `json_writer` / `png_writer` / `dbl2str` / **帧编解码** / **`decide_console_action`**（T7.1）等纯计算层（基线 70 → T1/D50 转义 +11 = 81 → T2 帧编解码 +20 = 101 → T5 删 `http`/`base64` 两段后 = 67 → **T7.1 补 `decide_console_action` 三条 = 70** → **T7.3 切片 B 补 `console_style_enabled` 三条 = 73** → **T8 a1 补 `decide_handoff_action` 四条 = 77** → **T8 a2 补 `base_dir` 四条 + `--no-handoff` 一条 = 82**） |
 | GUI 自动化（本地） | `pwsh tools/server_test/e2e_gui.ps1 -Render <64\|86> [-Variant legacy]` | 起一个 `gui_target.ps1` 靶子窗口，用**本地 CLI** 跑 `gui.*` 脚本断言（屏幕/窗口/控件/截图/`gui.pick`）；`-AllowInput` 才跑会动真鼠标/键盘的用例。T5 之前它走 HTTP `/run`，现已改成本地（`gui.*` 与传输无关，21 条断言；带 `-AllowInput` 是 26 条） |
 | raw TCP 帧（T2/T3/T4/D42/D2a） | `pwsh tools/server_test/e2e_tcp.ps1 -Render <64\|86> [-Variant legacy]` | `--server=tcp`：握手帧（`id` = 协议版本、`data` = token）→ `info`；版本不符 / 首帧非握手 / 错 token 的 `error` 帧；`script` → `out`+`result`+`end`；`control` 的 health / version / cancel / 未知 / shutdown；**执行期的 control**（Lua 死循环 + 引擎空转）；**`dbg` 状态机**（T7.3：`pump.*` 八条 —— 停住不放行 / 默认 code 对齐 / step / 重入拒绝 / record-and-continue + dropped / 空转期 cancel / attach + close 只分离 / attach 参数错）；**`--remote` 客户端**（跑脚本 / `--json` 信封 / 语法错误 / health / version / 另一个进程的 `--cancel`）；**`open_file` 读向**（远程 open 应答、read/tell/seek/lines 字节与位置语义、等回包超时 → `nil,"timeout"` 且脚本继续）、**调试回调里的阻塞读**（超时后回调返回、下一次 `Run` 照常；迟到的 `read_resp` 被丢弃）；**`0.0.0.0` 横幅列出网卡地址**；**协议 2 的归因**（`out.id` = 命令号、`event` 帧带命中记录且 `id` = 命令号、`result.id` 仍是退出码）。59 条断言（`pump.*`/`event.*` 只在 x86 跑，x64 51 条），legacy 同样必须真过 |
 | 本地 REPL（T7 切片 D1） | `pwsh tools/server_test/e2e_repl.ps1 -Render <64\|86> [-Variant legacy]` | 管道喂 stdin 跑 `--repl`：`print(1+1)` → `2`（**管道下零提示符**）、多行续行（`for`/`body`/`end`）、`=` 简写（`=1+1`）、EOF → 退出码 **0**、语法错 → **3**、最后一条命令的错 → **2**、`--repl`+`--json` → 启动器退 **2**、`dbg.caps()` 可用（证明复用同一个 `lua_State`）。11 条断言（`repl.remote-exclusive` / `repl.exit-report` / `repl.no-v`；x64 无 fixture ⇒ 10 + 1 SKIP），86 / 86 legacy / 64 都要过 |
@@ -106,8 +107,10 @@ make.bat i <dir>         :: 指定输出目录（默认 .out）
 | JSON 信封（T1/D50） | `pwsh tools/server_test/e2e_json.ps1 -Render <64\|86> [-Variant legacy]` | 本地模式 `--json` / `--out=<path>`：那一行 JSON 独占 stdout、字段齐全、`result` / `pid` / `detached` / `images` 口径、`--json` 与 `--server` 互斥（退出码 2）、退出码口径不变；那一行必须**纯 ASCII**（CP936 → UTF-8 或逐字节降级）。`-Variant legacy` **必须真过**（这段就是用来暴露 GBK 的） |
 | agent 技能包（T6） | `pwsh tools/agent/check_skill.ps1 -Render <64\|86>` | `tools/agent/autodbg-skill/` 是 CLI 口径下的**唯一对外契约文档**：检查 `SKILL.md` 的 frontmatter（`name` / `description`）并把每个 `.md` 里的 ` ```lua ` 片段交给产物做语法检查（只解析不执行）。17 条断言（6 条静态 + 11 个含 lua 块的 md）/ 58 个 Lua 片段（第 11 个是新增的 `recipes/child-process.md`） |
 | nvim 客户端（T5） | `pwsh tools/server_test/nvim_smoke.ps1 -Render <64\|86> [-Variant legacy]` | 起三台 `--server=tcp`（主 / 带 token / `--repl`）→ headless nvim 跑 `nvim_smoke.lua`：远程执行 + 结果 buffer、异步路径不出 `E5560`、语法错误 → chunkname + quickfix、`M.cancel`（控制帧）、health/version（`info`）、`open_file` 写/读回（帧上的 `open`/`data`/`close`/`read_req`）；REPL 三条连的是第三台 `--repl --server` —— `repl.cross-command-state`（同一连接两帧 ⇒ 跨命令 `lua_State` 存活 + `out.id` = 命令号）、`repl.error-code`（`result.id` 仍是该行的 Lua 错误码 3，且与命令号错开）、`repl.event-render`（`event` 帧渲染进 buffer 且 `id` = 命令号）。**35** 条断言（实测）；**nvim 不在 PATH 时 SKIP** |
+| 引导器 / handoff（T8 a2/D63） | `pwsh tools/boot_test/e2e_boot.ps1 -Render <64\|86> [-Variant legacy]` | 断单一落盘路径（tmpdir + `adbg64.bin`）、内容一致不重写、被锁 → 明确报错且不清写、`AUTODBG_BASE_DIR` 的传递与 `open_file` 的相对路径（相对的是 base 而不是 CWD）、命令行透传（引号与反斜杠逐字节还原，走 `autodbg_split_cmdline_a/w` 的逆过程）、job（`KILL_ON_JOB_CLOSE`，用 WMI 找父进程）、退出码透传（0 / -1 / 2 / 3）、`--json` 那一行独占 stdout、`--no-handoff` 开关、`version.parity.main-vs-exec`。15 条断言；❗一律带 `--quiet`（handoff 的报错会弹模态框，headless 断不了），中文路径按**字节**比（UTF-8 与 GBK 都收） |
 | Win9x 实机 | `pwsh tools/w9x_test/w9x.ps1 -Action check\|run\|record` | 需要 VMware 的 Win98 guest 与凭据（`tools/w9x_test/config.local.ps1`，已 gitignore）；**没有 VM / 凭据时 SKIP（exit 0）**。矩阵与剩余项见 `plan.md` §1.3 |
 
+- ❗64 位 host 上跑 x86 产物会 handoff（D63）⇒ 执行的是落盘的 x64 半份，而它现在调不了 32 位目标（`PITFALLS.md` M12）。所以 `e2e_dbg` / `e2e_tcp` / `e2e_repl` 在 64 位 host + `-Render 86` 时一律带 `--no-handoff`（只在启动器解析的排障/门禁开关，不占 boot 字段），断言测的仍然是 x86 半份；handoff 本身归 `tools/boot_test/e2e_boot.ps1`。
 - 黄金输出在本仓库 `tests/golden/w9x/`（Win98 guest 的输出），行尾与比较口径见 D15（golden 统一 LF，比较走「CRLF→LF + 去末尾空行」归一化）。
 - 行为类缺陷（需要真机跑调试会话才能确认的）**只记录不修**，等 Win9x 环境就绪（`plan.md` §1.3）。
 - 导入表类问题可用 `tools/api_check/main.py <符号>` 静态审计；新增任何 CRT/系统符号前先查。改完引擎/构建开关后跑一次 `scan_dir.py`，别让 `dbghelp.dll`、`K32*`、XP+ 的 `Nt*` 之类偷偷回到 legacy 导入表里。
@@ -360,6 +363,7 @@ payload              // 单条 LZMA 流：各模块原始字节按 entry 顺序�
 - `json_mode` / `json_out`：T1（D50）追加的字段（`--json` / `--out=<path>`），ABI 版本因此到 **3**。
 - `remote_host` / `remote_port` / `remote_cmd` / `pid` / `read_timeout_ms` / `max_frame`：T3（D42）追加的字段（`--remote` / `--pid` / `--read-timeout` / `--max-frame`），ABI 版本因此到 **4**。
 - `repl_mode`：T7 切片 D1 追加的字段（`--repl`：`0` = 普通脚本、`1` = REPL），ABI 版本因此到 **5**。
+- handoff（T8 a2/D63）**不占 boot 字段**：落盘 + CreateProcess + job + 退出码透传都在启动器侧（`src/sys/pack/handoff.*`），ABI 保持 **5**、协议保持 **2**；基准目录走环境变量 `AUTODBG_BASE_DIR`，`--no-handoff` 也只在启动器解析。
 
 改这个结构或导出名 = 改 ABI，必须同步 `AUTODBG_ABI_VERSION` 并重跑全部运行路径。
 
@@ -371,6 +375,7 @@ payload              // 单条 LZMA 流：各模块原始字节按 entry 顺序�
 4. 定 variant：平台探测（9x / NT4 → legacy）；`--variant` 只用于排障
 5. `map()` 失败 → **回退另一个变体**并打印原因；两个都失败 → exit 2
 6. `start()` → `autodbg_run(&boot)` → `ExitProcess(返回码)`
+7. T8 a2（D63）：64 位 host + 载荷里有 exec blob 且不是 `-h`/`--list`/`--version`/`--selftest`/显式 `--variant=legacy`/`--no-handoff` → 落盘 + `CreateProcess` + job（`KILL_ON_JOB_CLOSE`）+ 透传退出码；`--version` 的 arch 按 **host** 算（不再用编译期 `_WIN64`）
 
 ### 11.5 硬约束（手工映射的模块里**不得**出现的东西）
 
@@ -433,7 +438,7 @@ payload              // 单条 LZMA 流：各模块原始字节按 entry 顺序�
 > ❗D44 / D45：`read_file` / `write_file` 已被文件对象的 io 风格方法取代（`f:read("*a"|"*l"|"*n"|N)`、`f:read_line()`、`f:lines()`、`f:seek()`、`f:tell()`、`f:setbuf()`、`f:write()`、`f:flush()`、`f:close()`）；效果协议 + `base64` + 协程执行器 + `/effects` 已在 **T5 删除**。
 > 「调试回调里不可用」这条限制取消：回调里 `f:read()` 可以**阻塞等回包**（等待循环按 ≤250 ms 切片 `select`，每片检查 `exec_guard`），超时 → `nil, "timeout"` 后回调返回、断点继续。前提：执行连接的**唯一 reader 是脚本线程**（三个消费点：`f:read()` 等待循环、`on_wait_timeout` 的非阻塞 poll、`lua_sethook` tick）；其它连接是控制连接，由 accept 线程处理。
 
-文件在**客户端**那台机器上；本机脚本模式下两者都等价于 `io.open`。
+文件在**客户端**那台机器上；本机脚本模式下两者都等价于 `io.open`。 ❗相对路径按 §3 的基准目录（`AUTODBG_BASE_DIR`，T8 a2）解析 —— `open_file` 走 `base_dir()`，`io.open` 仍走 CWD。
 
 > **T4 已落地（分支 `feat/cli-tcp`）**：`open_file` 现在真支持**读**（r/rb），语义按 D49 钉死：
 > 默认 format `"l"`（去行尾）、`f:read(整数)` 读 N 字节、EOF → `nil`、错误 → `nil, err`、
