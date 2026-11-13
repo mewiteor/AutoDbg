@@ -10,8 +10,9 @@
 - 一次 `lua_eval` = 执行一段 Lua（**串行**，同一时刻只有一个脚本在跑）。
 - `Run{...}` / `Attach{...}` 是**阻塞**的：它们创建/附加目标并进入调试循环，
   一直跑到「目标退出」或脚本里调用 `Detach()`。所以**调试逻辑全部写在回调里**。
-- 没有「暂停后逐条读内存」的交互式接口（没有 step/pause/continue）。想「跑几秒看看」，
-  就在回调里用 `gui.sleep(ms)` 或直接用 `Run{...}` 跑到目标退出。
+- 要「停住目标、逐条看」用 **`dbg` 的会话对象**（下一节）：`d:pump()` 等一个事件、
+  `d:cont()` / `d:step()` 推进、`d:context()` / `d:read()` 读停住的目标。`Run`/`Attach` 那套
+  没有 step/pause（想「跑几秒看看」就在回调里 `gui.sleep(ms)` 或直接跑到目标退出）。
 - 后台没有任何常驻调试会话：上一条 `lua_eval` 里 `Detach()` 之后进程就干净结束了。
 
 最小骨架：
@@ -37,6 +38,237 @@ Run{                                  -- 或 Attach{ pid = 1234, ... }
 - 脚本的**第一个返回值**也会以 `tostring` 附带返回；结构化数据请
   `print(jsonx.encode(v))`（`jsonx` 是内置库，encode/decode）。
 - 出错 → 工具结果 `isError = true`，带 `@文件名:行号` 的 Lua 错误。
+
+## dbg：会话对象（主面）
+
+> **新脚本的主面**（D52/D55/D57）。`Run` / `Attach` 是「一口气跑到结束」的便捷糖；`dbg` 是
+> **状态机**：`create` / `attach` 拿一个**会话对象**，之后由你决定什么时候等事件、什么时候
+> 放行、什么时候读目标。要「停住看目标」或「一次驱动多个进程」只有这一条路。
+> 事实来源：`src/scripting/lua/dbg_bindings.cpp`（方法表、事件表字段、错误文案）、`src/core/context.cpp`
+> （`d:context()` 的键名）。拿不准「这台机器上有什么」就问运行时：`dbg.caps()` / `help('dbg')`。
+
+```lua
+local d, err = dbg.create{ imagepath = [[C:\path\target.exe]] }   -- 或 dbg.attach(pid)
+if not d then error(err) end
+
+local ev = d:pump(3000)            -- 等一个事件；默认**不放行**（目标停在这里）
+if ev then
+  print(ev.type, ev.pid, ev.tid, string.format('ea=%X', ev.ea))
+  local c = d:context()            -- 键名是 Cax…Cip（见下表）
+  print(string.format('eip=%X', c.Cip))
+  d:cont()                         -- 放行；缺省 = ev.cont_code
+end
+
+if d.detach then d:detach() else d:kill() end   -- 收尾；9x 上没有 detach
+```
+
+### 创建 / 取回
+
+| 调用 | 说明 |
+| --- | --- |
+| `dbg.create{ imagepath=… }` | = `Run` 的原语版（`CreateProcess` + `DEBUG_PROCESS`），**不循环**；返回会话对象 / `nil, err` |
+| `dbg.attach(pid [, opts])` | = `Attach` 的原语版（`DebugActiveProcess`）：**只认显式 pid**；Win95/98 没有 attach（失败文案里会直说） |
+| `dbg.sessions()` | `{ {root_pid, kind, state, lua_bound}, … }`：`kind` = `'create'`/`'attach'`，`state` = `'running'`/`'stopped'`/`'exited'` |
+| `dbg.session(pid)` | 按 `root_pid` 取回**同一个** userdata（表身份可判等）；没有 → `nil` |
+| `dbg.last()` | 最近一次 `create`/`attach` 的会话（= `dbg.*` 默认作用的那个） |
+
+`create` 的选项：`imagepath`（必填）、`cmdline`、`cwd`、`is_new_console`、`use_scylla_hide`，
+以及六个回调 `callback` / `exception_callback` / `on_exception` / `on_breakpoint` /
+`on_single_step` / `on_exit_process`。❗回调收的是**一张表** `{ pid, tid, ea, code, modname, rva }`
+（`callback` 里 `ea`/`code` 是 0）—— 与 `Run` 的 `callback(pid, tid)` 形状**不同**（D52：新面一律表 + 普通整数）。
+
+### 会话对象的字段
+
+| 字段 | 说明 |
+| --- | --- |
+| `d.root_pid` | 会话的键 = 树根进程（单进程树时就是目标本身）；**与事件的 `ev.pid` 是两回事** |
+| `d.kind` | `'create'` / `'attach'` |
+| `d.state` | `'running'`（没有未应答事件）/ `'stopped'`（停着一个）/ `'exited'`（目标没了或已收尾） |
+| `d.stop` | **当前未应答的事件表**；`nil` = 没有。「停住」就是这个字段非空 |
+
+### 事件表（`d:pump()` 的返回值就是 `d.stop` 那张表）
+
+| 字段 | 说明 |
+| --- | --- |
+| `type` | `DEBUG_EVENT` 码（`1` 异常 / `2` 建线程 / `3` 建进程 / `5` 退出进程 / `6` 加载 DLL …） |
+| `pid` / `tid` | 事件的进程 / 线程 |
+| `ea` / `modname` / `rva` | 命中地址与归属模块（没有命中语义的事件是 `0` / `""` / `0`） |
+| `code` | **异常码**（`EXCEPTION_*`；没有异常的事件是 `0`） |
+| `first_chance` | `1` / `0`，也可能是 `nil`（该通道 core 不上报首次命中） |
+| `cont_code` | core 算好的**默认应答码**（`0x00010002` = `DBG_CONTINUE` / `0x80010001` = `NOT_HANDLED`） |
+| `session` | 本事件**归属的会话**（userdata）：多会话时靠它归因，不要拿 `ev.pid` 去猜 |
+
+❗`code` 与 `cont_code` 不许混用：`code` 是「这是什么异常」，`cont_code` 是「该回的应答码」。
+
+### 方法
+
+| 方法 | 说明 |
+| --- | --- |
+| `d:pump([ms[, autocont]])` | **缓存优先**：`d.stop` 非空就立即返回它（不阻塞）；否则等属于本会话的事件。`nil` = 没等到（**不是错误**，也不清 `d.stop`）。缺省 `ms = 100` |
+| `d:cont([code])` | 应答当前事件 → `true` / `false`；缺省 `code` = `cont_code`。吞掉断点用 `0x00010002`，交给程序用 `0x80010001` |
+| `d:step([tid])` | 置 TF 单步（下一个事件是 SINGLE_STEP）；之后还要 `d:cont()` |
+| `d:eip([tid])` | 当前指令指针（整数）；拿寄存器表用 `d:context()` |
+| `d:arm(modname, rva, callback)` | 武装软件断点。`rva` 是**普通数字**（不要用 `GetModBase` 做算术：LuaVariant 会算错）；**允许延迟武装**（模块没加载就登记，`CREATE_PROCESS`/`LOAD_DLL` 时补 `0xCC`）。❗别打在本来就写着 `CC` 的地址上 |
+| `d:hits()` | 命中窗口的**副本**：`{ {seq,type,pid,tid,ea,modname,rva,code,cont_code,first_chance}, … }`；`type` `1` 断点 / `2` 异常 / `3` 单步 |
+| `d:dropped()` | 窗口满了以后被丢掉多少条（你看到的是窗口，不是全部事实） |
+| `d:setcap([1..64])` | 设置/查命中窗口上限（返回实际生效值） |
+| `d:stopped()` / `d:paused()` | 目标是否已结束（run 循环出口）/ 是否有未应答事件 |
+| `d:caps()` / `d:help()` | 同 `dbg.caps()` / `help('dbg')` |
+| `d:detach()` | 恢复断点原字节 + `DebugActiveProcessStop`，**目标继续活着**；❗**9x 上这个 key 不存在**（`d.detach == nil`） |
+| `d:kill()` | 终止目标（先恢复原字节、释放断点回调） |
+
+### 数据面
+
+```lua
+local s   = d:read(addr, 32)          -- **实际读到的字节串**（可能短于 32）；0 字节 → nil, err
+local b   = d:read_u8(addr)           -- 宽度靠函数名：read_u8 / read_u16 / read_u32 / read_u64
+local str = d:read_str(addr)          -- 以 NUL 结尾的字节串（不转码，与 LoadStr 同一函数）
+d:write(addr, "\x90\x90")             -- 字节串原样写
+d:write(addr, 0x1234)                 -- 整数 = u32 小端 4 字节
+
+local c = d:context()                 -- 整张寄存器表（普通整数；x64 的 Xmm* 是 { Low=, High= }）
+d:context(nil, { Cax = 0x1234 })      -- **部分更新**（只写表里出现的键）→ true / nil, err
+local frames = d:stack()              -- { {index, ea, modname, rva}, … }（栈回溯，与 StackTrace 同形）
+for _, m in ipairs(d:mods()) do end   -- { name, base, size, path }
+for _, t in ipairs(d:threads()) do end-- { {tid}, … }
+```
+
+- `d:context([tid])` 的键名（源码：`src/core/context.cpp` 的 `k_context_fields[]`）：
+  **`Cax Cbx Ccx Cdx Csi Cdi Csp Cbp Cip`** + `ContextFlags` / `EFlags` / `SegGs…SegSs` / `Dr0-Dr3` /
+  `Dr6` / `Dr7`；x64 另加 `R8-R15`、`Xmm0-15`（`{Low, High}`）、`P1Home…P6Home`、`MxCsr`、
+  `VectorControl`、`DebugControl`、`LastBranch*`。**不是** `Eax`/`Eip`/`Rip`。
+- 缺省 tid = 当前停住的那个线程（`d.stop.tid`），没有未应答事件时退到最近一条事件的 tid；
+  要看别的线程就**显式**给 tid。
+- `d:read(addr, n)` 与契约名 `ReadMemory` 的差别只有形状：那边返回字节数组、部分读被吞成整体失败；
+  这边返回**字节串 + 真实长度**。`d:stack([tid[, depth]])` 的 `depth` 缺省 64、上限 512。
+
+### 模块级 `dbg.*`
+
+除了 `create` / `attach` / `sessions` / `session` / `last`，模块级还保留一组**作用在默认会话**
+（= `dbg.last()`）上的转发：`dbg.pump([ms[, autocont]])` / `dbg.cont([pid[, tid[, code]]])` /
+`dbg.step([tid])` / `dbg.eip([tid])` / `dbg.arm(...)` / `dbg.hits()` / `dbg.dropped()` /
+`dbg.setcap([n])` / `dbg.stopped()` / `dbg.paused()` / `dbg.caps()` / `dbg.help()` /
+`dbg.detach([pid])` / `dbg.kill([pid])`（后两个给 pid = 按 `root_pid` 指名哪个会话）。
+
+❗两层 pump 的分工（D57）：
+
+- **`dbg.pump` 是唯一的「等」，而且是进程级的**：读一条事件 → 按 `dwProcessId` 分派到归属会话
+  （记录 + 回调 + 引擎记账）→ 返回带 `session` 的事件表。**不缓存**。
+- **`d:pump` 缓存优先 + 过滤**：别人的事件已经在它自己的会话里分派完了（分派不能推迟），
+  只是不返回给本次调用方。
+- 数据面（`read` / `context` / `stack` / `mods` / `threads`）只有 `d:` 形式，没有模块级转发。
+
+### 错误口径（一律 `nil, err`，不抛异常）
+
+门禁逐字判据的三条固定文案：
+
+```text
+pump cannot be called from a callback
+cannot run while an event is unhandled
+cannot run while a dbg session exists (detach/kill it first)
+```
+
+- 第 1 条：**回调里**调状态机（`pump`/`cont`/`step`/`arm`/`detach`/`kill`/`create`/`attach`）。
+- 第 2 条是 T7.3 的「有未应答事件」判据（`dbg_error_paused()`）；现行 `Run`/`Attach` 走的是第 3 条
+  —— C 侧 registry 里**存在**任何 dbg 会话就拒（两条路径都独占整个进程的事件流）。
+- 没有会话（或已收尾）时：`dbg: no session (call dbg.create or dbg.attach first)`。
+
+## dbglib：多会话脚本糖
+
+`lualib/dbglib.lua` 烘焙成全局 `dbglib`（`dbglib._version` 当前是 `'0.1.0'`）。它**只调** `dbg`，
+不新增 C 代码；两个函数都把失败当值返回，不抛异常。
+
+### `dbglib.wait_all(goals [, opts])` —— rendezvous（两边同时停住）
+
+```lua
+local EXE, MOD, SITE = [[C:\path\target.exe]], 'target.exe', 0x1028
+local a = dbg.create{ imagepath = EXE }
+local b = dbg.create{ imagepath = EXE }
+a:arm(MOD, SITE, function() end)
+b:arm(MOD, SITE, function() end)
+
+local ok, err = dbglib.wait_all({
+  { sess = a, mod = MOD, rva = SITE },
+  { sess = b, mod = MOD, rva = SITE },
+})
+if ok then
+  local ca, cb = a:context(), b:context()   -- 两边都停住 ⇒ 现在才能读 context
+  print(string.format('%X %X', ca.Cip, cb.Cip))
+end
+a:cont(); b:cont()                          -- 收尾前先放行
+if a.detach then a:detach() else a:kill() end
+b:kill()
+```
+
+- `goals` 每项 `{ sess = <会话对象>, mod = '名字'(可省), rva = <普通数字> }`；比较口径是
+  「同一个会话 + RVA 相同 + 模块名相同（给了 `mod` 才算，大小写不敏感）」。
+- 命中目标的会话**不 cont**（= 停住，这就是 rendezvous 的语义）；其它事件用 **`ev.cont_code`** 放行。
+- `opts = { timeout_ms = 8000, pump_ms = 200 }`；上界是**迭代次数** `ceil(timeout_ms/pump_ms)`
+  （不用墙钟：两个 Lua 版的 `os.clock`/`os.time` 语义不一致）。
+- 任一未达成目标的会话 `stopped()`（目标先退了）→ 立即 `nil, err`；超时 → `nil, 'dbglib.wait_all: timeout'`。
+
+### `dbglib.run_all(params_list [, opts])` —— batch / collect
+
+```lua
+local EXE = [[C:\path\target.exe]]
+local hits = 0                                   -- 回调里用 **upvalue** 收集（D58：别用全局）
+local res, perr = dbglib.run_all({
+  { imagepath = EXE, on_breakpoint = function(ev) hits = hits + 1 end },
+  { imagepath = EXE },
+})
+if res then
+  for i = 1, #res do
+    print(res[i].root_pid, res[i].ok, res[i].exit, res[i].hits)
+  end
+end
+if perr then print('timeout:', perr) end          -- 'dbglib.run_all: timeout'
+print('breakpoint hits seen in callbacks:', hits)
+```
+
+- 每项就是一个 `dbg.create{...}` 的选项表；全部 `create` 成功后才开泵，`dbg.pump(pump_ms, true)`
+  （**autocont**）跑到所有会话 `stopped()`。
+- 返回每会话一张结果表 `{ root_pid, ok, exit, hits }`：`exit` = 收到的 `EXIT_PROCESS` 退出码，
+  没收到（超时/被杀）就是 `nil`；`hits` 是 `#d:hits()`（`kill` 之前取）。
+- ❗**autocont ⇒ 不能在命中处检查**（引擎在 `dispatch` 末尾就应答了，没有「停住」这回事）。
+  要「两边同时停住」用 `wait_all`；要「跑到结束再比较」用 `run_all`。
+- 超时**不吞**：返回已经收集到的结果 + 第二个返回值 `'dbglib.run_all: timeout'`；
+  结束时会 `kill` 每个会话（`ok = false` = 那次 kill 失败，其余照常收）。
+
+## help 与 caps
+
+三方分工（D53），互不包含：
+
+| 问题 | 去哪里 |
+| --- | --- |
+| 语义 / 契约 / 坑 / 例子 | 本技能包（`references/` + `recipes/`） |
+| 「这台机器 / 这个 build 上有什么」 | `dbg.caps()`（**机器可读**） |
+| 「现在敲什么」 | `help([topic])` / `dbg.help()`（人类散文） |
+
+```lua
+help()              -- 索引（顶层主题），返回 true
+help('dbg')         -- dbg 表全部成员（= dbg.help()）
+help('dbg.pump')    -- 单个成员：签名 + 口径 + 坑
+local ok, err = help('no-such-topic')       -- nil, "no help for 'no-such-topic' (try help())"
+
+local c = dbg.caps()
+-- c.arch='x86'|'x64'  c.variant='modern'|'legacy'  c.flavor='lua'|'luajit'
+-- c.win9x=false  c.attach=true  c.detach=true  c.hits_cap=64
+print(tostring(dbg.detach ~= nil))          -- ❗AI 的权威能力判据
+```
+
+- `help` 的主题全部来自源码的一张表（`help_bindings.cpp` 的 `kHelp[]`）：`help` / `dbg` /
+  `dbg.create` / `dbg.attach` / `dbg.pump` / `dbg.cont` / `dbg.step` / `dbg.eip` / `dbg.arm` /
+  `dbg.hits` / `dbg.dropped` / `dbg.setcap` / `dbg.sessions` / `dbg.session` / `dbg.last` /
+  `dbg.stopped` / `dbg.paused` / `dbg.detach` / `dbg.kill` / `dbg.caps` / `dbg.help` /
+  `gui` / `open_file` / `legacy`。`help('dbg')` 的成员列表是**按主题前缀生成**的，没有第二份。
+- **能力判据 = 成员存在性**：`dbg.detach ~= nil`（9x 上不存在）、`dbg.caps().detach`（同一份事实）。
+  `inspect(dbg)` 只给人看（表成员带 C 函数，**机器别解析**）。
+- 上色只在**真控制台**且没有 `NO_COLOR` 时发生，走 `SetConsoleTextAttribute`（不是 ANSI）；
+  管道 / `--json` / server 的 sink 下一律纯文本（不会有 ESC 字节）。
+
+> ❗**冻结**：下面的 29 个 PascalCase 契约名（`Run` / `Attach` / `SetBreakpoint` / `ReadMemory` / …）
+> **不改名、不删、不加参数**，行为被门禁逐字节锁定；新脚本请用 `dbg`（会话对象）、`gui`、`open_file`。
+> 它们仍然可用，是上面这些便捷面的底层原语。
 
 ## Run{ ... }：启动并调试新进程
 

@@ -262,7 +262,7 @@ repl.state-member-parity     run() 重构后既有门禁全绿（逐字节验证
 | **T7.4 数据面补口** | §2.2 的 1/2/3/4/5/6/7/12（其余按需要补） | 约 200 行 | `repl.snapshot-restore`、`pump.partial-read-length`、`repl.writes-log` |
 | **T7.5 协议 + `--repl`** | `event` 帧 + `out.id` 归因 + proto 2；launcher `--repl` → ABI 5；模块侧 REPL loop（ReadFile + 切片 + guard） | `stream.*` 约 +40 行、launcher 约 40 行、模块约 120 行 | `repl.*` 五条 + 三处断言数字更新 |
 | **T7.6 Lua sugar** | `lualib/` 里新名字（例如 `dbglib`），只跑在 `dbg` 上；契约名不动 | 约 100 行 | `check_skill`（新 markdown 的 lua 片段）+ 一条 sugar 对照断言 |
-| **T7.7 文档与 nvim** | `AGENTS.md` §7 架构行 + §12 口径、skill 包 `references/lua-api.md` 加 `dbg`、新 recipe `stop-and-inspect.md`、PITFALLS 新增 S14（pump 不可从回调重入 / 归因靠命令号）；nvim 的 `:AutoDbgRepl`（独立仓单独提交） | — | `check_skill` 14 → 会随新 markdown 增加 |
+| **T7.7 文档与 nvim** ✅ 文档已落地 | skill 包 `references/lua-api.md`（`dbg` / `dbglib` / `help`+`caps` 三节，29 名标冻结）、`references/cli.md`（`--repl` + 协议 2 + `event` 帧）、新 recipe `stop-and-inspect.md`、`SKILL.md` 主面、`PITFALLS.md` **S15–S22**（S14 已被 T4 占用，续排）；**剩**：nvim 的 `:AutoDbgRepl`（独立仓单独提交）与 `AGENTS.md` §12 的 REPL 口径 | — | `check_skill` 14 → **15** 断言 / 39 → **47** 个 lua 片段（86 与 64 都过） |
 
 顺序不能调的地方：T7.1 必须单独一个提交（纯重构 + 既有门禁全绿）；T7.3 依赖 T7.1；T7.5 的协议变更必须与客户端（nvim/独立仓）同步，否则归因会在两边分叉（PITFALLS 里已有同类教训）。
 

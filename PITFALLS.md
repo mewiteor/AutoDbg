@@ -128,6 +128,22 @@
 | S13 | 回调里 `f:read()` 阻塞等回包时，`cancel`（控制帧 / CLI `--cancel`）打不断它 | `lua_sethook` 只在 **Lua 指令边界**触发，阻塞在 C 调用里不会触发；`on_wait_timeout`（100 ms）也到不了，因为线程不在 `WaitForDebugEvent` 里 | 等待循环按 ≤250 ms 切片 `select`，每片检查 `exec_guard` 标志（D45）。另一半：被取消的请求可能已有 **stale 应答**——必须丢弃该帧并给 client 发 `cancel_notify`，否则协议串位；且执行连接的唯一 reader 只能是脚本线程，其它连接才是控制连接（由 accept 线程处理） |
 | S14 | 读超时之后的**下一次** `f:read` 神秘地拿到了上一轮的旧数据（或位置乱跳） | 超时/取消只发了 `cancel_notify`（D45 规则 4）就结束；不守规矩的客户端仍会把那一轮的 `read_resp` 发回来，而它在同一个句柄上与下一次请求**长得一模一样** | 服务端自己兜底：句柄上记 `stale_replies`，超时/取消时 +1，下一次发 `read_req` **之前**非阻塞地把滞留的 `read_resp` 吃掉（`file_stream.cpp` 的 `remote_req`）。门禁：`e2e_tcp.ps1` 的 `callback.read-stale-discarded` |
 
+## S（续）dbg 会话对象 / 事件表 / REPL（T7 切片 C–D）
+
+> 编号接着上面的 S 节往下排（S14 已被 T4 的文件 I/O 占掉）。全部来自实测：`tools/server_test/e2e_dbg.ps1`、
+> `e2e_tcp.ps1` 的 `pump.*` / `proto.event-frame`、`e2e_repl.ps1`；对外文档是 `tools/agent/autodbg-skill/`。
+
+| # | 现象 | 根因 | 现在的做法 |
+| --- | --- | --- | --- |
+| S15 | 在断点回调里调 `d:pump()` / `d:cont()` 想「先看一眼再放行」，拿到的是 `nil, "pump cannot be called from a callback"`；另有一处（`Run`/`Attach`）报 `cannot run while a dbg session exists (detach/kill it first)` | 回调是 `pump_once` 派发进来的（`g_in_callback` 置位），状态机重入会让同一个事件被应答两次；`Run`/`Attach` 与 `dbg` 都要独占**整个进程**的事件流，而 `dbg_busy()` 查的是 C 侧 registry 非空 | 回调里只**记录**（写 upvalue 表 / 打日志），推进与放行都回到外层 `dbg.pump` 循环；要 `Run`/`Attach` 先把会话 `detach`/`kill` 干净。文案是门禁逐字判据（`pump.reentry-rejected` / `run.refused-with-session`）；`dbg_error_paused()` 里的 `cannot run while an event is unhandled` 是同族的历史文案，现行 `Run`/`Attach` 走的是上面那条 registry 判据 |
+| S16 | 以为 `d:pump()` 返回「事件码」，拿去 `if ev == 1 then` 判异常；或者空转一轮就以为事件丢了 | `pump` 返回的是**普通事件表**（`type` 是 `dwDebugEventCode`，还有 `pid/tid/ea/modname/rva/code/cont_code/session`）；`d:pump` **缓存优先**（`d.stop` 非空立刻返回同一张表，不阻塞），模块级 `dbg.pump` **不缓存** | 判事件看 `ev.type`、判「还是不是同一个」看表身份 `ev == d.stop`；「没等到」= `nil`（不是错误，也**不清** `d.stop`）。`pump.no-auto-continue` 里的「目标停着时第二泵是空转」正是模块级 `dbg.pump` 不缓存的表现：目标已被系统挂起，`WaitForDebugEvent` 只是超时 |
+| S17 | `d:context().Eip` / `.Eax` 全是 `nil`，脚本静默算出 0 | 键名沿用旧 X-macro 的 `C` 前缀（`src/core/context.cpp` 的 `k_context_fields[]`，`GetContext` 与 `d:context` 同一张表）：**`Cax Cbx Ccx Cdx Csi Cdi Csp Cbp Cip`** + `EFlags`/`SegGs…`/`Dr0…`；x64 另加 `R8-R15`/`Xmm0-15`/`P1Home…P6Home` 等 | 一律用 `Cip`/`Cax`…（不是 `Eip`/`Eax`，也不是 `Rip`/`Rax`；x64 上 `Cip` 就是 `Rip`）。`d:context(tid, t)` 是**部分更新**：未知键按 `SetContext` 的既有口径忽略，写成功返回 `true`。❗停住时 `Cip` 是否等于 `ev.ea` 取决于事件（实测）：`d:arm` 的断点被**压回 EIP** ⇒ `Cip == ea`（且引擎已把原字节写回 —— `d:read` 读到的是原指令、不是 `CC`），靶子**自带的 `int 3`** 系统停在它之后 ⇒ `Cip == ea + 1` —— 别拿 `Cip` 反推断点地址 |
+| S18 | `d:arm()` 打在本来就写着 `CC`（`int 3`）的地址上，同一个断点被反复命中，`hits()` 一直涨 | 那本来就是断点指令：引擎压回 EIP 后它仍是 `CC`，`re-arm` 与「恢复原字节」都没得做 | 不要对已有的 `int 3` 用 `d:arm`（`help('dbg.arm')` 里是明写的）；靶子里那种自带的 `int 3` 只能**显式** `d:cont(0x00010002)`（= `DBG_CONTINUE`，吞掉断点）/ `dbg.cont(nil, nil, 0x00010002)` 放行，坐标按缺省 `cont_code` 会走 `NOT_HANDLED` |
+| S19 | 想用 `dbg.pump(ms, true)`（autocont）验证靶子的「8 轮命中 + `exit 42`」，拿到的却是 `0x4000001F` | autocont = record-and-continue：引擎在 `dispatch` 末尾就自己应答了，**第二轮**那个不由 core 管的 `int 3` 走 `NOT_HANDLED` ⇒ 进程被系统以 WOW64 断点状态终止 | 要拿靶子契约里的 `42` 与 8 次命中，必须 `dbg.setcap(2)` + 逐次 `dbg.pump(ms, false)` + 显式 `dbg.cont(nil, nil, 0x00010002)`（`pump.record-and-continue` 断言 `hits=2 dropped=7 exit=42`）；`autocont` 只适合「跑到结束/超时、结果靠回调收集」的 batch 档（`dbglib.run_all`） |
+| S20 | REPL 多行输入不续行，或者管道喂完 stdin 之后 REPL 卡在「读错误」 | 续行判据不是 plan 里写的 `end of input`（实测 Lua 5.5 = `unexpected symbol near <eof>`、LuaJIT = `… near '<eof>'`）；而管道写端关闭时 `ReadFile` 返回的是 **FALSE + `ERROR_BROKEN_PIPE`**（不是 `TRUE` + 0 字节） | 判据取共同出现的 **`<eof>` 标记**（`repl.cpp` 的 `error_is_incomplete`），不认完整句子；EOF 认 `TRUE+0` 与 `FALSE+ERROR_BROKEN_PIPE`/`ERROR_HANDLE_EOF` 两种表象，否则 `printf … \| AutoDbg_86.exe --repl` 的第二次读会被当成读错误 |
+| S21 | 拿 `ev.code` 去当 `ContinueDebugEvent` 的应答码，异常被「吃掉」或者本该吞的又交给程序 | 事件表有两个码：`code` = **异常码**（`EXCEPTION_*`，没有异常的事件是 0），`cont_code` = core 在 `pump` 末尾算好的**默认应答码**（`DBG_CONTINUE` = `0x00010002` = 65538 / `NOT_HANDLED` = `0x80010001` = 2147549185） | 应答一律 `d:cont()`（缺省 = `cont_code`）或 `ev.session:cont(ev.cont_code)`；`code` 只用来判「这是什么异常」。`cont_code` 之所以是**泵完**才回填的（`fill_cont_code`），是因为 core 在 `dispatch` 末尾才算得出它 |
+| S22 | 想「探一下」`pcall(dbg.detach)` 看平台支不支持，结果目标被真 detach（或被 kill）掉了 | `dbg.detach` 在**没有** `DebugActiveProcessStop` 的平台（Win95/98）上**根本不安装**（建表时 dynapi 探一次，`g_has_detach`）—— 但它在 NT 上是**真函数**，`pcall` 试探 = 真收尾 | 判据是**成员存在性**：`dbg.detach ~= nil`（或机器可读的 `dbg.caps().detach`）；`d.detach` 同理（方法表按能力装）。要兼容 9x 就 `if d.detach then d:detach() else d:kill() end` |
+
 ## W. Win9x 实机自动化（vmrun）与 GUI 自动化
 
 | # | 现象 | 根因 | 现在的做法 |
