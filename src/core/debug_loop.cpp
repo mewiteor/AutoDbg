@@ -221,6 +221,9 @@ int DebuggerSession::begin(const core::RunParams *params, const core::DebugCallb
 /* pump：一次 `WaitForDebugEvent` + 派发（T7.1）。返回调试事件码（0 = 没等到事件）；
  * -1 = 引擎内部错误（`*err` 已置，且收尾已在这条路径里跑过）。`autocont = false` ⇒ ❗不调
  * `ContinueDebugEvent`：事件停在未应答状态，由调用方显式 `cont(pid, tid, code)`。 */
+/* pump 的等待切片上限（T7.3 / plan_t7.md §4.4）：`run()` 传 100 ms ⇒ 正好一片 ⇒ 行为逐字节不变。 */
+const DWORD kPumpSliceMs = 250;
+
 int DebuggerSession::pump(DWORD timeout_ms, bool autocont, const char **err)
 {
     const RunParams      *params = m_params;   /* begin 存下的调用方对象（别名保留旧调用点写法） */
@@ -229,8 +232,19 @@ int DebuggerSession::pump(DWORD timeout_ms, bool autocont, const char **err)
     DEBUG_EVENT DBGEvent;
     DWORD       DBGCode  = DBG_CONTINUE;
     bool        detached = false;
-    if (!WaitForDebugEvent(&DBGEvent, timeout_ms))
+    bool        got      = false;
+
+    /* T7.3：等待按 ≤ kPumpSliceMs 切片，每片没等到事件就问一次 `on_wait_timeout` —— 那是执行期
+     * 唯一的 control poll 点（D32 / S13），所以 `--cancel` 能在 pump 空闲时插话。core 仍然只拿到
+     * 一个 timeout，不知道 socket / stdin（§5 第 5 条）。 */
+    for (DWORD left = timeout_ms; ; )
     {
+        DWORD slice = (timeout_ms == 0) ? 0 : (left > kPumpSliceMs ? kPumpSliceMs : left);
+        if (WaitForDebugEvent(&DBGEvent, slice))
+        {
+            got = true;
+            break;
+        }
         if (to_detach())
         {
             term() = false;
@@ -239,8 +253,6 @@ int DebuggerSession::pump(DWORD timeout_ms, bool autocont, const char **err)
         }
         else if (cb->on_wait_timeout)
         {
-            /* 引擎只执行结论；「能不能分离而不终止」由引擎告知（DebugActiveProcessStop 可用性）。
-             * ❗pump 的空闲路径照旧问宿主 —— 那是执行期唯一的 control poll 点（D32 / S13） */
             switch (cb->on_wait_timeout(cb->context, !!m_debug_active_process_stop))
             {
             case core::WAIT_TIMEOUT_DETACH_KEEP_ALIVE: /* 2 */
@@ -256,9 +268,12 @@ int DebuggerSession::pump(DWORD timeout_ms, bool autocont, const char **err)
             if (m_debug_active_process_stop)
                 m_debug_active_process_stop(proc().dwProcessId);
             m_cont = false; /* 旧的 `break`：run 的 while 出口（pump 不回传「停不停」，只置标志） */
+            break;
         }
-        return 0;           /* 旧的 `continue` = 回到 while 顶 → pump 的「0 = 没等到事件」 */
+        if (left <= slice) break; /* timeout 用尽 ⇒ 等价于旧的 `continue`（回到 while 顶） */
+        left -= slice;
     }
+    if (!got) return 0;           /* pump 的「0 = 没等到事件」（与旧的 `continue` 同义） */
     if (cb->on_any_debug_event)
     {
         core::DebugEvent ev;
@@ -781,6 +796,7 @@ int DebuggerSession::pump(DWORD timeout_ms, bool autocont, const char **err)
 
     /* `autocont = false` ⇒ ❗不 continue：事件停在未应答状态（`DBG_EVENT_UNHANDLED` 就是为此存在），
      * 由调用方显式 `cont(pid, tid, code)`。 */
+    m_last_code = DBGCode;   /* T7.3（§4.4）：存下这一轮的默认 code，绑定层读它（`pump.default-code-parity`） */
     if (autocont)
     {
         if (!cont(DBGEvent.dwProcessId, DBGEvent.dwThreadId, DBGCode))

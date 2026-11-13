@@ -64,6 +64,36 @@ end(&err)                        run_shutdown（761）+ detach；D47 的降级�
 
 `on_wait_timeout` 的语义不变：pump 的空闲路径照旧问宿主，那正是执行期唯一的 control poll 点（`exec_guard.cpp:133` → `stream_poll_and_dispatch`）。
 
+**落地状态（T7.3）**：`dbg` 表在 `src/scripting/lua/dbg_bindings.cpp`（照 `gui` 的做法，注册一个全局表；29 个契约名不动）。
+方法 13 个：`begin / pump / cont / close / step / eip / arm / hits / dropped / setcap / code / stopped / paused`
+（`end` 改叫 `close` —— `end` 是 Lua 关键字，`dbg.end` 写不出来）。回调参数统一是普通表
+`{pid,tid,ea,code,modname,rva}`（新接口不再用 LuaVariant）。`hits()` 是 64 格环形队列 + `dropped` 计数
++ `setcap(1..64)`；记录只在 `on_breakpoint / on_exception / on_single_step` 三个通道产生。
+
+同轮改的 core：`pump` 的等待按 **≤250 ms 切片**，每片没等到事件就问一次 `on_wait_timeout`
+（`run()` 传 100 ms ⇒ 正好一片 ⇒ 行为逐字节不变）；`m_last_code` + `last_code()` 让绑定层拿到
+「本来该用的 code」（`dbg.cont()` 无参时用它）；两条固定文案 `"pump cannot be called from a callback"`
+与 `"cannot run while an event is unhandled"` 定在 `dbg_bindings.hpp`，`bindings.cpp` 的
+`lua_run` / `lua_attach` 在 `dbg` 停着未应答事件时报后者。
+
+同期把 T7.1 记录 ① 结清：`decide_console_action` 从 `scripting/lua/console_input.*` 搬进
+`common/console_action.*`（纯函数、只带 `windows.h`），`common → scripting` 的反向依赖消失；
+自测仍是 70 条。
+
+**T7.3 实测口径（数字已钉死，改门禁前先看这里）**：
+- 「显式放行」路线：`dbg.cont(nil, nil, 0x00010002)`（= DBG_CONTINUE）逐次放行 ⇒ 9 条记录
+  （ntdll 初始 int3 1 条 + site 的 int3 8 条）、窗口 2 ⇒ `dropped = 7`、目标**干净退出 42**。
+- `autocont` 路线：fixture 的 int3 不是 core 管的软件断点 ⇒ core 算出来的是 NOT_HANDLED，目标在
+  第二次机会后终止；同一次 NOT_HANDLED 会在同一 EA 上**报两遍**（first / second chance），
+  所以那一段的固定数字是 `hits = 3`（不是 2）。要区分 first/second chance 得等 T7.4（§2.2 第 5 条）。
+- ❗**别把 `dbg.arm` 打在 fixture 的 int3 上**：那条指令本身就是 `CC`，core 命中后会把它当
+  「原始字节」还原、退回 EIP、置 TF 单步 —— 单步执行的又是 `CC` ⇒ 再撞一次断点，实测只到
+  3 条记录就被 NOT_HANDLED 终止。`arm` 适用于**普通指令地址**，不是已经写着 `int 3` 的地址。
+- ❗门禁脚本层面两个坑：① PowerShell 双引号 here-string 里 `$site.rva` **不是**属性访问（要
+  `$($site.rva)`），写错时症状是「脚本一句输出都没有」（整段 Lua 变成 `System.Collections.Hashtable + 5`）；
+  ② 服务端把空闲 2 s 的控制连接关掉（`tcp_server.cpp` 的 `k_conn_idle_ms = 2000`）⇒ 中间跑过几轮
+  `Run-Client` 之后必须**新开**连接，否则第一次写就是 `WSAECONNABORTED`。
+
 **落地状态（T7.1 = `8e35348` + `ca3bde1`）**：本机全部门禁跑过且绿（导入表 12 产物、json 32、gui 21、tcp 48、skill 14、nvim_smoke 32、w9x gate），除自测 `67` → `70` 外断言数未变。两点记录：
 ① `src/common/selftest.cpp` 为此 include 了 `src/scripting/lua/console_input.hpp`（那个头只带 `windows.h`，§5 第 5 条没被破坏），但依赖方向是 `common → scripting`，与分层相反；理顺只需把纯函数 `decide_console_action` 挪进 `src/common/`（它本来不做 I/O、不碰 Lua），留待 T7.3 一起定。
 ② `pump` 的返回值只表达事件码（`0` = 没等到事件），「该不该停」仍靠会话标志，所以绑定层要用无参的 `cont()` 判断循环是否已终止 —— 「没等到事件」与「已 detach 退出」在返回值上不可区分；`cont()`（无参标志）与 `cont(pid, tid, code)`（显式应答）是同名重载，保留不改，但绑定层容易误用。
@@ -216,7 +246,7 @@ repl.state-member-parity     run() 重构后既有门禁全绿（逐字节验证
 | --- | --- | --- | --- |
 | **T7.1 纯重构** | 循环态 → 会话成员；`run()` = `begin`+`pump`+`cont`+`end` 封装；可观察行为不变 | `debug_loop.cpp` +80 行、`core.hpp` +6 声明 | 既有门禁全绿 + `decide_console_action` 3 条 |
 | **T7.2 fixture** | `tests/fixtures/bin/x86_loop.c` + `fixture` ninja 边 + `scan_dir.py` 口径 | 约 60 行 | fixture 过导入表 |
-| **T7.3 `dbg` 表** | `src/scripting/lua/dbg_bindings.cpp`（新文件、新全局表）：`begin/pump/cont/end/step/hits/list_*` | 约 150 行 | `pump.*` 七条 |
+| **T7.3 `dbg` 表** | `src/scripting/lua/dbg_bindings.cpp`（新文件、新全局表）：`begin/pump/cont/close/step/eip/arm/hits/dropped/setcap/code/stopped/paused` + `pump` 的 250 ms 切片 + `m_last_code`/`last_code()` + `decide_console_action` 搬进 `common/` | 约 700 行（含门禁与注释） | `pump.*` 六条（tcp 48 → 54，已在 86 modern/legacy 上真过；x64 整段 SKIP） |
 | **T7.4 数据面补口** | §2.2 的 1/2/3/4/5/6/7/12（其余按需要补） | 约 200 行 | `repl.snapshot-restore`、`pump.partial-read-length`、`repl.writes-log` |
 | **T7.5 协议 + `--repl`** | `event` 帧 + `out.id` 归因 + proto 2；launcher `--repl` → ABI 5；模块侧 REPL loop（ReadFile + 切片 + guard） | `stream.*` 约 +40 行、launcher 约 40 行、模块约 120 行 | `repl.*` 五条 + 三处断言数字更新 |
 | **T7.6 Lua sugar** | `lualib/` 里新名字（例如 `dbglib`），只跑在 `dbg` 上；契约名不动 | 约 100 行 | `check_skill`（新 markdown 的 lua 片段）+ 一条 sugar 对照断言 |
@@ -235,12 +265,19 @@ repl.state-member-parity     run() 重构后既有门禁全绿（逐字节验证
 5. ~~`ReadConsoleW` 要先查导入表~~ —— 已查（`tools/api_check/datas.bin` 按 OS 段）：`ReadConsoleW` 全 w95 可 ⇒ 不需要 dynapi。剩下的只是「先 `ReadFile`（管道可跑，门禁靠它）再回退 `ReadConsoleW`」这个顺序。
 6. session 上限与 idle 回收的数值（`hits()` 队列上限照 64 已推荐，但「几个 session」「空闲多久回收」还没数）。
 7. `session.default-parity` 这条门禁的落点：契约名走默认 session、`sess:xxx` 走 session 对象，两者必须逐字节一致（§10 第 6 条）。
-8. **T7.2 已落地但 fixture 的契约数字还不可观测**（本机探针）：无武装断点时 `on_exception` 只触发 3 次、`on_exit_process` 报的是 `0x4000001F`（不是 42）；
-   8 次命中与退出码 42 只有在每次 `int 3` 都被 `DBG_CONTINUE` 之后才成立（`m_first_bp` 只放行第一个），所以要等 T7.3 的 `pump.*` 门禁来钉。单跑 fixture（无调试器）在第一个 `int 3` 就终止，退出码 `0x80000003` ⇒ 代码路径本身没问题。
+8. **T7.2 已落地，fixture 的契约数字由 T7.3 钉死**：无武装断点时 `on_exception` 只触发 3 次、
+   `on_exit_process` 报的是 `0x4000001F`（不是 42）；8 次命中与退出码 42 只有在每次 `int 3` 都被
+   **显式** `DBG_CONTINUE` 之后才成立（`m_first_bp` 只放行第一个）。T7.3 的门禁现在就是这样写的：
+   `dbg.cont(nil, nil, 0x00010002)` 逐次放行 ⇒ 9 条记录（窗口 2 ⇒ dropped 7）、`exit=42`。
+   单跑 fixture（无调试器）在第一个 `int 3` 就终止，退出码 `0x80000003` ⇒ 代码路径本身没问题。
 9. `SetBreakpoint` 的 `rva` 只接受 LuaVariant（数字与普通字符串都报 "LuaVariant expected"），且 LuaVariant 算术有坑：实测 `GetModBase('x86_loop.exe') + 0x1028` 传进来的 rva 变成 `0x28`（`VirtualProtectEx` 报 487）。
-   主模块在 `GetModBase` 里的名字带扩展名（`x86_loop.exe`）。T7.3 的门禁必须用显式 variant，不能靠算术。
-8. 多 session 的 pump 口径：「事件属于别的 session」时是立刻 dispatch 还是入 queue（§10 第 5 条建议入 queue + 返回归属）。
-9. Lua sugar 的落点：`lualib/`（按文件名设全局，不能设 `Run`）还是 `dbg` 表的方法（C 注册）——我推荐 sugar 挂 `dbg` 表，lualib 只放纯 Lua 的策略函数。转义符口径（已讨论）：文件名去扩展名后，`<转义符><字母>` → 大写，其余原样；转义符选 `-`（`_` 不行，它是标识符字符，会跟「按文件名」约定打架）。只转 `name` 不转 `path`（`path` 是 chunkname，`nvim_smoke` 的 `err.error-text` 靠它）；`gen_lua_lib.lua` 要在构建期校验「结果是合法标识符」。
+   主模块在 `GetModBase` 里的名字带扩展名（`x86_loop.exe`），且它返回的是 LuaVariant 而**不是**普通数字
+   （`tostring()` 才得到 `0x00550000` 那种串），所以门禁里不要拿它做算术。
+   T7.3 的 `dbg.arm(modname, rva, cb)` 走**普通数字**并先判 `get_base`：模块没加载时直接返回
+   `nil, "dbg.arm: module not loaded (pump to its load event first)"`，而不是留给 core 在命中时报
+   "tmp->has_orignal_byte is zero!"。
+10. 多 session 的 pump 口径：「事件属于别的 session」时是立刻 dispatch 还是入 queue（§10 第 5 条建议入 queue + 返回归属）。
+11. Lua sugar 的落点：`lualib/`（按文件名设全局，不能设 `Run`）还是 `dbg` 表的方法（C 注册）——我推荐 sugar 挂 `dbg` 表，lualib 只放纯 Lua 的策略函数。转义符口径（已讨论）：文件名去扩展名后，`<转义符><字母>` → 大写，其余原样；转义符选 `-`（`_` 不行，它是标识符字符，会跟「按文件名」约定打架）。只转 `name` 不转 `path`（`path` 是 chunkname，`nvim_smoke` 的 `err.error-text` 靠它）；`gen_lua_lib.lua` 要在构建期校验「结果是合法标识符」。
 
 ---
 

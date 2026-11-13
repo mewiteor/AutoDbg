@@ -611,5 +611,255 @@ if ($null -eq $banner) {
 }
 
 Write-Output ''
+
+# ---------------- ⑯ T7.3 `dbg` 状态机（pump.*，6 条） ----------------
+# 只在 x86 跑：fixture 是 x86-only（MSVC 的 inline asm 在 x64 不可用），而 `parse_pe` 按编译期
+# _WIN64 判位数（§5 第 5 条的架构边界）⇒ x64 产物看 32 位节点会被跳过；64 口径下这段整段 SKIP。
+# 口径（本轮实测后钉死，见 plan_t7.md §9 第 8-11 条）：
+#   · 断点地址 = 模式命中地址 + 5（= 每条 int 3 被执行的那一条的地址）；模式在产物里必须只出现一次；
+#   · `pump` 的默认 code（`dbg.code()`）：首泵（首个 EXCEPTION_BREAKPOINT，m_first_bp）= DBG_CONTINUE
+#     = 65538；之后未武装的 int3 = DBG_EXCEPTION_NOT_HANDLED = 2147549185（这两条就是「与旧 run
+#     用的码一致」的可断形式）；
+#   · `hits()` 的 type：1=断点、2=异常、3=单步；记录只在 `on_breakpoint` 通道产生（arm 的回调不另记）。
+#   ❗fixture 的 int3 是**写死的指令**，不是 core 管的软件断点 ⇒ core 算出来的是 NOT_HANDLED，
+#     所以脚本想让它继续跑就必须显式 `dbg.cont(nil, nil, 0x00010002)`（= DBG_CONTINUE）。
+#     这是 plan_t7.md §9 第 8 条留下的尾巴：8 次命中 + 退出码 42 只在每次 int3 都被放行时成立。
+#   ❗NOT_HANDLED 的那一次会在同一个 EA 上再报一次（first chance → second chance）：autocont 段
+#     因此是 3 条记录（ntdll 初始 int3 + site int3 的两次）。first/second chance 的真值要等 T7.4
+#     （§2.2 第 5 条）才能区分，所以这里是固定数字而不是「命中次数 = 轮数」。
+function Find-FixtureSite([string]$path)
+{
+    $b = [IO.File]::ReadAllBytes($path)
+    $peOff = [BitConverter]::ToUInt32($b, 60)
+    $soh = [BitConverter]::ToUInt16($b, $peOff + 20)
+    $nsec = [BitConverter]::ToUInt16($b, $peOff + 6)
+    $secOff = $peOff + 24 + $soh
+    $pattern = [byte[]](0xB8, 0x44, 0x42, 0x47, 0x50, 0xCC)
+    $hits = New-Object System.Collections.Generic.List[int]
+    for ($i = 0; $i -le $b.Length - $pattern.Length; $i++)
+    {
+        $ok = $true
+        for ($k = 0; $k -lt $pattern.Length; $k++)
+        {
+            if ($b[$i + $k] -ne $pattern[$k]) { $ok = $false; break }
+        }
+        if ($ok) { $hits.Add($i) }
+    }
+    $rva = -1
+    foreach ($h in $hits)
+    {
+        for ($s = 0; $s -lt $nsec; $s++)
+        {
+            $e = $secOff + $s * 40
+            $va = [BitConverter]::ToUInt32($b, $e + 12)
+            $rawsize = [BitConverter]::ToUInt32($b, $e + 16)
+            $raw = [BitConverter]::ToUInt32($b, $e + 20)
+            if ($h -ge $raw -and $h -lt ($raw + $rawsize)) { $rva = $va + ($h - $raw) }
+        }
+    }
+    return @{ count = $hits.Count; rva = $rva; site = $rva + 5 }
+}
+
+if ($Render -ne '86')
+{
+    Write-Output 'SKIP: pump.* 段只在 x86 跑（fixture 是 x86-only；x64 的 parse_pe 按编译期 _WIN64 判位数）'
+}
+else
+{
+    $fx = Join-Path $Root '.out/fixtures/x86_loop.exe'
+    if (-not (Test-Path $fx))
+    {
+        Bad 'pump.fixture-missing' '先 make.bat a 86 生成 .out/fixtures/x86_loop.exe'
+    }
+    else
+    {
+        $site = Find-FixtureSite $fx
+        $fxLua = $fx.Replace('\', '/')
+        $siteHex = ('0x{0:X}' -f $site.site)
+
+        $s1 = Join-Path $TmpDir 'pump_no_auto.lua'
+        [IO.File]::WriteAllText($s1, @"
+local EXE = '$fxLua'
+local SITE = $($site.rva) + 5
+local ok, err = dbg.begin{ imagepath = EXE }
+if not ok then print('begin ' .. tostring(err)) return end
+for i = 1, 24 do
+    local code = dbg.pump(3000, false)
+    if code == nil or code == 0 then break end
+    local h = dbg.hits()
+    local last = h[#h]
+    if last and last.type == 1 and last.rva == SITE then
+        -- 目标停在 int3 之后那一条上：再泵一次是空转（进程被系统挂起），EIP 必须不动
+        local e1 = dbg.eip()
+        local idle = dbg.pump(300, false)
+        local e2 = dbg.eip()
+        print(string.format('paused=%s eip_after_int3=%s idle=%s eip_still=%s',
+            tostring(dbg.paused()), tostring(e1 == last.ea + 1), tostring(idle), tostring(e1 == e2)))
+        break
+    end
+    dbg.cont(nil, nil, 0x00010002)   -- DBG_CONTINUE：fixture 的 int3 是写死的，不显式放行就会终止
+end
+dbg.close()
+"@, (New-Object System.Text.UTF8Encoding($false)))
+
+        $s2 = Join-Path $TmpDir 'pump_code.lua'
+        [IO.File]::WriteAllText($s2, @"
+local ok, err = dbg.begin{ imagepath = '$fxLua' }
+if not ok then print('begin ' .. tostring(err)) return end
+local codes, seen = {}, 0
+for i = 1, 24 do
+    local code = dbg.pump(3000, false)
+    if code == nil or code == 0 then break end
+    local h = dbg.hits()
+    if #h > seen then seen = #h; codes[#codes + 1] = dbg.code() end
+    if #codes >= 2 then break end
+    dbg.cont(nil, nil, 0x00010002)
+end
+print('code1=' .. tostring(codes[1]) .. ' code2=' .. tostring(codes[2]))
+dbg.close()
+"@, (New-Object System.Text.UTF8Encoding($false)))
+
+        $s3 = Join-Path $TmpDir 'pump_step.lua'
+        [IO.File]::WriteAllText($s3, @"
+local ok, err = dbg.begin{ imagepath = '$fxLua' }
+if not ok then print('begin ' .. tostring(err)) return end
+for i = 1, 14 do
+    local code = dbg.pump(3000, false)
+    if code == nil or code == 0 then break end
+    local h = dbg.hits()
+    if #h == 1 then
+        print('step=' .. tostring(dbg.step()))
+        dbg.cont()
+        for j = 1, 6 do
+            local c2 = dbg.pump(3000, false)
+            if c2 == nil or c2 == 0 then break end
+            local h2 = dbg.hits()
+            for k = 1, #h2 do if h2[k].type == 3 then print('steprec=' .. h2[k].type) end end
+            dbg.cont()
+        end
+        break
+    end
+    dbg.cont(nil, nil, 0x00010002)
+end
+dbg.close()
+"@, (New-Object System.Text.UTF8Encoding($false)))
+
+        $s4 = Join-Path $TmpDir 'pump_reentry.lua'
+        [IO.File]::WriteAllText($s4, @"
+local EXE = '$fxLua'
+local ok, err = dbg.begin{ imagepath = EXE, on_breakpoint = function(info)
+    local r, e = dbg.pump()
+    print('reentry=' .. tostring(r) .. ' ' .. tostring(e))
+end }
+if not ok then print('begin ' .. tostring(err)) return end
+for i = 1, 24 do
+    local code = dbg.pump(3000, false)
+    if code == nil or code == 0 then break end
+    if #dbg.hits() >= 1 then break end
+    dbg.cont(nil, nil, 0x00010002)
+end
+print('runwhile=' .. tostring(select(2, pcall(Run, { imagepath = EXE }))))
+dbg.close()
+"@, (New-Object System.Text.UTF8Encoding($false)))
+
+        # record-and-continue 分两段：
+        #   ① `autocont = true` 时引擎自己 continue（脚本一次都不调 `dbg.cont`）⇒ 目标会自己跑到
+        #      site 的 int3（那条不是 core 管的断点 ⇒ NOT_HANDLED ⇒ 目标终止）。能跑到 = 引擎自己放行了。
+        #   ② 用显式 `DBG_CONTINUE` 逐次放行 ⇒ fixture 的契约数字：8 次命中 + 退出码 42；
+        #      窗口只有 2 格 ⇒ dropped 必须诚实计数（9 条记录 - 2）。
+        $s5 = Join-Path $TmpDir 'pump_record.lua'
+        [IO.File]::WriteAllText($s5, @"
+local EXE = '$fxLua'
+local ok, err = dbg.begin{ imagepath = EXE }
+if not ok then print('begin ' .. tostring(err)) return end
+for i = 1, 40 do
+    local code = dbg.pump(3000, true)
+    if code == nil or code == 0 then break end
+    if dbg.stopped() then break end
+end
+print('autocont_hits=' .. #dbg.hits() .. ' autocont_paused=' .. tostring(dbg.paused()))
+dbg.close()
+
+local exited = nil
+ok, err = dbg.begin{ imagepath = EXE, on_exit_process = function(info) exited = info.code end }
+if not ok then print('begin2 ' .. tostring(err)) return end
+print('cap=' .. tostring(dbg.setcap()) .. ' cap2=' .. tostring(dbg.setcap(2)) .. ' capbig=' .. tostring(dbg.setcap(200)))
+dbg.setcap(2)
+for i = 1, 60 do
+    local code = dbg.pump(3000, false)
+    if code == nil or code == 0 then break end
+    dbg.cont(nil, nil, 0x00010002)   -- 记录 + 显式放行
+    if dbg.stopped() then break end
+end
+print(string.format('hits=%d dropped=%d exit=%s', #dbg.hits(), dbg.dropped(), tostring(exited)))
+dbg.close()
+"@, (New-Object System.Text.UTF8Encoding($false)))
+
+        $s6 = Join-Path $TmpDir 'pump_cancel.lua'
+        [IO.File]::WriteAllText($s6, @"
+local ok, err = dbg.begin{ imagepath = '$fxLua' }
+if not ok then print('begin ' .. tostring(err)) return end
+print('event1=' .. tostring(dbg.pump(30000, false)))
+local code, e = dbg.pump(30000, false)             -- 目标停在未应答的事件上 ⇒ 这一泵是空转
+print('idle=' .. tostring(code) .. ' err=' .. tostring(e))
+dbg.close()
+"@, (New-Object System.Text.UTF8Encoding($false)))
+
+        With-Server @('--server-timeout=20000') {
+            param($c)
+            $null = $c
+
+            $r1 = Run-Client @("--remote=127.0.0.1:$Port", $s1)
+            Check 'pump.no-auto-continue' ($site.count -eq 1 -and $r1.out -match 'paused=true' -and `
+                $r1.out -match 'eip_after_int3=true' -and $r1.out -match 'eip_still=true' -and $r1.out -match 'idle=0') `
+                ("pattern=" + $site.count + " site=" + $siteHex + " out=[" + $r1.out + "]")
+
+            $r2 = Run-Client @("--remote=127.0.0.1:$Port", $s2)
+            Check 'pump.default-code-parity' ($r2.out -match 'code1=65538' -and $r2.out -match 'code2=2147549185') `
+                "DBG_CONTINUE=65538 NOT_HANDLED=2147549185 out=[$($r2.out)]"
+
+            $r3 = Run-Client @("--remote=127.0.0.1:$Port", $s3)
+            Check 'pump.step' ($r3.out -match 'step=true' -and $r3.out -match 'steprec=3') "out=[$($r3.out)]"
+
+            $r4 = Run-Client @("--remote=127.0.0.1:$Port", $s4)
+            Check 'pump.reentry-rejected' ($r4.out -match 'reentry=nil pump cannot be called from a callback' -and `
+                $r4.out -match 'runwhile=cannot run while an event is unhandled') "out=[$($r4.out)]"
+
+            $r5 = Run-Client @("--remote=127.0.0.1:$Port", $s5)
+            Check 'pump.record-and-continue' ($r5.out -match 'autocont_hits=3' -and $r5.out -match 'autocont_paused=false' -and `
+                $r5.out -match 'cap=64' -and $r5.out -match 'cap2=2' -and $r5.out -match 'capbig=64' -and `
+                $r5.out -match 'hits=2 dropped=7 exit=42') "out=[$($r5.out)]"
+
+            # ⑥ 单连接：script 帧先被 worker 拿走（开始空转），control 帧由 accept 线程直答
+            # ❗必须新开一条连接：上面 5 次 Run-Client 期间 `$c` 一直空闲，而控制连接空闲 2 s 就被
+            #   服务端关掉（tcp_server.cpp 的 k_conn_idle_ms = 2000）——复用 `$c` 会在第一次写就拿到
+            #   WSAECONNABORTED。
+            $c2 = Connect-Retry
+            if ($null -eq $c2) { Bad 'pump.cancel-while-idle' 'connect failed' }
+            else
+            {
+            $c2.ReceiveTimeout = 12000
+            $s = $c2.GetStream()
+            Send-Frame $s 10 0 1 '' $null
+            $null = Recv-Frame $s
+            Send-Frame $s 11 0 1 '' ([System.Text.Encoding]::UTF8.GetBytes((Get-Content $s6 -Raw)))
+            $first = Recv-Until $s 4 8000
+            Send-Frame $s 12 0 1 '' $null
+            $ackf = Recv-Until $s 8 8000
+            $ack = if ($ackf -and $ackf.json) { $ackf.json | ConvertFrom-Json } else { $null }
+            $second = Recv-Until $s 4 12000
+            Check 'pump.cancel-while-idle' ($first -and $first.data -match 'event1=3' -and `
+                $ack -and $ack.applied -eq $true -and $second -and $second.data -match 'err=canceled by server') `
+                "first=[$($first.data)] ack=[$($ackf.json)] second=[$($second.data)]"
+            try { $c2.Close() } catch { }
+            }
+        }
+    }
+}
 Write-Output ("e2e_tcp: variant={0} pass={1} fail={2}" -f $(if ($Variant) { $Variant } else { 'auto' }), $script:pass, $script:fail)
 if ($script:fail -gt 0) { exit 1 } else { exit 0 }
+
+
+
+
+

@@ -5,7 +5,8 @@
  * 与旧实现的差异：无（新文件）。
  * 覆盖：json_writer（转义/嵌套/数字/深度溢出/T1 的全转义出口）、rand（hex 形状与两次不相等）、
  *   帧头编解码（T2：定长头 / json 长度反推 / raw 长度前缀 / 全部拒绝路径）、PNG/BMP 编码、
- *   `decide_console_action`（T7.1 补上 plan.md §1.1 第 1 条欠着的三条：67 → 70）。
+ *   `decide_console_action`（T7.1 补上 plan.md §1.1 第 1 条欠着的三条：67 → 70；T7.3 从
+ *   `scripting/lua/console_input.*` 搬进 `common/console_action.*`，消除 `common → scripting` 的反向依赖）。
  * ❗T5（D41/D44）删除了 HTTP 与 base64 两段：它们跟着 http.* / ase64.* 一起消失。
  * 说明：断言用 `strcmp`/`memcmp` 逐字节比较（跨架构/跨编译器稳定）；
  *   期望值都是**手写的字面量**，不要在这里用被测代码生成期望值（否则等于没测）。
@@ -13,7 +14,7 @@
 #include "selftest.hpp"
 
 #include "frame.hpp"   /* T2：帧头编解码（plan_cli.md §2.1） */
-#include "../scripting/lua/console_input.hpp" /* T7.1：`decide_console_action`（纯判定、只依赖 windows.h） */
+#include "console_action.hpp" /* T7.3：`decide_console_action`（纯判定、只依赖 windows.h；从 scripting/lua 搬来） */
 #include "json_writer.hpp"
 #include "png_writer.hpp"
 #include "rand.hpp"
@@ -445,7 +446,7 @@ void test_frame(test_ctx *t)
 /* ------------------------------ 控制台输入判定（plan.md §1.1 第 1 条 / T7.1） ------------------------------
  * `decide_console_action` 是宿主层的**纯判定**（不做 I/O、不碰 Lua），所以可以按记录列表直接断言。
  * 期望值是手写字面量：0 = 继续等、1 = 分离并终止、2 = 分离但保留目标。
- * 口径（与 `console_input.hpp` 的注释一致）：只有 `KEY_EVENT` 的 **key-up** 且虚拟键码 = 'Q' 才算；
+ * 口径（与 `common/console_action.hpp` 的注释一致）：只有 `KEY_EVENT` 的 **key-up** 且虚拟键码 = 'Q' 才算；
  * Shift / CapsLock 只影响 `uChar`，不影响 `wVirtualKeyCode`（所以 q / Q 都能退出）。 */
 void test_console_action(test_ctx *t)
 {

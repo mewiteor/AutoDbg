@@ -28,13 +28,14 @@ extern "C"
 #include "core/process.hpp"                                                                /* P3.B：进程 / 线程控制模块 */
 #include "core/debug_loop.hpp"                                                             /* P3.B：调试事件主循环（Run） */
 #include "common/handle.hpp"                                                               /* P6.1：HANDLE RAII */
+#include "common/console_action.hpp" /* T7.3：控制台判定的纯函数（从 scripting/lua/console_input.hpp 搬来，Q27） */
 #include "scripting/lua/last_pid.hpp"                                                      /* P3.B 模块 12：上次 PID 持久化（原 tools.c） */
 #include "core/stack_trace.hpp"                                                            /* P3.B：调用栈回溯（dbghelp 回调 + x86 兼容结构体） */
 #include "common/dynapi.hpp"                                                              /* get_proc_as：dbghelp 动态解析（Win9x 兼容） */
+#include "dbg_bindings.hpp" /* T7.3：paused 守卫 —— `Run`/`Attach` 与 `dbg` 不可混用（§2.1 第 4 条） */
 #include "core/core.hpp" /* P6.4：状态访问改为显式 current_session()（engine.hpp 已删） */ /* P3.B：模块共享的全局状态（过渡期） */
 #include "core/types.hpp"
 #include "scripting/lua/helpers.hpp"
-#include "scripting/lua/console_input.hpp" /* 宿主层控制台判定（纯函数，可单测；Q27） */
 #include "scripting/lua/exec_guard.hpp"    /* S2：远程执行的取消/超时守卫（plan_server.md §5.4） */
 #include "registry.hpp"                    /* P4.2：注册表（`register_lua_api`） */
 #include "state.hpp"                       /* P4.1：脚本状态（`run_script_file` / `g_wfilepath`） */
@@ -1515,9 +1516,10 @@ static int CheckConsoleInput(struct lua_State *L, int on_console_event, bool can
                     PCALL(L, 1, 0, n);
                     lua_pop(L, 1);
                 }
-                /* 判定段已抽到 `console_input.cpp`（纯函数）：宿主侧判定可单测，
-                 * 引擎侧「拿到结论怎么做」归模块 9 —— 两边都不需要控制台（Q27）。 */
-                ret = decide_console_action(input_records, num_events, can_detach_without_term);
+                /* 判定段在 `common/console_action.cpp`（纯函数）：宿主侧判定可单测，
+                 * 引擎侧「拿到结论怎么做」归模块 9 —— 两边都不需要控制台（Q27）。
+                 * ❗T7.3 把它从 `scripting/lua` 搬进 `common/`（plan_t7.md §2.1 记录 ①）。 */
+                ret = autodbg::common::decide_console_action(input_records, num_events, can_detach_without_term);
             }
             free_(input_records);
         }
@@ -1637,6 +1639,13 @@ int lua_run(lua_State *L)
 {
     if (lua_gettop(L) != 1)
         return run_help(L);
+    /* T7.3（plan_t7.md §2.1 第 4 条）：`dbg` 状态机停着一个未应答的事件时，`Run` / `Attach` 必须报错
+     * —— 两条路径在同一个会话上不可混用（固定文案在 dbg_bindings.hpp）。 */
+    if (autodbg::host::dbg_paused())
+    {
+        lua_pushstring(L, autodbg::host::dbg_error_paused());
+        return lua_error(L);
+    }
     core::RunParams      params;
     LuaDebugAdapter      adapter;
     core::DebugCallbacks cb;
@@ -1739,6 +1748,13 @@ int lua_attach(lua_State *L)
 {
     if (lua_gettop(L) != 1)
         return attach_help(L);
+    /* T7.3（plan_t7.md §2.1 第 4 条）：`dbg` 状态机停着一个未应答的事件时，`Run` / `Attach` 必须报错
+     * —— 两条路径在同一个会话上不可混用（固定文案在 dbg_bindings.hpp）。 */
+    if (autodbg::host::dbg_paused())
+    {
+        lua_pushstring(L, autodbg::host::dbg_error_paused());
+        return lua_error(L);
+    }
     LPCTSTR              suffix = TEXT(".attach.last.pid.bin");
     core::RunParams      params;
     LuaDebugAdapter      adapter;

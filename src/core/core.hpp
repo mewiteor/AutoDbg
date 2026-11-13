@@ -17,10 +17,12 @@
  * ✅ P6.4 后：引擎函数**就是本类的成员**（见下面的「引擎 API」段），内部一律用自己的状态；`current_session()` 只留给宿主层与签名固定的回调。
  *   模块之间按 Q9 用「内部头 + session 成员」直接访问（即下面的过程态访问器），
  *   只有绑定层看到公有接口，P6.4 再统一收窄。
+ *   T7.3 加 `last_code()`（pump 存下的 code 给绑定层读）；`pump` 的 timeout 按 ≤250 ms 切片，
+ *   每片没等到事件就问一次 `on_wait_timeout`（core 仍不知道 socket / stdin）。
  *
  * ✅ T7.1（plan_t7.md §2.1）：调试主循环拆成状态机 `begin` / `pump` / `cont` / `end`，`run` 是它的
  *   封装（可观察行为逐字节不变）。跨 pump 的循环状态（`m_first_bp` / `m_push_fb` / `m_reset_bpx` /
- *   `m_reset_hw_bp` / `m_first_create_process` / `m_debug_active_process_stop`，加上 `begin` 存下的
+ *   `m_reset_hw_bp` / `m_first_create_process` / `m_debug_active_process_stop` / `m_last_code`，加上 `begin` 存下的
  *   `m_params` / `m_cb`）**必须是会话成员** —— 手工映射的模块禁止 `thread_local` 与函数内非平凡
  *   构造的 static（§11.5、PITFALLS M10），留在栈上就是跨 pump 状态丢失。
  *
@@ -125,10 +127,14 @@ public:
      * `begin` 另用 -2 上报「附加失败但 1:1 不跑收尾」。`pump` 返回调试事件码（0 = 没等到事件）。
      * ❗`begin` 存的是调用方的 `params` / `cb` 指针 —— 调用方必须保证它们活过整个状态机。 */
     int  begin(const RunParams *params, const DebugCallbacks *cb, const char **err);
-    int  pump(DWORD timeout_ms, bool autocont, const char **err);   /* autocont = false ⇒ ❗不 continue */
+    int  pump(DWORD timeout_ms, bool autocont, const char **err);   /* autocont = false ⇒ ❗不 continue；timeout_ms 按 ≤250 ms 切片（T7.3） */
     int  pump_now(const char **err);                                /* pump(0, false) */
     bool cont(DWORD pid, DWORD tid, DWORD code);                    /* ContinueDebugEvent（code 显式） */
     int  end(const char **err);
+    /* T7.3（plan_t7.md §4.1 / 已拍板第 5 条）：pump 算出来的「本来该用的 code」存在会话里，绑定层读它。
+     * `pump` 的返回值只表达事件码（0 = 没等到事件）；「没等到事件」与「循环已终止」在返回值上
+     * 不可区分（§2.1 记录 ②），所以 code 单独存一份 —— `cont` 必须显式带它（`pump.default-code-parity`）。 */
+    DWORD last_code() const noexcept { return m_last_code; }
 private:
     /* `run` 的收尾（P6.4：随 run 一起进会话，使用会话自身的状态） */
     void run_shutdown(const RunParams *params);
@@ -165,6 +171,10 @@ private:
      * 降级（只能 terminate）。这里按 C 名字保留（与 `bindings.cpp` 的 `lua_detach` 同一口径）。 */
     typedef BOOL(WINAPI *DebugActiveProcessStopFn)(DWORD dwProcessId);
     DebugActiveProcessStopFn m_debug_active_process_stop{};
+
+    /* T7.3：`pump` 每处理一个事件就把算出来的 code 存这里（绑定层读它做显式应答；
+     * 没等到事件时不更新，读到的是上一次的 code）。 */
+    DWORD m_last_code{};
 };
 
 /* ---------------- 当前会话（P3.B 模块 11 引入；P6.4 后范围收窄） ----------------
