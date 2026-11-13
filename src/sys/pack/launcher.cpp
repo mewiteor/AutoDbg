@@ -14,9 +14,9 @@
  *   信封本身在模块里组装（`main.cpp`）。`--out` 单独给也算 JSON 模式；与 `--server` 互斥
  *   （同时给 → 报错、退出码 2）；JSON 模式不弹文件对话框，启动器自己的诊断走 stderr
  *   （stdout 必须被那一行 JSON 独占）。
- * T7 切片 D1：`--repl` → `boot.repl_mode = 1`（ABI 5），**不需要脚本**。与 `--json` / `--out`
- *   互斥（那一行必须独占 stdout）、与 `--server` 互斥（REPL 跑在 server 上属切片 D2，本切片
- *   只报错），两者都退 2。REPL 主循环在模块里（`scripting/lua/repl.cpp`）。
+ * T7 切片 D1/D2b：`--repl` → `boot.repl_mode = 1`（ABI 5），**不需要脚本**。与 `--json` / `--out`
+ *   互斥（那一行必须独占 stdout）、与 `--remote` 互斥（输入是 stdin，客户端不转发），三者都退 2。
+ *   与 `--server` **可并存**（D2b）：同一连接内 `lua_State` 跨命令存活；主循环在模块里（`repl.cpp`）。
  *
  * ❗启动器是 **ANSI 编译**（要能在 Win9x 上跑）：所有 API 显式带 A/W 后缀；
  *   `GetCommandLineW` / `GetOpenFileNameW` 一律走 `GetProcAddress`（9x 的 kernel32/comdlg32 没有 W 版）。
@@ -682,7 +682,7 @@ extern "C" int launcher_main(int argc, char **argv)
     bool        server_mode    = false;
     unsigned    server_mode_v  = 1;   /* 1 = http（将被 D41 删除）、2 = raw tcp（D42） */
     bool        selftest_mode  = false;
-    /* T7 切片 D1：`--repl`（不需要脚本；与 --json/--out、--server 互斥） */
+    /* T7 切片 D1/D2b：`--repl`（不需要脚本；与 --json/--out、--remote 互斥退 2，与 --server 可并存） */
     bool        repl_mode      = false;
     const char *server_addr    = nullptr;
     unsigned    server_port    = 0;

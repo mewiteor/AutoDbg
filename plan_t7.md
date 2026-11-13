@@ -2,7 +2,7 @@
 
 > 分支：`feat/t7-low-level-api`。本文件是 T7 的独立计划（`plan.md` §1.1 第 6 条是它的出处，`plan.md` 不动）。
 > 决策仍归 `AGENTS.md` §13；坑归 `PITFALLS.md`；对外契约文档归 `tools/agent/autodbg-skill/`。
-> 门禁基线（本轮实测）：import 12 产物全过 / selftest 67 / e2e_tcp 48 / e2e_json 32 / e2e_gui 21（26）/ nvim_smoke 32 / check_skill 14（39 片段）。
+> 门禁基线（当前，详见 §12.2）：import **14 产物** / selftest **73** / e2e_tcp **59**（x64 51）/ e2e_json 32 / e2e_gui 21（26）/ nvim_smoke 32 / check_skill **17（58 片段）** / e2e_dbg **36** / e2e_repl **11**。
 > 本文件里所有「已核实的落点」都带文件:行号，便于改之前先验证。
 
 ---
@@ -792,11 +792,11 @@ context；两个会话都要显式收尾；命中武装断点时引擎已 EIP-- 
 | skill 包 | `tools/agent/check_skill.ps1 -Render 86`（+64） | **17 断言 / 58 片段** |
 | nvim | `nvim_smoke.ps1 -Render 86` | 32 |
 
-### 12.3 剩余任务（只剩 **②** 与 **④**：③ 已落地，① 已拍板不做）
+### 12.3 剩余任务（只剩 **②**：③、④ 已落地，① 已拍板不做）
 
 #### ① ~~C3 —— 29 名转薄转发 + `Var` 退出新面~~ —— **已拍板不做**（纯内部整理）
 
-- **状态**：本轮拍板**不做** —— 它不改变对外契约，行为一致已由 `session.default-parity`（`e2e_dbg` 第 28 条）守住；D52 的 29 名退役仍留给后续 D 条目。所以 **T7 的代码切片到此收尾**，剩余是文档与 nvim 尾巴（②、③ 已落地、④ 待写）。下面的内容 / 入口 / 风险只是万一要再做时的依据。
+- **状态**：本轮拍板**不做** —— 它不改变对外契约，行为一致已由 `session.default-parity`（`e2e_dbg` 第 28 条）守住；D52 的 29 名退役仍留给后续 D 条目。所以 **T7 的代码切片到此收尾**，剩余是文档与 nvim 尾巴（③、④ 已落地；只剩 nvim 的 ②）。下面的内容 / 入口 / 风险只是万一要再做时的依据。
 - **内容**：把 `bindings.cpp` 里 29 个 `lua_*` 改成「转发到 session 对象的那份实现」，删除重复逻辑（数据面已经在 `dbg_bindings.cpp` 里有一份）。`Var`（`V`/`U32`…）继续只在 29 名里存活，新面不新增。
 - **硬约束**：**行为逐字节不变** —— 门禁是 `session.default-parity`（`e2e_dbg` 第 28 条）+ `e2e_tcp` 59 条 + `e2e_json` 32 条。改完必须逐条比对文案与错误码。
 - **入口**：`src/scripting/lua/bindings.cpp`（29 个 `lua_*`）、`src/scripting/lua/dbg_bindings.cpp`（`session_*` 实现、`kProcMethods`）、`registry.cpp`（注册点）。
@@ -815,9 +815,9 @@ context；两个会话都要显式收尾；命中武装断点时引擎已 EIP-- 
 - ✅ 已落地：`recipes/child-process.md`（2 个 lua 片段）—— 扫 6 字节模式定位命中点、`d:procs()` 找子、`p:read_u32` 对照父子标记（父 42 / 子 7）、回调里用 `d:current_pid()` 归属。
 - 门禁：`check_skill`（脚本片段会做语法检查，不执行）。计数因此从 **16 断言 / 55 片段** 涨到 **17 / 58**（含 lua 块的 md 从 10 个到 11 个）。
 
-#### ④ `AGENTS.md` §12 的 REPL / 进程树口径（文档尾巴）
+#### ④ `AGENTS.md` §12 的 REPL / 进程树口径（文档尾巴）—— ✅ 已完成
 
-- §12 目前只写到文件 I/O 与 server；补两小节：`--repl`（本地 + `--repl --server`、`=` 简写、续行判据 `near <eof>`、退出码 = 最后一条命令、退出会话报告）与「进程树」（`owns_pid`、`handle_for_pid`、`d:procs/d:proc/current_pid`、两个限制）。写清之后 `AGENTS.md` 才和代码同源。
+- ✅ 已落地：`AGENTS.md` 新增 §12.7（`--repl`：本地 + `--repl --server`、`=` 简写、续行判据 `near <eof>`、退出码 = 最后一条命令、退出会话报告）与 §12.8（进程树：`owns_pid`、`handle_for_pid`、`d:procs()` / `d:proc(pid)` / `d:current_pid()`、两个限制），并修 §13 的两处过时说法与 §4 的数字（验证链四条 → **十条**、§9 的 recipe 7 → **8**）。写清之后 `AGENTS.md` 才和代码同源。
 
 ### 12.4 已记录、**不打算现在做**的延期项（别当 bug 报）
 

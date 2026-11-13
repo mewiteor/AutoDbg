@@ -93,7 +93,7 @@ make.bat i <dir>         :: 指定输出目录（默认 .out）
 
 ## 4. 测试与门禁
 
-本仓库自带四条可复跑的验证链（都不需要额外的机器）：
+本仓库自带**十条**可复跑的验证链（都不需要额外的机器）：
 
 | 链 | 入口 | 说明 |
 | --- | --- | --- |
@@ -200,7 +200,7 @@ tests/golden/w9x/    Win98 guest 的黄金输出
 | `plan_t7.md` | T7 的独立计划：状态机、数据面原语、REPL 与协议归因、AI + IDA MCP 的缺口；**§12 = 交接清单（剩余任务与复跑基线）** |
 | `plan_bootloader.md` | T8 的独立计划：交付面必须 32 位、按 host 选 exe、tmpdir 落盘与 handoff（命令行透传 / 退出码 / job）、job 与 dynapi 口径、多 session 的进程树路由 |
 | `nvim/README.md` | neovim 插件的安装、配置、命令与可编程 API |
-| `tools/agent/autodbg-skill/` | **面向 agent 的技能包**（Agent Skills 格式）：`SKILL.md` 入口 + `references/`（CLI / Lua API / 地雷）+ `recipes/`（7 个场景，含 `stop-and-inspect.md` 的 `dbg` 会话 + `dbglib` 配方、`cross-arch-remote.md` 的跨位数代理）。CLI 口径下的唯一对外契约文档（T7 的主面 `dbg` / `dbglib` / `help` / `caps` / `--repl` 已写进去） |
+| `tools/agent/autodbg-skill/` | **面向 agent 的技能包**（Agent Skills 格式）：`SKILL.md` 入口 + `references/`（CLI / Lua API / 地雷）+ `recipes/`（8 个场景，含 `stop-and-inspect.md` 的 `dbg` 会话 + `dbglib` 配方、`cross-arch-remote.md` 的跨位数代理、`child-process.md` 的进程树 / `d:proc(pid)` / `d:current_pid()`）。CLI 口径下的唯一对外契约文档（T7 的主面 `dbg` / `dbglib` / `help` / `caps` / `--repl` 已写进去） |
 | `make.bat` | 构建定义（ninja 生成器） |
 | 各文件头部注释 | 该文件的职责、来源、与旧实现的差异（第一手依据） |
 
