@@ -27,7 +27,7 @@
 ```bat
 make.bat                 :: 默认：64 + 86 两个架构，release
 make.bat d               :: debug 模式
-make.bat a 64            :: 只构建一个架构（同时生成 compile_commands.json）
+make.bat a 64            :: 只生成该架构的 compile_commands.json（不构建）
 make.bat a 86            :: 同上；`a 98` 已退役，会直接报错（Win9x 口径改用 legacy 变体，见 §11）
 make.bat r               :: 删除 .build 后重新生成 build.ninja 并构建
 make.bat c               :: 只清空 .build
@@ -98,7 +98,7 @@ make.bat i <dir>         :: 指定输出目录（默认 .out）
 | 链 | 入口 | 说明 |
 | --- | --- | --- |
 | 导入表门禁 | `uv --directory tools/api_check run scan_dir.py` | 扫 `.out` 下全部产物，按产物自动选口径（`AutoDbgLegacy_*` 与启动器 → `w95`、`.out/fixtures/` 下的 fixture → `w95`（fixture 里禁止 NT-only 调用）、其余 x86 → `wxp`、x64 → `w7`），有目标系统不可用的导入就打印并返回 1。单文件用法：`uv --directory tools/api_check run main.py <exe\|dll> <w95\|w98\|w982\|wxp>`（x64 免第二个参数）。当前实测 **14 产物**（12 个产物 + `.out/fixtures/` 的 `x86_loop`、`x86_spawn`，两个 fixture 都走 w95） |
-| 纯函数自测 | `.out\AutoDbg_<arch>.exe --selftest` | 覆盖 `json_writer` / `png_writer` / `dbl2str` / **帧编解码** / **`decide_console_action`**（T7.1）等纯计算层（基线 70 → T1/D50 转义 +11 = 81 → T2 帧编解码 +20 = 101 → T5 删 `http`/`base64` 两段后 = 67 → **T7.1 补 `decide_console_action` 三条 = 70** → **T7.3 切片 B 补 `console_style_enabled` 三条 = 73**） |
+| 纯函数自测 | `.out\AutoDbg_<arch>.exe --selftest` | 覆盖 `json_writer` / `png_writer` / `dbl2str` / **帧编解码** / **`decide_console_action`**（T7.1）等纯计算层（基线 70 → T1/D50 转义 +11 = 81 → T2 帧编解码 +20 = 101 → T5 删 `http`/`base64` 两段后 = 67 → **T7.1 补 `decide_console_action` 三条 = 70** → **T7.3 切片 B 补 `console_style_enabled` 三条 = 73** → **T8 a1 补 `decide_handoff_action` 四条 = 77**） |
 | GUI 自动化（本地） | `pwsh tools/server_test/e2e_gui.ps1 -Render <64\|86> [-Variant legacy]` | 起一个 `gui_target.ps1` 靶子窗口，用**本地 CLI** 跑 `gui.*` 脚本断言（屏幕/窗口/控件/截图/`gui.pick`）；`-AllowInput` 才跑会动真鼠标/键盘的用例。T5 之前它走 HTTP `/run`，现已改成本地（`gui.*` 与传输无关，21 条断言；带 `-AllowInput` 是 26 条） |
 | raw TCP 帧（T2/T3/T4/D42/D2a） | `pwsh tools/server_test/e2e_tcp.ps1 -Render <64\|86> [-Variant legacy]` | `--server=tcp`：握手帧（`id` = 协议版本、`data` = token）→ `info`；版本不符 / 首帧非握手 / 错 token 的 `error` 帧；`script` → `out`+`result`+`end`；`control` 的 health / version / cancel / 未知 / shutdown；**执行期的 control**（Lua 死循环 + 引擎空转）；**`dbg` 状态机**（T7.3：`pump.*` 八条 —— 停住不放行 / 默认 code 对齐 / step / 重入拒绝 / record-and-continue + dropped / 空转期 cancel / attach + close 只分离 / attach 参数错）；**`--remote` 客户端**（跑脚本 / `--json` 信封 / 语法错误 / health / version / 另一个进程的 `--cancel`）；**`open_file` 读向**（远程 open 应答、read/tell/seek/lines 字节与位置语义、等回包超时 → `nil,"timeout"` 且脚本继续）、**调试回调里的阻塞读**（超时后回调返回、下一次 `Run` 照常；迟到的 `read_resp` 被丢弃）；**`0.0.0.0` 横幅列出网卡地址**；**协议 2 的归因**（`out.id` = 命令号、`event` 帧带命中记录且 `id` = 命令号、`result.id` 仍是退出码）。59 条断言（`pump.*`/`event.*` 只在 x86 跑，x64 51 条），legacy 同样必须真过 |
 | 本地 REPL（T7 切片 D1） | `pwsh tools/server_test/e2e_repl.ps1 -Render <64\|86> [-Variant legacy]` | 管道喂 stdin 跑 `--repl`：`print(1+1)` → `2`（**管道下零提示符**）、多行续行（`for`/`body`/`end`）、`=` 简写（`=1+1`）、EOF → 退出码 **0**、语法错 → **3**、最后一条命令的错 → **2**、`--repl`+`--json` → 启动器退 **2**、`dbg.caps()` 可用（证明复用同一个 `lua_State`）。11 条断言（`repl.remote-exclusive` / `repl.exit-report` / `repl.no-v`；x64 无 fixture ⇒ 10 + 1 SKIP），86 / 86 legacy / 64 都要过 |
@@ -302,7 +302,7 @@ tests/golden/w9x/    Win98 guest 的黄金输出
 
 ### 10.9 compile_commands.json
 
-- 只在单架构模式（`make.bat a <arch>`，`GEN_COMPILE=1`）生成；多架构循环时不生成。
+- 只在单架构模式（`make.bat a <arch>`，`GEN_COMPILE=1`）生成；多架构循环时不生成。❗T8 起 `a` **不再构建**：`a <arch>` 只生成 `compile_commands.json`；构建只在 `make.bat` 不带 `a` 时进行，顺序是 **64 先、86 后**（86 的 pack 边要读 64 的产物，见 §11.2 与 PITFALLS B14）。
 - 文件以 `[` 开头、`]` 结尾；条目之间用**前导逗号**（`,{...}`），避免尾逗号。
 - **条目会成倍增长（预期）**：`src/**` 被 flavor × variant 各编一次，同一源文件有 4 条 entry（lua+modern 先写，其后 luajit+modern、lua+legacy、luajit+legacy）；clangd 取第一条（modern、UNICODE、`/utf-8`）。
 - `command` 里带 clangd 需要的 `--target=`（`TARGET_ARG`）；路径反斜杠双写，所以用的是转义版变量（`CFLAGS_JSON` = `%CFLAGS:\=\\% /std:c17`、`CXXFLAGS_JSON` = 同基线 + `/std:c++20`）。
@@ -337,7 +337,7 @@ tests/golden/w9x/    Win98 guest 的黄金输出
 
 ```text
 u32 entry_count
-entry[entry_count]:  u16 name_len | char name[name_len]（小写、无路径） | u32 raw_size
+entry[entry_count]:  u16 name_len | char name[name_len]（小写、无路径） | u32 raw_size | u8 kind（0 = module、1 = exec blob）
 u8  props[5]         // 全包共用一份 LZMA 属性
 payload              // 单条 LZMA 流：各模块原始字节按 entry 顺序背靠背
 ```
@@ -346,6 +346,7 @@ payload              // 单条 LZMA 流：各模块原始字节按 entry 顺序�
 - **不设 magic / 版本号**：生成器与消费者永远出自同一次构建（ninja 保证）。自检只做结构边界校验（entry 数上限、`name_len` / `raw_size` 越界、解压长度 == `raw_size` 之和）。
 - **单流**（不是每模块一条流）：四个 x86 模块高度同质，独立流会多付约 2 倍体积；代价是启动即解压全部模块（x86 ≈19.5 ms / 2.3 MB 缓冲，x64 ≈17 ms / 1.5 MB）。
 - `tools/pack` 会**审计导入表**：模块引用了非白名单系统 DLL、又不在打包集合里 → 构建期直接报错（把「漏打包 xxx.dll」挡在构建期）。新增系统依赖必须先加白名单（`PITFALLS.md` X1）。
+- `tools/pack` 的 `--blob=<path>` / `--no-blob` **必须给出其一**（D63，构建期挡）：`--blob` 把另一架构的产物作为 `kind = 1` 的 entry 打进主 exe（blob 在 manifest 里的名字固定为 `adbg64.bin`，进**同一条单流**、字节原样参与），`--no-blob` 是「本次没有 blob 条目」的显式声明（给 x64 那一侧用——它就是 blob 本体）。选项一律排在文件列表之前；两个都不给或两个都给 → 报错退 1。`--list` 按 `kind` 区分（`module` / `exec`）。
 
 ### 11.3 exe ↔ 模块的 ABI（唯一契约）
 

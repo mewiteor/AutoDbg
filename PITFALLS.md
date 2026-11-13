@@ -24,6 +24,7 @@
 | B11 | `.out` 里出现 `AutoDbg_*.lib` / `*.exp` 噪音 | DLL 链接默认产出导入库与导出文件，而模块只被手工映射、从不被 import | DLL 链接加 `/noimplib /noexp`（导出表本身不受影响，`resolve("autodbg_run")` 照常工作） |
 | B12 | 加了个「构建期生成的版本头」后，每次构建都全量重编 | 生成步骤无条件重写文件 → mtime 变 → 包含它的 TU 全部重编；或者反过来忘了把它放到 include 路径里（`#include` 找不到 → 默默跑“unknown”分支） | `:genversion` 先写 `*.tmp`、`fc /b` 比内容，**变了才 `move`**（同 `luajit_relver.txt` 的路子）；`<build>\gen` 必须同时进 `CFLAGS` 与 `AD_FLAGS` 的 `/I` |
 | B13 | 把中文写进启动器打印的文本（`--help` / 错误信息）在控制台上是乱码 | 启动器走 `WriteFile` 写字节，控制台按 CP936 解码；它又是 ANSI 编译 | 启动器输出一律 **ASCII**（中文只走模块内的 `WriteConsoleW`）；构建期生成的 `.h` 注释也只写 ASCII（cmd 代码页不可控，进了 `/utf-8` 编译单元会报 C4819） |
+| B14 | 给 `pack` 加 `flags =` 之后，`build.ninja` 报 `expected newline, got ':'` —— 在 build 行里用 `!VAR::=$:!` 转义冒号，但 `VAR` 为空时 cmd 不做替换，把 `:=$:` 当字面量吐进 ninja 文件（x64 那一侧的 blob 变量就是空的） | 需要转义的变量要**先存转义好的值**（`set PACK_BLOB_ESC=%INSTALLROOT::=$:%\AutoDbg_64.exe`，x64 分支存空串），build 行里用 `!PACK_BLOB_ESC!`；`flags =` 里的路径不需要转义（变量值不参与 build 行的冒号解析，见 §10.5 与现有 `flags = ... %SRCDIR%\...lib` 的先例） |
 
 ## K. 零 CRT / 编译器辅助符号 / 结构偏移
 

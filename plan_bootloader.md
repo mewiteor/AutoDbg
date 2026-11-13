@@ -2,7 +2,7 @@
 
 > 建议单独开分支（`feat/bootloader`）：它改的是产物矩阵与打包口径，不改引擎状态机。
 > 决策仍归 `AGENTS.md` §13；坑归 `PITFALLS.md`；对外契约文档归 `tools/agent/autodbg-skill/`。
-> 门禁基线（当前，详见 `plan_t7.md` §12.2）：import **14 产物** / selftest **73** / e2e_tcp **59**（x64 51）/ e2e_json 32 / e2e_gui 21（26）/ nvim_smoke **35**（含 `repl.*` 三条）/ check_skill **17（58 片段）** / e2e_dbg 36 / e2e_repl 11。
+> 门禁基线（当前，详见 `plan_t7.md` §12.2）：import **14 产物** / selftest **77**（含 `handoff.decision-*` 四条）/ e2e_tcp **59**（x64 51）/ e2e_json 32 / e2e_gui 21（26）/ nvim_smoke **35**（含 `repl.*` 三条）/ check_skill **17（58 片段）** / e2e_dbg 36 / e2e_repl 11。
 > 依赖：`plan_t7.md` —— handoff 之后真正跑脚本的是 child，child 的执行模型必须是逐事件的。
 
 ---
@@ -100,16 +100,20 @@
 - **(b) 产物矩阵与命名一次改完**：主 exe 改名 `AutoDbg.exe` + `scan_dir.py` 的名字规则与 `.bin` 支持 + `AutoDbg_64.exe` 停止产出 + 4 个 e2e 脚本的 exe 路径口径（`-Render 64` 从此含义是「跑 `AutoDbg.exe` → handoff」）+ nvim 的 PATH 查找加 host 位宽档（D39 本地模式）+ skill `references/cli.md` 加「产物与位数」一节。
 - **(c) WOW64 四件**：`parse_pe` 按运行期 `Machine`、`Wow64Get/SetThreadContext` 能力上报、`stack_trace` 走 EBP 链、PEB/TEB 按位宽 + `wow64.target-unsupported`。
 
-### 仍待确认（(a) 开工前）
+### 已定（(a) 开工前拍板）
 
-1. `tools/pack` 遇到**没有 x64 blob** 时（单架构 `make.bat a 86` 就是这种情形）：报错挡在构建期，还是「无 `exec` 条目 → 构建照常完成、运行期回退 x86 模块」？后者要加一条断言 `handoff.no-blob-fallback`，并且 handoff 门禁要求一次两架构全量构建。
-2. `--selftest` 归主 exe（不落盘、不 handoff，与 `-h` / `--list` / `--version` 同侧）还是跟着 handoff？建议归主 exe，这样 selftest 门禁口径不变（73 条）。
-3. `handoff.job-nested-fails-clean` 的写法：PowerShell 没有原生 job API，门禁里用 `Add-Type` P/Invoke 建 job 并把主 exe assign 进去（`CreateJobObject` / `AssignProcessToJobObject` 是 wxp+，本机可用）。确认这个写法。
+1. **构建期直接报错**（拍板）：`--blob=<path>` / `--no-blob` 必须给出其一，没有「静默无 blob」第三档。配合第 2 条，运行期不存在「单架构拿不到 blob」的分支，所以**不设 `handoff.no-blob-fallback` 断言**。
+2. `make.bat a <arch>` **不再构建**（拍板）——只生成该架构的 `compile_commands.json`；构建只在 `make.bat` 不带 `a` 时进行，顺序 **64 先、86 后**（86 的 pack 边把 64 的产物当隐式依赖 `^|`）。于是 86 主 exe 永远带 blob，64 那一侧显式 `--no-blob`（它就是 blob 本体）。
+3. `--selftest` **归主 exe**（拍板）：与 `-h` / `--list` / `--version` 同侧，不触发落盘、不 handoff；判定本身是纯函数 `decide_handoff_action`（`src/common/handoff_decision.*`），4 条自测 `handoff.decision-*` → selftest **77**。
+4. `handoff.job-nested-fails-clean` 用 `Add-Type` P/Invoke 建 job 并把主 exe assign 进去（`CreateJobObject` / `AssignProcessToJobObject` 是 wxp+，本机可用）——已定。
 
 
 ---
 
 ## 6. 门禁断言名
+- ❗`handoff.no-blob-fallback` **不设断言**（见 §5.5 第 1 条）。
+- `boot.no-wow64-branch` 本地测不了（需要 98 guest）→ 挂 `plan.md` §1.3 的 Win9x 矩阵。
+- `e2e_boot.ps1`（新建）必须跑在**一次两架构全量构建**之后（`make.bat`，64 先、86 后）。
 
 ```text
 handoff.cmdline-passthrough      含引号的 argv[0]、带空格/引号的脚本参数、中文路径
