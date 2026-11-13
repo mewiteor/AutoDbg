@@ -69,6 +69,13 @@ $Port = 18771
 $TmpDir = Join-Path ([System.IO.Path]::GetTempPath()) 'autodbg_tcp_e2e'
 New-Item -ItemType Directory -Force -Path $TmpDir | Out-Null
 
+# 拍板 A：server 那侧跑的是 32 位 fixture，所以必须留在 x86 半份 —— (c) 的四件做完之前 x64 半份调不了
+# 32 位目标（`parse_pe` 按编译期 `_WIN64`、`GetThreadContext` 对 WOW64 线程无效，PITFALLS M12）。
+# 所以只在 64 位 host + x86 产物时关 handoff。client 那侧不调试（它只是送帧），所以上面的断言仍然走
+# handoff 那条路径 —— 顺带把进程边界也测了一遍。
+$HostIs64 = [Environment]::Is64BitOperatingSystem
+$NoHandoffArgs = if ($HostIs64 -and $Render -eq '86') { @('--no-handoff') } else { @() }
+
 function Ok([string]$name, [string]$detail = '')
 {
     $script:pass++
@@ -168,6 +175,7 @@ function Start-Server([string[]]$Extra)
     $err = Join-Path $TmpDir 'srv.err'
     $args = @('--server=tcp', "--server-port=$Port", '--server-no-echo')
     if ($Variant) { $args += "--variant=$Variant" }
+    $args += $NoHandoffArgs
     $args += $Extra
     $script:proc = Start-Process -FilePath $Exe -ArgumentList $args -RedirectStandardOutput $out `
         -RedirectStandardError $err -PassThru -NoNewWindow

@@ -10,6 +10,7 @@
 #
 # 覆盖（切片 A + C1a + C1b + C1c + C1d）：
 #   caps.*            这台机器/build 的事实：arch / variant / flavor / win9x / attach / detach / hits_cap
+#                     ❗本门禁带 `--no-handoff`（拍板 A）⇒ 跑的是 x86 半份；不带时 64 位 host 上 arch 要按「执行脚本的那个进程」算（D63）
 #   detach.capability `dbg.detach` 存在且 `dbg.close` **已删**（D51：无隐式回退，能力缺席就是 nil）
 #   help.*            help() / help('dbg') / help('dbg.pump') / 未知主题 / 管道下纯文本（无 ESC）
 #   kill.*            d:kill 真的终止目标；之后状态复位（pump -> nil + "no session"）
@@ -124,6 +125,13 @@ New-Item -ItemType Directory -Force -Path $TmpDir | Out-Null
 $VariantArgs = @()
 if ($Variant) { $VariantArgs += "--variant=$Variant" }
 
+# 拍板 A：本门禁必须留在 x86 半份 —— (c) 的四件做完之前，x64 半份调不了 32 位 fixture（`parse_pe` 按编译期
+# `_WIN64`、`GetThreadContext` 对 WOW64 线程无效，PITFALLS M12）。所以 64 位 host + x86 产物时这里显式
+# 关 handoff；handoff 本身由 `tools/boot_test/e2e_boot.ps1` 测。`remote.*` 那几条连的是 `$Exe64` 起的
+# 64 位 server，与这个开关无关。
+$HostIs64 = [Environment]::Is64BitOperatingSystem
+$NoHandoffArgs = if ($HostIs64 -and $Render -eq '86') { @('--no-handoff') } else { @() }
+
 function Ok([string]$name, [string]$detail = '')
 {
     $script:pass++
@@ -145,7 +153,7 @@ function Run-Local([string]$script, [int]$TimeoutMs = 30000)
     $out = Join-Path $TmpDir 'out.txt'
     $err = Join-Path $TmpDir 'err.txt'
     Remove-Item $out, $err -ErrorAction SilentlyContinue
-    $p = Start-Process -FilePath $Exe -ArgumentList (@($VariantArgs) + @($script)) `
+    $p = Start-Process -FilePath $Exe -ArgumentList (@($VariantArgs) + $NoHandoffArgs + @($script)) `
         -RedirectStandardOutput $out -RedirectStandardError $err -PassThru -NoNewWindow
     $null = $p.WaitForExit($TimeoutMs)
     $o = if (Test-Path $out) { Get-Content $out -Raw } else { '' }
@@ -240,6 +248,8 @@ print(string.format('arch=%s variant=%s flavor=%s win9x=%s attach=%s detach=%s h
 print('detach_member=' .. tostring(dbg.detach ~= nil) .. ' close_member=' .. tostring(dbg.close))
 '@
 $r = Run-Local $s_caps
+# 因为本门禁带 `--no-handoff`（拍板 A），跑脚本的就是 x86 半份本身 ⇒ 期望值仍然是「渲染架构」；
+# 不带那个开关时，64 位 host 上跑 x86 产物会 handoff ⇒ 期望值要按「执行脚本的那个进程」算（D63）。
 $arch = if ($Render -eq '64') { 'x64' } else { 'x86' }
 $variant = if ($Variant) { $Variant } else { 'modern' }
 Check 'caps.arch-variant' ($r.out -match "arch=$arch variant=$variant flavor=lua") "expected arch=$arch variant=$variant; out=[$($r.out)]"

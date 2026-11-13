@@ -20,6 +20,7 @@
 #   repl.json-exclusive       `--repl --json` → 启动器报错、退出码 2（D50：那一行独占 stdout）
 #   repl.state-shared         `=dbg.caps().arch` → `x86` / `x64`：证明 REPL 与脚本路径共用
 #                             同一份 `lua_State`（`dbg`/`gui`/`open_file`/`help` 都在）
+#                             ❗本门禁带 `--no-handoff`（拍板 A）⇒ 跑的是 x86 半份；不带时 64 位 host 上会 handoff（D63）
 #   repl.remote-exclusive     **D2b**：`--repl --remote=<host:port>` → 启动器报错、退出码 2
 #                             （D1 里这条是「静默忽略」，现在不再静默）
 #   repl.exit-report          **D2b**：`dbg.create{ imagepath = <fixture> }` 后 EOF → stderr 含
@@ -68,6 +69,12 @@ New-Item -ItemType Directory -Force -Path $TmpDir | Out-Null
 $VariantArgs = @()
 if ($Variant) { $VariantArgs += "--variant=$Variant" }
 
+# 拍板 A：本门禁必须留在 x86 半份 —— (c) 的四件做完之前，x64 半份调不了 32 位目标（`parse_pe` 按编译期
+# `_WIN64`、`GetThreadContext` 对 WOW64 线程无效，PITFALLS M12）。所以 64 位 host + x86 产物时这里显式
+# 关 handoff；handoff 本身由 `tools/boot_test/e2e_boot.ps1` 测。
+$HostIs64 = [Environment]::Is64BitOperatingSystem
+$NoHandoffArgs = if ($HostIs64 -and $Render -eq '86') { @('--no-handoff') } else { @() }
+
 function Ok([string]$name, [string]$detail = '')
 {
     $script:pass++
@@ -93,7 +100,7 @@ function Run-Repl([string]$stdinText, [string[]]$Extra = @(), [int]$TimeoutMs = 
     Remove-Item $in, $out, $err -ErrorAction SilentlyContinue
     [IO.File]::WriteAllText($in, $stdinText, (New-Object System.Text.UTF8Encoding($false)))
 
-    $replArgs = @('--repl') + $VariantArgs + $Extra
+    $replArgs = @('--repl') + $VariantArgs + $NoHandoffArgs + $Extra
     $p = Start-Process -FilePath $Exe -ArgumentList $replArgs -RedirectStandardInput $in `
         -RedirectStandardOutput $out -RedirectStandardError $err -PassThru -NoNewWindow
     $null = $p.WaitForExit($TimeoutMs)
@@ -109,7 +116,7 @@ function Run-Repl([string]$stdinText, [string[]]$Extra = @(), [int]$TimeoutMs = 
 # （repl.cpp 的 `read_once` 两条都要认）—— 所以门禁两条都跑。
 function Run-Repl-Pipe([string[]]$Lines)
 {
-    $replArgs = @('--repl') + $VariantArgs
+    $replArgs = @('--repl') + $VariantArgs + $NoHandoffArgs
     $o = @($Lines) | & $Exe @replArgs
     $code = $LASTEXITCODE
     return [pscustomobject]@{ code = $code; out = ($o -join "`n") }
@@ -160,6 +167,8 @@ Check 'repl.json-exclusive' ($r.code -eq 2 -and $r.err -match '--repl cannot be 
 # ---------------------------------------------------------------- ⑧ 复用同一个 state
 # `dbg.caps()` 是 `dbg` 表上的能力上报（切片 A），REPL 里能取到就说明它与脚本路径共用
 # 同一份 `create_state_with_libs()`（不是另建了一个只装了基库的 state）。
+# 因为本门禁带 `--no-handoff`（拍板 A），跑脚本的就是 x86 半份本身 ⇒ 期望值仍然是「渲染架构」；
+# 不带那个开关时，64 位 host 上跑 x86 产物会 handoff ⇒ 期望值就要按「执行脚本的那个进程」算（D63）。
 $want = if ($Render -eq '64') { 'x64' } else { 'x86' }
 $r = Run-Repl "=dbg.caps().arch`n"
 Check 'repl.state-shared' ($r.code -eq 0 -and $r.out -match "(?m)^$want\s*$") `
