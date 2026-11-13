@@ -8,6 +8,11 @@
  *   · 旧 `run()` 是「拿到事件后立刻 ContinueDebugEvent」；这里 `pump` 默认**不 continue**，事件停在
  *     未应答状态（`dbg.paused()`），由脚本显式 `dbg.cont([pid[,tid[,code]]])` —— `Run` 仍是那条便捷糖，
  *     两条路径在同一个会话上不可混用：`dbg` 停着一个未应答事件时 `Run`/`Attach` 报固定文案（§2.1 第 4 条）。
+ *   · 两个入口分开：`dbg.create{...}`（= `Run` 的原语版，`CreateProcess` + `DEBUG_PROCESS`）与
+ *     `dbg.attach(pid [, opts])`（= `Attach` 的原语版，`DebugActiveProcess`）。不再用 `params.pid != 0`
+ *     隐式分派 —— 两个入口各自校验必填项（create 要 `imagepath`、attach 要非 0 的 `pid`），
+ *     且 `attach` 能诚实地把「Win95/98 没有附加能力」作为 `nil, err` 上报（core 的 `-2`）。
+ *     `attach` 只认显式 pid：`Attach{ }` 的「沿用上次 pid / 鼠标选进程」属 D48 解析链，是隐形状态，不进原语层。
  *   · `pump` 的 timeout 按 ≤250 ms 切片（core），每片没等到事件就问一次 `on_wait_timeout` ⇒ `--cancel`
  *     能在 pump 空闲时插话（D32 的第①个 poll 点）。本地模式的控制台 q / Shift+Q 策略仍只属 `Run` 路径
  *     （`CheckConsoleInput`）：`dbg` 不回读控制台，这条是**有意的**（免得以后被当 bug）。
@@ -24,6 +29,9 @@
  *   · `arm` 要求模块**已加载**（`get_base` 非 0）——否则 core 的 `set_breakpoint` 只会建一个
  *     `has_orignal_byte = 0` 的节点，直到命中时才报 "tmp->has_orignal_byte is zero!"（§9 第 9 条）；
  *     所以这里先判 base 并给一句能看懂的错。
+ *   · ❗`arm` 不能打在「本来就写着 `CC` 的地址」上（例如 fixture 的 int 3）：core 命中后会把那里
+ *     当「原始字节」还原、退回 EIP、置 TF 单步 —— 单步执行的又是 `CC`，于是再撞一次断点。
+ *     对写死的 `int 3`，正确的做法是 `dbg.cont(nil, nil, 0x00010002)`（= `DBG_CONTINUE`）显式放行。
  *   · 用户回调的参数是**普通表** `{pid,tid,ea,code,modname,rva}`（新接口一律普通数字，不再用 LuaVariant）：
  *     `on_breakpoint` / `on_single_step` / `on_exception` / 断点自带回调都带 modname+rva，
  *     `callback`（入口）/ `on_exit_process` 没有 EA，modname 为空串、rva = 0。
@@ -58,9 +66,12 @@ namespace
 
 const int kHitCapMax = 64;
 
-/* 两条固定文案（门禁逐字断，plan_t7.md §2.1 第 4 条） */
+/* 两条固定文案（门禁逐字断，plan_t7.md §2.1 第 4 条）。
+ * 另两条「入口错」用常量，免得 rename 时改漏： */
 const char *const kErrReentry = "pump cannot be called from a callback";
 const char *const kErrPaused  = "cannot run while an event is unhandled";
+const char *const kErrStarted = "dbg: already started (call dbg.close first)";
+const char *const kErrNoSess  = "dbg: no session (call dbg.create or dbg.attach first)";
 
 enum HitType
 {
@@ -148,9 +159,9 @@ static void reset_state(lua_State *L)
     g.seq_next = 1;
 }
 
-static int store_ref(lua_State *L, const char *field)
+static int store_ref(lua_State *L, int n, const char *field)
 {
-    lua_getfield(L, 1, field);
+    lua_getfield(L, n, field);
     int ref = LUA_NOREF;
     if (lua_isfunction(L, -1)) ref = luaL_ref(L, LUA_REGISTRYINDEX);
     else lua_pop(L, 1);
@@ -379,80 +390,46 @@ static int h_wait_timeout(void *ctx, bool can_detach_without_term)
 
 /* ---------------- 表方法 ---------------- */
 
-static int dbg_begin(lua_State *L)
+/* 选项表里**两个入口共用**的那部分：`use_scylla_hide` + 六个回调。
+ * `n` = 表在栈上的绝对下标（`create` 的表是 1，`attach` 的第二个参数是 2）。 */
+static void read_common_opts(lua_State *L, int n)
 {
-    if (g.in_callback) return reentry(L);
-    if (g.started)     return fail(L, "dbg.begin: already started (call dbg.close first)");
-    if (!lua_istable(L, 1)) return fail(L, "dbg.begin: table expected");
-
-    reset_state(L);
-
-    lua_getfield(L, 1, "imagepath");
-    if (lua_isstring(L, -1))
-    {
-        g.s_imagepath = utf8_to_tchar(lua_tostring(L, -1));
-        g.params.imagepath = g.s_imagepath;
-    }
-    lua_pop(L, 1);
-    lua_getfield(L, 1, "cmdline");
-    if (lua_isstring(L, -1))
-    {
-        g.s_cmdline = utf8_to_tchar(lua_tostring(L, -1));
-        g.params.cmdline = g.s_cmdline;
-    }
-    lua_pop(L, 1);
-    lua_getfield(L, 1, "cwd");
-    if (lua_isstring(L, -1))
-    {
-        g.s_cwd = utf8_to_tchar(lua_tostring(L, -1));
-        g.params.cwd = g.s_cwd;
-    }
-    lua_pop(L, 1);
-
-    lua_getfield(L, 1, "pid");
-    if (lua_isnumber(L, -1)) g.params.pid = (DWORD)lua_tointeger(L, -1);
-    lua_pop(L, 1);
-    lua_getfield(L, 1, "is_new_console");
-    g.params.is_new_console = lua_toboolean(L, -1) ? true : false;
-    lua_pop(L, 1);
-    lua_getfield(L, 1, "use_scylla_hide");
+    lua_getfield(L, n, "use_scylla_hide");
     g.params.use_scylla_hide = lua_toboolean(L, -1) ? true : false;
     lua_pop(L, 1);
 
-    /* 与 `Run` 同一口径：有 `pid` = 附加，否则创建。两边都没有 → core 会拿 NULL 去 CreateProcess，
-     * 不如在这里给一句能看懂的错。 */
-    if (!g.params.imagepath && !g.params.pid)
-    {
-        free_strings();
-        return fail(L, "dbg.begin: imagepath or pid expected");
-    }
+    g.ref_entry           = store_ref(L, n, "callback");
+    g.ref_exception_cb    = store_ref(L, n, "exception_callback");
+    g.ref_on_exception    = store_ref(L, n, "on_exception");
+    g.ref_on_breakpoint   = store_ref(L, n, "on_breakpoint");
+    g.ref_on_single_step  = store_ref(L, n, "on_single_step");
+    g.ref_on_exit_process = store_ref(L, n, "on_exit_process");
+}
 
-    g.ref_entry           = store_ref(L, "callback");
-    g.ref_exception_cb    = store_ref(L, "exception_callback");
-    g.ref_on_exception    = store_ref(L, "on_exception");
-    g.ref_on_breakpoint   = store_ref(L, "on_breakpoint");
-    g.ref_on_single_step  = store_ref(L, "on_single_step");
-    g.ref_on_exit_process = store_ref(L, "on_exit_process");
-
+/* 装好 `DebugCallbacks` 调 core 的 `begin`；两个入口的最后一步（差别已在 `params` 里）。 */
+static int start_session(lua_State *L)
+{
     ZeroMem(g.cb);
-    g.cb.context                = L;
-    g.cb.on_any_debug_event     = h_any_event;
-    g.cb.on_exception           = h_exception;
-    g.cb.on_breakpoint          = h_breakpoint;
-    g.cb.on_single_step         = h_single_step;
-    g.cb.on_exit_process        = h_exit_process;
-    g.cb.on_first_breakpoint    = h_first_breakpoint;
-    g.cb.on_user_exception      = h_user_exception;
-    g.cb.on_breakpoint_callback = h_bp_callback;
+    g.cb.context                 = L;
+    g.cb.on_any_debug_event      = h_any_event;
+    g.cb.on_exception            = h_exception;
+    g.cb.on_breakpoint           = h_breakpoint;
+    g.cb.on_single_step          = h_single_step;
+    g.cb.on_exit_process         = h_exit_process;
+    g.cb.on_first_breakpoint     = h_first_breakpoint;
+    g.cb.on_user_exception       = h_user_exception;
+    g.cb.on_breakpoint_callback  = h_bp_callback;
     g.cb.on_breakpoint_destroyed = h_bp_destroyed;
-    g.cb.on_wait_timeout        = h_wait_timeout;
+    g.cb.on_wait_timeout         = h_wait_timeout;
 
     const char *err = nullptr;
     int r = sess().begin(&g.params, &g.cb, &err);
     if (r == -2)
     {
-        free_strings();                             /* 1:1：这条路径不跑收尾（§4.1） */
-        return fail(L, "attach failed");
+        /* 1:1：这条路径不跑收尾（§4.1）。`-2` 只来自 `DebugActiveProcess` 失败
+         * （Win95/98 根本没有附加能力 ⇒ legacy 变体上 `dbg.attach` 就是这句）。 */
+        free_strings();
+        return fail(L, "attach failed (DebugActiveProcess) — Win95/98 has no attach");
     }
     if (r < 0)
     {
@@ -465,10 +442,77 @@ static int dbg_begin(lua_State *L)
     return 1;
 }
 
+/* `dbg.create{ imagepath=…, cmdline=…, cwd=…, is_new_console=…, use_scylla_hide=…, <六个回调> }`
+ * = `Run` 的原语版：`CreateProcess` + `DEBUG_PROCESS`，**不循环**。 */
+static int dbg_create(lua_State *L)
+{
+    if (g.in_callback) return reentry(L);
+    if (g.started)     return fail(L, kErrStarted);
+    if (!lua_istable(L, 1)) return fail(L, "dbg.create: table expected");
+
+    reset_state(L);
+
+    lua_getfield(L, 1, "imagepath");
+    if (lua_isstring(L, -1))
+    {
+        g.s_imagepath      = utf8_to_tchar(lua_tostring(L, -1));
+        g.params.imagepath = g.s_imagepath;
+    }
+    lua_pop(L, 1);
+    lua_getfield(L, 1, "cmdline");
+    if (lua_isstring(L, -1))
+    {
+        g.s_cmdline      = utf8_to_tchar(lua_tostring(L, -1));
+        g.params.cmdline = g.s_cmdline;
+    }
+    lua_pop(L, 1);
+    lua_getfield(L, 1, "cwd");
+    if (lua_isstring(L, -1))
+    {
+        g.s_cwd      = utf8_to_tchar(lua_tostring(L, -1));
+        g.params.cwd = g.s_cwd;
+    }
+    lua_pop(L, 1);
+    lua_getfield(L, 1, "is_new_console");
+    g.params.is_new_console = lua_toboolean(L, -1) ? true : false;
+    lua_pop(L, 1);
+
+    /* 必填项显式判：core 会拿 NULL 去 `CreateProcess`，那只会换来一句 CreateProcess 失败 */
+    if (!g.params.imagepath)
+    {
+        free_strings();
+        return fail(L, "dbg.create: imagepath expected");
+    }
+
+    read_common_opts(L, 1);
+    return start_session(L);
+}
+
+/* `dbg.attach(pid [, { use_scylla_hide=…, <六个回调> }])` = `Attach` 的原语版。
+ * ❗只认**显式** pid：`Attach{ }` 的「沿用上次 pid / 鼠标选进程」魔法属 D48 的解析链，
+ *   在状态机原语层里是隐形状态（脚本该自己 `gui.pick()` 并把结果写进脚本头标记）。 */
+static int dbg_attach(lua_State *L)
+{
+    if (g.in_callback) return reentry(L);
+    if (g.started)     return fail(L, kErrStarted);
+    if (!lua_isnumber(L, 1)) return fail(L, "dbg.attach: pid (number) expected");
+
+    DWORD pid = (DWORD)lua_tointeger(L, 1);
+    if (!pid) return fail(L, "dbg.attach: pid expected");
+
+    bool has_opts = lua_istable(L, 2);
+    if (!has_opts && lua_gettop(L) >= 2) return fail(L, "dbg.attach: options table expected");
+
+    reset_state(L);
+    g.params.pid = pid;                    /* 非 0 ⇒ core 走 `DebugActiveProcess` 而不是 CreateProcess */
+    if (has_opts) read_common_opts(L, 2);  /* 不给表 = 只要命中记录，不要回调 */
+    return start_session(L);
+}
+
 static int dbg_pump(lua_State *L)
 {
     if (g.in_callback) return reentry(L);
-    if (!g.started)     return fail(L, "dbg.begin first");
+    if (!g.started)     return fail(L, kErrNoSess);
 
     int    top     = lua_gettop(L);
     DWORD  timeout = (top >= 1 && lua_isnumber(L, 1)) ? (DWORD)lua_tointeger(L, 1) : 100;
@@ -506,7 +550,7 @@ static int dbg_pump(lua_State *L)
 static int dbg_cont(lua_State *L)
 {
     if (g.in_callback) return reentry(L);
-    if (!g.started)     return fail(L, "dbg.begin first");
+    if (!g.started)     return fail(L, kErrNoSess);
 
     int   top  = lua_gettop(L);
     DWORD pid  = (top >= 1 && lua_isnumber(L, 1)) ? (DWORD)lua_tointeger(L, 1) : g.last_pid;
@@ -519,10 +563,17 @@ static int dbg_cont(lua_State *L)
     return 1;
 }
 
+/* `dbg.close()`：收尾。返回值：0 = 正常（该终止就终止）；1 = 要求 detach 但系统没有
+ * `DebugActiveProcessStop`（Win95/98）⇒ 已降级成 terminate（D47 的「能力上报」）。
+ * ❗目标归属决定「杀不杀」：**附加来的目标只分离**（`pid != 0` ⇒ 置 `to_detach()`，恢复原字节 +
+ * `DebugActiveProcessStop`，目标继续活着、pid 不变）；**自己 `create` 的目标维持老口径**（随 close 终止）。
+ * 这样「我只想看一眼」时不会把用户的目标搞死，而自己起的靶子不会泄漏。 */
 static int dbg_close(lua_State *L)
 {
     if (g.in_callback) return reentry(L);
-    if (!g.started)     return fail(L, "dbg.begin first");
+    if (!g.started)     return fail(L, kErrNoSess);
+
+    if (g.params.pid) sess().to_detach() = true;   /* attach 来的：只要分离（core 的 `end` 做实事） */
 
     const char *err = nullptr;
     int r = sess().end(&err);
@@ -537,10 +588,12 @@ static int dbg_close(lua_State *L)
 
     free_strings();
 
-    /* 复位本层状态：同一个 `lua_State` 里可以再次 `begin`（命中环形队列留到下一次 `begin` 再清） */
-    g.started    = false;
-    g.paused     = false;
+    /* 复位本层状态：同一个 `lua_State` 里可以再次 `create` / `attach`
+     * （命中环形队列与 `params.pid` 留到下一次入口再清） */
+    g.started     = false;
+    g.paused      = false;
     g.cb_error[0] = 0;
+    g.params.pid  = 0;
 
     lua_pushinteger(L, (lua_Integer)r);
     return 1;
@@ -562,7 +615,7 @@ static HANDLE step_thread(DWORD tid)
 static int dbg_step(lua_State *L)
 {
     if (g.in_callback) return reentry(L);
-    if (!g.started)     return fail(L, "dbg.begin first");
+    if (!g.started)     return fail(L, kErrNoSess);
 
     int   top = lua_gettop(L);
     DWORD tid = (top >= 1 && lua_isnumber(L, 1)) ? (DWORD)lua_tointeger(L, 1) : g.last_tid;
@@ -574,7 +627,7 @@ static int dbg_step(lua_State *L)
 static int dbg_eip(lua_State *L)
 {
     if (g.in_callback) return reentry(L);
-    if (!g.started)     return fail(L, "dbg.begin first");
+    if (!g.started)     return fail(L, kErrNoSess);
 
     int   top = lua_gettop(L);
     DWORD tid = (top >= 1 && lua_isnumber(L, 1)) ? (DWORD)lua_tointeger(L, 1) : g.last_tid;
@@ -595,7 +648,7 @@ static int dbg_eip(lua_State *L)
 static int dbg_arm(lua_State *L)
 {
     if (g.in_callback)  return reentry(L);
-    if (!g.started)     return fail(L, "dbg.begin first");
+    if (!g.started)     return fail(L, kErrNoSess);
     if (!lua_isstring(L, 1))  return fail(L, "dbg.arm: modname (string) expected");
     if (!lua_isnumber(L, 2))  return fail(L, "dbg.arm: rva (number) expected");   /* 普通数字，不经 LuaVariant（§2.1 第 3 条） */
     if (!lua_isfunction(L, 3)) return fail(L, "dbg.arm: callback expected");
@@ -657,14 +710,14 @@ static int dbg_setcap(lua_State *L)
 
 static int dbg_code(lua_State *L)
 {
-    if (!g.started) return fail(L, "dbg.begin first");
+    if (!g.started) return fail(L, kErrNoSess);
     lua_pushinteger(L, (lua_Integer)sess().last_code());
     return 1;
 }
 
 static int dbg_stopped(lua_State *L)
 {
-    if (!g.started) return fail(L, "dbg.begin first");
+    if (!g.started) return fail(L, kErrNoSess);
     lua_pushboolean(L, sess().cont() ? 0 : 1);   /* 「这一轮该停」= run 的 while 出口（§2.1 记录 ②） */
     return 1;
 }
@@ -685,11 +738,12 @@ void register_dbg_api(lua_State *L)
 {
     reset_state(L);
 
-    lua_createtable(L, 0, 12);
-    lua_pushcfunction(L, dbg_begin);   lua_setfield(L, -2, "begin");
+    lua_createtable(L, 0, 14);
+    lua_pushcfunction(L, dbg_create);  lua_setfield(L, -2, "create");   /* = Run 的原语版（CreateProcess） */
+    lua_pushcfunction(L, dbg_attach);  lua_setfield(L, -2, "attach");   /* = Attach 的原语版（DebugActiveProcess；Win95/98 没有） */
     lua_pushcfunction(L, dbg_pump);    lua_setfield(L, -2, "pump");
     lua_pushcfunction(L, dbg_cont);    lua_setfield(L, -2, "cont");
-    lua_pushcfunction(L, dbg_close);    lua_setfield(L, -2, "close");   /* ❗不叫 `end`：`end` 是 Lua 关键字，`dbg.end` 写不出来（`dbg["end"]()` 才能调）*/
+    lua_pushcfunction(L, dbg_close);   lua_setfield(L, -2, "close");    /* ❗不叫 `end`：`end` 是 Lua 关键字，`dbg.end` 写不出来（`dbg["end"]()` 才能调）*/
     lua_pushcfunction(L, dbg_step);    lua_setfield(L, -2, "step");
     lua_pushcfunction(L, dbg_eip);     lua_setfield(L, -2, "eip");
     lua_pushcfunction(L, dbg_arm);     lua_setfield(L, -2, "arm");

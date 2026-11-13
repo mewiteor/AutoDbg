@@ -267,7 +267,8 @@ int DebuggerSession::pump(DWORD timeout_ms, bool autocont, const char **err)
         {
             if (m_debug_active_process_stop)
                 m_debug_active_process_stop(proc().dwProcessId);
-            m_cont = false; /* 旧的 `break`：run 的 while 出口（pump 不回传「停不停」，只置标志） */
+            to_detach() = false; /* detach 已经做完：别让 `end()` 再做一遍 */
+            m_cont = false;      /* 旧的 `break`：run 的 while 出口（pump 不回传「停不停」，只置标志） */
             break;
         }
         if (left <= slice) break; /* timeout 用尽 ⇒ 等价于旧的 `continue`（回到 while 顶） */
@@ -814,14 +815,31 @@ bool DebuggerSession::cont(DWORD pid, DWORD tid, DWORD code)
     return ContinueDebugEvent(pid, tid, code) != 0;
 }
 
-/* end：收尾（原 `run` 的尾部）。`end` 不自己 detach：detach 只发生在 pump 的空闲路径
- * （1:1 保留旧行为 —— `to_detach()` 只在没等到事件时被执行），所以这里只有 `run_shutdown`。
- * D47 的降级（Win95/98 没有 DebugActiveProcessStop → 只能 terminate）由返回值与 `term()` 上报。 */
+/* end：收尾（原 `run` 的尾部）。
+ * ❗T7.3：`to_detach()` 为真时先做**真 detach**（D47）—— 恢复断点原字节 + `DebugActiveProcessStop`，
+ *   目标**继续活着**且 pid 不变（下次可再 `Attach`）。这是 `dbg.close()` 对「附加来的目标」的口径；
+ *   `Run`/`Attach` 的旧路径（`to_detach` 为假）行为一字不变。
+ * 返回值：0 = 正常收尾（该终止就终止）；**1 = 要求 detach 但系统没有 `DebugActiveProcessStop`
+ *   （Win95/98）⇒ 已降级成 terminate**（D47 的「能力上报」）；-1 保留给以后的错误。 */
 int DebuggerSession::end(const char **err)
 {
     (void)err; /* 目前不产生错误；与 begin / pump 保持同一签名 */
+    int ret = 0;
+    if (to_detach())
+    {
+        term() = false;          /* 不杀：detach 的语义就是「放手让目标继续跑」 */
+        detach_process(m_cb);    /* 恢复所有断点的原字节 + 通知销毁（令牌） */
+        if (m_debug_active_process_stop)
+            m_debug_active_process_stop(proc().dwProcessId);
+        else
+        {
+            term() = true;       /* 9x：没有该导出 ⇒ 与 D47 一样降级成 kill */
+            ret    = 1;
+        }
+        to_detach() = false;     /* 只消费一次（否则下一次 end 会再 detach 一遍） */
+    }
     run_shutdown(m_params);
-    return 0;
+    return ret;
 }
 
 /* pump_now() = pump(0, false)：REPL 与回调里唯一能用的形态（不阻塞、不 continue） */

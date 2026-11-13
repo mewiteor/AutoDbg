@@ -21,7 +21,9 @@
  *   每片没等到事件就问一次 `on_wait_timeout`（core 仍不知道 socket / stdin）。
  *
  * ✅ T7.1（plan_t7.md §2.1）：调试主循环拆成状态机 `begin` / `pump` / `cont` / `end`，`run` 是它的
- *   封装（可观察行为逐字节不变）。跨 pump 的循环状态（`m_first_bp` / `m_push_fb` / `m_reset_bpx` /
+ *   封装（可观察行为逐字节不变）。T7.3 给 `end` 补上 D47 的真 detach（`to_detach()` 为真时恢复原字节 +
+ *   `DebugActiveProcessStop`，没有该导出就降级成 kill 并返回 1）—— `Run`/`Attach` 的旧路径一字不变。
+ *   跨 pump 的循环状态（`m_first_bp` / `m_push_fb` / `m_reset_bpx` /
  *   `m_reset_hw_bp` / `m_first_create_process` / `m_debug_active_process_stop` / `m_last_code`，加上 `begin` 存下的
  *   `m_params` / `m_cb`）**必须是会话成员** —— 手工映射的模块禁止 `thread_local` 与函数内非平凡
  *   构造的 static（§11.5、PITFALLS M10），留在栈上就是跨 pump 状态丢失。
@@ -130,7 +132,7 @@ public:
     int  pump(DWORD timeout_ms, bool autocont, const char **err);   /* autocont = false ⇒ ❗不 continue；timeout_ms 按 ≤250 ms 切片（T7.3） */
     int  pump_now(const char **err);                                /* pump(0, false) */
     bool cont(DWORD pid, DWORD tid, DWORD code);                    /* ContinueDebugEvent（code 显式） */
-    int  end(const char **err);
+    int  end(const char **err);                                     /* 收尾；`to_detach()` 为真时先做真 detach（返回 1 = 无 DebugActiveProcessStop，已降级成 kill） */
     /* T7.3（plan_t7.md §4.1 / 已拍板第 5 条）：pump 算出来的「本来该用的 code」存在会话里，绑定层读它。
      * `pump` 的返回值只表达事件码（0 = 没等到事件）；「没等到事件」与「循环已终止」在返回值上
      * 不可区分（§2.1 记录 ②），所以 code 单独存一份 —— `cont` 必须显式带它（`pump.default-code-parity`）。 */

@@ -65,10 +65,18 @@ end(&err)                        run_shutdown（761）+ detach；D47 的降级�
 `on_wait_timeout` 的语义不变：pump 的空闲路径照旧问宿主，那正是执行期唯一的 control poll 点（`exec_guard.cpp:133` → `stream_poll_and_dispatch`）。
 
 **落地状态（T7.3）**：`dbg` 表在 `src/scripting/lua/dbg_bindings.cpp`（照 `gui` 的做法，注册一个全局表；29 个契约名不动）。
-方法 13 个：`begin / pump / cont / close / step / eip / arm / hits / dropped / setcap / code / stopped / paused`
-（`end` 改叫 `close` —— `end` 是 Lua 关键字，`dbg.end` 写不出来）。回调参数统一是普通表
+入口**两个**（不再用 `params.pid != 0` 隐式分派）：`create{...}` = `Run` 的原语版（`CreateProcess`，选项键与
+`Run` 同名），`attach(pid [, opts])` = `Attach` 的原语版（`DebugActiveProcess`，**只认显式 pid** ——
+「沿用上次 pid / 鼠标选进程」属 D48 解析链，不进原语层；Win95/98 没附加能力 ⇒ `nil, err`）。
+方法共 15 个：`create / attach / pump / cont / close / step / eip / arm / hits / dropped / setcap / code /
+stopped / paused`（`end` 改叫 `close` —— `end` 是 Lua 关键字，`dbg.end` 写不出来）。回调参数统一是普通表
 `{pid,tid,ea,code,modname,rva}`（新接口不再用 LuaVariant）。`hits()` 是 64 格环形队列 + `dropped` 计数
-+ `setcap(1..64)`；记录只在 `on_breakpoint / on_exception / on_single_step` 三个通道产生。
++ `setcap(1..64)`；记录只在 `on_breakpoint / on_exception / on_user_exception / on_single_step` 四个通道产生。
+
+`close()` 的**归属口径**：附加来的目标（`attach`）只分离不杀 —— `to_detach()` 为真时 core 的 `end` 做
+真 detach（恢复原字节 + `DebugActiveProcessStop`），目标继续活着、pid 不变；自己 `create` 的目标仍随
+`close` 终止（= `Run` 的老口径）。返回值：0 = 正常；**1 = 要 detach 但系统没 `DebugActiveProcessStop`
+（Win95/98）⇒ 已降级成 kill**（D47 的能力上报）。`run()` 的旧路径（`to_detach` 恒为假）行为一字不变。
 
 同轮改的 core：`pump` 的等待按 **≤250 ms 切片**，每片没等到事件就问一次 `on_wait_timeout`
 （`run()` 传 100 ms ⇒ 正好一片 ⇒ 行为逐字节不变）；`m_last_code` + `last_code()` 让绑定层拿到
@@ -246,7 +254,7 @@ repl.state-member-parity     run() 重构后既有门禁全绿（逐字节验证
 | --- | --- | --- | --- |
 | **T7.1 纯重构** | 循环态 → 会话成员；`run()` = `begin`+`pump`+`cont`+`end` 封装；可观察行为不变 | `debug_loop.cpp` +80 行、`core.hpp` +6 声明 | 既有门禁全绿 + `decide_console_action` 3 条 |
 | **T7.2 fixture** | `tests/fixtures/bin/x86_loop.c` + `fixture` ninja 边 + `scan_dir.py` 口径 | 约 60 行 | fixture 过导入表 |
-| **T7.3 `dbg` 表** | `src/scripting/lua/dbg_bindings.cpp`（新文件、新全局表）：`begin/pump/cont/close/step/eip/arm/hits/dropped/setcap/code/stopped/paused` + `pump` 的 250 ms 切片 + `m_last_code`/`last_code()` + `decide_console_action` 搬进 `common/` | 约 700 行（含门禁与注释） | `pump.*` 六条（tcp 48 → 54，已在 86 modern/legacy 上真过；x64 整段 SKIP） |
+| **T7.3 `dbg` 表** | `src/scripting/lua/dbg_bindings.cpp`（新文件、新全局表）：`create`/`attach`/`pump`/`cont`/`close`/`step`/`eip`/`arm`/`hits`/`dropped`/`setcap`/`code`/`stopped`/`paused` + `pump` 的 250 ms 切片 + `m_last_code`/`last_code()` + `end()` 的真 detach（D47 能力上报）+ `decide_console_action` 搬进 `common/` | 约 750 行（含门禁与注释） | `pump.*` 八条（tcp 48 → 56，已在 86 modern/legacy 上真过；x64 整段 SKIP） |
 | **T7.4 数据面补口** | §2.2 的 1/2/3/4/5/6/7/12（其余按需要补） | 约 200 行 | `repl.snapshot-restore`、`pump.partial-read-length`、`repl.writes-log` |
 | **T7.5 协议 + `--repl`** | `event` 帧 + `out.id` 归因 + proto 2；launcher `--repl` → ABI 5；模块侧 REPL loop（ReadFile + 切片 + guard） | `stream.*` 约 +40 行、launcher 约 40 行、模块约 120 行 | `repl.*` 五条 + 三处断言数字更新 |
 | **T7.6 Lua sugar** | `lualib/` 里新名字（例如 `dbglib`），只跑在 `dbg` 上；契约名不动 | 约 100 行 | `check_skill`（新 markdown 的 lua 片段）+ 一条 sugar 对照断言 |
@@ -278,6 +286,15 @@ repl.state-member-parity     run() 重构后既有门禁全绿（逐字节验证
    "tmp->has_orignal_byte is zero!"。
 10. 多 session 的 pump 口径：「事件属于别的 session」时是立刻 dispatch 还是入 queue（§10 第 5 条建议入 queue + 返回归属）。
 11. Lua sugar 的落点：`lualib/`（按文件名设全局，不能设 `Run`）还是 `dbg` 表的方法（C 注册）——我推荐 sugar 挂 `dbg` 表，lualib 只放纯 Lua 的策略函数。转义符口径（已讨论）：文件名去扩展名后，`<转义符><字母>` → 大写，其余原样；转义符选 `-`（`_` 不行，它是标识符字符，会跟「按文件名」约定打架）。只转 `name` 不转 `path`（`path` 是 chunkname，`nvim_smoke` 的 `err.error-text` 靠它）；`gen_lua_lib.lua` 要在构建期校验「结果是合法标识符」。
+12. **`attach` 的两条实测口径**（T7.3 / `pump.attach-*`）：
+   · 位数必须配对：**32 位调试器附 64 位目标**时 `DebugActiveProcess` 返回 ERROR_NOT_SUPPORTED（50），
+     不是权限错也不是「目标已退出」——门禁里必须起一个 32 位靶子（`SysWOW64\cmd.exe`，
+     32 位主机上才能用 `system32\cmd.exe`）。
+   · `attach` + `close()` 必须**只分离**：自己 `create` 的目标随 close 终止（= `Run` 老口径），
+     附加来的目标 `to_detach()` → 恢复原字节 + `DebugActiveProcessStop` 后继续活着（pid 不变，可再 Attach）。
+     降级路径（9x 无 `DebugActiveProcessStop`）由 `dbg.close()` 返回值 **1** 上报。
+   · 门禁不能复用「跑过几轮客户端」的那条共享连接（空闲 2 s 被服务端关，见 §2.1 实测口径），
+     且断言「目标还活着」要在 `Run-Client` 返回后 `$tgt.Refresh()` 再读 `HasExited`。
 
 ---
 

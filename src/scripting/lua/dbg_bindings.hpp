@@ -4,13 +4,17 @@
  * src/scripting/lua/dbg_bindings.hpp —— `dbg` 表（T7.3 / plan_t7.md §2.1）
  *
  * 来源：新写。形态照 `gui`：注册**一个全局表**（AGENTS.md §5 第 6 条），29 个契约名一个都不动。
- *   表内容：begin / pump / cont / close / step / eip / arm / hits / dropped / setcap / code / stopped / paused。`end` 用 `close` 的名字 —— `end` 是 Lua 关键字，`dbg.end` 写不出来（只有 `dbg["end"]()` 能调，所以不用）。
+ *   表内容：create / attach / pump / cont / close / step / eip / arm / hits / dropped / setcap /
+ *   code / stopped / paused。
+ *     · `create` = `Run` 的原语版（`CreateProcess` + `DEBUG_PROCESS`，选项表与 `Run` 同名）；
+ *     · `attach` = `Attach` 的原语版（`DebugActiveProcess`，`dbg.attach(pid [, opts])`；Win95/98 没有附加能力）；
+ *     · `close` 而不是 `end` —— `end` 是 Lua 关键字，`dbg.end` 写不出来（只有 `dbg["end"]()` 能调）。
  *   便捷层（until / on_hit / 条件断点）是 Lua sugar，归 T7.6（新文件 + 新全局名），不在这里。
  *
  * 回调参数形状（新接口一律普通数字/字符串，不再用 LuaVariant）：`{ pid, tid, ea, code, modname, rva }`，
- *   与 `dbg.hits()` 的记录同名同义。`begin` 接受的选项键与 `Run` 的表格同名：
- *   `imagepath` / `cmdline` / `cwd` / `pid` / `is_new_console` / `use_scylla_hide`，加六个回调
- *   （`callback` / `exception_callback` / `on_exception` / `on_breakpoint` / `on_single_step` / `on_exit_process`）。
+ *   与 `dbg.hits()` 的记录同名同义。回调键在**两个入口共用**：
+ *   `callback` / `exception_callback` / `on_exception` / `on_breakpoint` / `on_single_step` / `on_exit_process`
+ *   （`attach` 不给选项表 ⇒ 不要回调，只记 `hits()`）。
  *
  * 两条固定文案（门禁逐字断）定在本层：
  *   "pump cannot be called from a callback"      —— 回调里调状态机

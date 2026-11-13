@@ -612,7 +612,7 @@ if ($null -eq $banner) {
 
 Write-Output ''
 
-# ---------------- ⑯ T7.3 `dbg` 状态机（pump.*，6 条） ----------------
+# ---------------- ⑯ T7.3 `dbg` 状态机（pump.*，8 条） ----------------
 # 只在 x86 跑：fixture 是 x86-only（MSVC 的 inline asm 在 x64 不可用），而 `parse_pe` 按编译期
 # _WIN64 判位数（§5 第 5 条的架构边界）⇒ x64 产物看 32 位节点会被跳过；64 口径下这段整段 SKIP。
 # 口径（本轮实测后钉死，见 plan_t7.md §9 第 8-11 条）：
@@ -681,8 +681,8 @@ else
         [IO.File]::WriteAllText($s1, @"
 local EXE = '$fxLua'
 local SITE = $($site.rva) + 5
-local ok, err = dbg.begin{ imagepath = EXE }
-if not ok then print('begin ' .. tostring(err)) return end
+local ok, err = dbg.create{ imagepath = EXE }
+if not ok then print('create ' .. tostring(err)) return end
 for i = 1, 24 do
     local code = dbg.pump(3000, false)
     if code == nil or code == 0 then break end
@@ -704,8 +704,8 @@ dbg.close()
 
         $s2 = Join-Path $TmpDir 'pump_code.lua'
         [IO.File]::WriteAllText($s2, @"
-local ok, err = dbg.begin{ imagepath = '$fxLua' }
-if not ok then print('begin ' .. tostring(err)) return end
+local ok, err = dbg.create{ imagepath = '$fxLua' }
+if not ok then print('create ' .. tostring(err)) return end
 local codes, seen = {}, 0
 for i = 1, 24 do
     local code = dbg.pump(3000, false)
@@ -721,8 +721,8 @@ dbg.close()
 
         $s3 = Join-Path $TmpDir 'pump_step.lua'
         [IO.File]::WriteAllText($s3, @"
-local ok, err = dbg.begin{ imagepath = '$fxLua' }
-if not ok then print('begin ' .. tostring(err)) return end
+local ok, err = dbg.create{ imagepath = '$fxLua' }
+if not ok then print('create ' .. tostring(err)) return end
 for i = 1, 14 do
     local code = dbg.pump(3000, false)
     if code == nil or code == 0 then break end
@@ -747,11 +747,11 @@ dbg.close()
         $s4 = Join-Path $TmpDir 'pump_reentry.lua'
         [IO.File]::WriteAllText($s4, @"
 local EXE = '$fxLua'
-local ok, err = dbg.begin{ imagepath = EXE, on_breakpoint = function(info)
+local ok, err = dbg.create{ imagepath = EXE, on_breakpoint = function(info)
     local r, e = dbg.pump()
     print('reentry=' .. tostring(r) .. ' ' .. tostring(e))
 end }
-if not ok then print('begin ' .. tostring(err)) return end
+if not ok then print('create ' .. tostring(err)) return end
 for i = 1, 24 do
     local code = dbg.pump(3000, false)
     if code == nil or code == 0 then break end
@@ -770,8 +770,8 @@ dbg.close()
         $s5 = Join-Path $TmpDir 'pump_record.lua'
         [IO.File]::WriteAllText($s5, @"
 local EXE = '$fxLua'
-local ok, err = dbg.begin{ imagepath = EXE }
-if not ok then print('begin ' .. tostring(err)) return end
+local ok, err = dbg.create{ imagepath = EXE }
+if not ok then print('create ' .. tostring(err)) return end
 for i = 1, 40 do
     local code = dbg.pump(3000, true)
     if code == nil or code == 0 then break end
@@ -781,8 +781,8 @@ print('autocont_hits=' .. #dbg.hits() .. ' autocont_paused=' .. tostring(dbg.pau
 dbg.close()
 
 local exited = nil
-ok, err = dbg.begin{ imagepath = EXE, on_exit_process = function(info) exited = info.code end }
-if not ok then print('begin2 ' .. tostring(err)) return end
+ok, err = dbg.create{ imagepath = EXE, on_exit_process = function(info) exited = info.code end }
+if not ok then print('create2 ' .. tostring(err)) return end
 print('cap=' .. tostring(dbg.setcap()) .. ' cap2=' .. tostring(dbg.setcap(2)) .. ' capbig=' .. tostring(dbg.setcap(200)))
 dbg.setcap(2)
 for i = 1, 60 do
@@ -797,12 +797,38 @@ dbg.close()
 
         $s6 = Join-Path $TmpDir 'pump_cancel.lua'
         [IO.File]::WriteAllText($s6, @"
-local ok, err = dbg.begin{ imagepath = '$fxLua' }
-if not ok then print('begin ' .. tostring(err)) return end
+local ok, err = dbg.create{ imagepath = '$fxLua' }
+if not ok then print('create ' .. tostring(err)) return end
 print('event1=' .. tostring(dbg.pump(30000, false)))
 local code, e = dbg.pump(30000, false)             -- 目标停在未应答的事件上 ⇒ 这一泵是空转
 print('idle=' .. tostring(code) .. ' err=' .. tostring(e))
 dbg.close()
+"@, (New-Object System.Text.UTF8Encoding($false)))
+
+        # `dbg.attach`：附到一个**已在跑**的 32 位目标（自己起的 64 位进程附不了：32 位调试器对 64 位目标会拿到
+        # ERROR_NOT_SUPPORTED = 50）。`ping -n 20` 约 19 s，够门禁用；close 必须只分离、目标仍活着（D47）。
+        $syswow = Join-Path $env:WINDIR 'SysWOW64\cmd.exe'
+        $cmd32  = if (Test-Path $syswow) { $syswow } else { Join-Path $env:WINDIR 'system32\cmd.exe' }
+        $tgt = Start-Process -FilePath $cmd32 -ArgumentList '/c', 'ping -n 20 127.0.0.1 >NUL' `
+            -PassThru -WindowStyle Hidden
+        Start-Sleep -Milliseconds 200
+        $s7 = Join-Path $TmpDir 'pump_attach.lua'
+        [IO.File]::WriteAllText($s7, @"
+local ok, err = dbg.attach($($tgt.Id))
+print('attach=' .. tostring(ok) .. ' err=' .. tostring(err))
+if not ok then return end
+local seen = 0
+for i = 1, 12 do
+    local code = dbg.pump(2000, false)
+    if code == nil or code == 0 then break end
+    if code == 3 then seen = 3 end          -- CREATE_PROCESS
+    dbg.cont(nil, nil, 0x00010002)
+    if seen == 3 and i >= 3 then break end
+end
+print('create_process=' .. seen)
+print('close=' .. tostring(dbg.close()))
+print('nopid=' .. tostring(select(2, dbg.attach(0))))
+print('badpid=' .. tostring(select(2, dbg.attach('x'))))
 "@, (New-Object System.Text.UTF8Encoding($false)))
 
         With-Server @('--server-timeout=20000') {
@@ -853,6 +879,17 @@ dbg.close()
                 "first=[$($first.data)] ack=[$($ackf.json)] second=[$($second.data)]"
             try { $c2.Close() } catch { }
             }
+
+            # ⑦ attach + close 的归属口径：附加来的目标只分离（目标仍活着），自己 create 的才随 close 终止
+            $r7 = Run-Client @("--remote=127.0.0.1:$Port", $s7)
+            Start-Sleep -Milliseconds 400
+            $tgt.Refresh()
+            Check 'pump.attach-detach' ($r7.out -match 'attach=true' -and $r7.out -match 'create_process=3' -and `
+                $r7.out -match 'close=0' -and -not $tgt.HasExited) `
+                "alive=$(-not $tgt.HasExited) out=[$($r7.out)]"
+            Check 'pump.attach-arg-errors' ($r7.out -match 'nopid=dbg.attach: pid expected' -and `
+                $r7.out -match 'badpid=dbg.attach: pid \(number\) expected') "out=[$($r7.out)]"
+            if (-not $tgt.HasExited) { Stop-Process -Id $tgt.Id -Force -ErrorAction SilentlyContinue }
         }
     }
 }
