@@ -543,7 +543,8 @@ type  pid  tid  ea  modname  rva  code  first_chance  cont_code
 | **B** ✅ 已落地 | help 上色（`core::print_styled` + `console_style_enabled` 纯判定 + `NO_COLOR`; sink / 非控制台 / `--json` 天然纯文本） | ~230 行（含自测与注释） | 自测 `console.style-*` 三条（70 → 73）+ 既有 `help.plain-when-piped` |
 | **C1a** ✅ 已落地 | Session 对象（full userdata + 弱值句柄表）+ C 侧 registry + `dbg.sessions/session/last` + **事件表**（`d.stop`/`cont_code`，删 `dbg.code`）+ `d:pump` 缓存优先 + 延迟武装；**仍限单会话** | ~1350 行（含门禁与注释） | `e2e_dbg` 10 → 13（`session.identity` / `session.pump-cache-first` / `session.event-table`）；`e2e_tcp` ⑯ 六个脚本迁移，条数不变（56） |
 | **C1b** ✅ 已落地 | 数据面接上对象：`d:read` / `read_u8` / `read_u16` / `read_u32` / `read_u64` / `read_str` / `write` / `context([tid[,t]])` / `stack` / `mods` / `threads` + core 的 `read_some`（真实读取长度） | ~450 行 | `e2e_dbg` 13 → 17（`session.read-write` / `read-partial` / `context` / `mods-threads`） |
-| **C2** | 多会话：事件归属分派 + 每 session 深度 1 的待应答槽 + 进程树 pid-set + 按 pid 的句柄（§10，D57） | ~400 行 | `route.*` + `pump.dispatch-attribution` / `pump.one-pending-per-session` |
+| **C2a** ✅ 已落地 | 多会话（每会话**自带** `DebuggerSession`）+ 进程级事件路由（`wait_one`/`dispatch` 拆分；按 `root_pid` 归属）+ `d:pump` 过滤循环 + `dbg.detach(pid)/kill(pid)`；本切片只保证「一个会话 = 一棵单进程树」 | ~500 行 | `e2e_dbg` 17 → 21（`session.multi-two-stopped` / `pump.dispatch-attribution` / `route.same-name-two-processes` / `run.refused-with-session`） |
+| **C2b** | 进程树：子进程事件归属父会话、按 pid 的句柄表（`read`/`write`/`VirtualProtectEx` 不能只用 `proc().hProcess`）、每 **pid** 的待应答槽、子进程 fixture | ~400 行 | `route.child-process` / `route.child-handle` / `route.other-session-queued` |
 | **C3** | 29 名转薄转发 + `Var` 退出新面（D52） | ~200 行 | `session.default-parity` |
 | **D** | REPL 本体（T7.5：`event` 帧 / `out.id` 归因 / proto 2 / ABI 5 / `=` 简写 / 多行 / 退出收尾报告） | 按 §8 | `repl.*` |
 | **C-remote** | `dbg.remote(host:port, token)` 远端 session 代理（方法面与本地相同，复用 `--server` + `client.cpp`）—— 跨位数 / 强隔离的唯一形态（D56） | ~200 行 | `remote.proxy-parity`（需两个位数） |
@@ -552,7 +553,7 @@ type  pid  tid  ea  modname  rva  code  first_chance  cont_code
 顺序硬约束：**A 必须早于 C**（`detach`/`kill` 就是 Session 对象的方法）；**C 必须早于 D**（REPL 里
 人/AI 都按对象写）。29 个旧名在 C 期间转成对象 API 的薄转发（行为逐字节不变，`session.default-parity`
 守门），退役留给之后的 D 条目。
-### 11.8 切片 A / B / C1a / C1b 落地状态（已提交）
+### 11.8 切片 A / B / C1a / C1b / C2a 落地状态（已提交）
 
 - `src/common/platform.{hpp,cpp}`（新文件）：`is_win9x()` / `is_nt()`（`GetVersionExA` 的 `dwPlatformId`，与启动器 `detect_variant()` 同一判据）+ `arch_name` / `variant_name` / `flavor_name`（收拢一处，免得 caps / help / info 各写一份字符串）。❗为什么不用编译开关：`/DAUTODBG_WIN9X` 是「要能在 9x 上跑」的**构建约束**，legacy 产物在 Win11 上也跑；而 caps 报的是**这台机器**。
 - `src/scripting/lua/help_bindings.{hpp,cpp}`（新文件）：`help([topic])` 与 `dbg.help()` 共用 `kHelp[]` 一张表，`help('dbg')` 是**前缀匹配生成的成员列表**（不存在第二份）。输出走 `PrintS` ⇒ server 模式自动进 `out` 帧、本地进控制台/管道，本层不碰句柄。正文是**窄串字面量**（现代变体 UTF-8、legacy CP936，`PrintS` 各自转成 console 需要的形式）；**主题名与签名保持 ASCII**（门禁逐字匹配）。❗legacy 编译警告 **C4566** 的教训：`⇒` / `❗` 这类字符**不能出现在字符串字面量里**（CP936 表示不出），注释里可以 —— 帮助正文里一律用 `->` 与「注意：」。
@@ -580,6 +581,16 @@ type  pid  tid  ea  modname  rva  code  first_chance  cont_code
 - 门禁：`e2e_dbg` 13 → **17**（`session.read-write`：读回 fixture 的 `B8 44 42 47 50 CC` 且 `read_u32 == 0x50474244`、写回原值；`session.read-partial`：256 MB 读只拿到一部分、`0x7FFF0000` 完全读不到；`session.context`：`Cip == site+1`、部分更新 `Cax` 生效并可还原；`session.mods-threads`：`mods()` 含 `x86_loop.exe`、`threads()` 的 tid 与事件一致）。
 - 本机实测：`e2e_dbg` 86 modern **17** / 86 legacy 17 / 64 modern 8（数据面需 x86 fixture）、`e2e_tcp` 56/56/48、`--selftest` 73（两架构）、导入表 13 产物、`e2e_json` 32、`e2e_gui` 21、`check_skill` 14、`nvim_smoke` 32 全绿。
 - 仍**没做**：`d:bp/bp_hw/bps`、`snapshot/restore`、`mem_regions`、写入日志/`dry_run`、通配符扫描（都是 §2.2 余下的数据面补口，属 C1b 之后的 T7.4 尾巴）；多会话在 C2、代理在 C-remote。
+**切片 C2a（多会话 + 进程级路由）**：
+
+- **每个会话自带一个 `DebuggerSession`**（`new core::DebuggerSession`，`release_state` 释放）—— C1a 里所有会话共用宿主那一个，多会话根本立不起来；这是本轮真正的架构补齐（§7 的「引擎可多实例」）。
+- core 把 `pump` 拆成 **`wait_one`**（≤250 ms 切片 + `on_wait_timeout` + detach/取消路径，只读一条事件，不按 `params->pid` 过滤）+ **`dispatch`**（`on_any_debug_event` → scylla → 整个 switch → `m_last_code` → `autocont` 时 continue）；`pump` = 两者串联，`run()` 一字未改。`dispatch` 没有 `err` 形参，所以内部错误文案进 `m_last_error`（`last_error()`），`pump` 再转给 `*err`。
+- 宿主层路由：`dbg.pump` = 唯一的「等」（在 `g_default`/`g_sessions` 头一个会话上调 `wait_one`）→ 按 `ev.dwProcessId` 在 registry 里找 **`root_pid` 精确匹配**的归属会话 → 在它上面 `dispatch`（`SessionScope` 包住）→ 事件表带 `session` 字段。**找不到归属就报错**（`event for unknown pid`），绝不静默丢事件（丢了那个进程会永远挂起）。
+- `d:pump` = 缓存优先 + 过滤循环（别人的事件已经分派进它自己的会话，D57 的「分派不能推迟」）。
+- 多会话放开：`dbg.sessions()` 返回全部、`dbg.session(pid)`、`dbg.last()`、**新增 `dbg.detach(pid)` / `dbg.kill(pid)`**。`Run`/`Attach` 在有 dbg 会话时拒绝，用**新固定文案** `"cannot run while a dbg session exists (detach/kill it first)"`（`dbg_busy()` 判据；`dbg_paused()` 收窄为「任一会话停着未应答事件」）。
+- ❗未应答槽的诚实口径：本切片只覆盖「单进程树」⇒ 每会话至多一个未应答事件（OS 挂起该进程线程直到 `ContinueDebugEvent`）。若同一会话的第二个事件到达（C2b 的树才会发生），**不覆盖 `d.stop`**，返回 `nil, kErrPending` —— 覆盖会让那个进程永远挂起。
+- 门禁：`e2e_dbg` 17 → **21**（`session.multi-two-stopped`：两个同名 fixture 同时停在各自 site 断点再各自收尾；`pump.dispatch-attribution`：只泵 b 时 a 的事件也被分派进 a、`a:pump(0)` 返回 `a.stop` 而不是 b 的；`route.same-name-two-processes`：同名不同 base、各自能读自己的 `base+site`；`run.refused-with-session`）。
+- 本机实测：`e2e_dbg` 86 modern **21** / 86 legacy 21 / 64 modern 8、`e2e_tcp` 56/56/48、`--selftest` 73（两架构）、导入表 13 产物、`e2e_json` 32、`e2e_gui` 21、`check_skill` 14、`nvim_smoke` 32 全绿。
 ### 11.9 多 session 的脚本面（D57 / D58，随切片 C / T7.6）
 
 #### 11.9.1 pump 的两层（D57）
@@ -595,8 +606,9 @@ type  pid  tid  ea  modname  rva  code  first_chance  cont_code
 1. **分派不能推迟**。`cont` 必须作用在已分派的事件上（已 EIP--、已 re-arm、已记录），所以§10.5 原先
    「不跑 B 的 callback」只能收紧为「`d:pump` 不**返回**别人的事件」——回调在别人 pump 里跑是可接受的
    （回调里禁止 pump/cont，不会嵌套）。
-2. **每个 session 最多一个未应答事件**：OS 会挂起该进程的线程直到 `ContinueDebugEvent` ⇒ 所谓队列
-   深度恒为 1，存一个原始 `DEBUG_EVENT` 就够，不需要队列结构。
+2. **每个「进程」最多一个未应答事件**：OS 会挂起该进程的线程直到 `ContinueDebugEvent`。单进程树（C2a 的口径）
+   ⇒ 每会话至多一个，`d.stop` 单槽就够；**进程树（C2b）里同一会话可能有多个**（别的进程还在跑），那时待应答槽要按 pid 存、
+   数量 ≤ 树里的进程数（`d.stop` 只指「最近那个」）。
 
 `d:bp` 同步改为**允许延迟武装**（D57）：模块未加载时只登记，`CREATE_PROCESS` / `LOAD_DLL` 时由
 `apply_breakpoints_for_module` 补 `0xCC`（core 本来就支持）—— 否则 `create → bp → pump` 这个最自然的

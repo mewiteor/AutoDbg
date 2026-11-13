@@ -1639,11 +1639,12 @@ int lua_run(lua_State *L)
 {
     if (lua_gettop(L) != 1)
         return run_help(L);
-    /* T7.3（plan_t7.md §2.1 第 4 条）：`dbg` 状态机停着一个未应答的事件时，`Run` / `Attach` 必须报错
-     * —— 两条路径在同一个会话上不可混用（固定文案在 dbg_bindings.hpp）。 */
-    if (autodbg::host::dbg_paused())
+    /* T7 切片 C2a（plan_t7.md §10 / D57）：**存在** dbg 会话时 `Run` / `Attach` 一律拒（固定文案在
+     * dbg_bindings.hpp）。判据从「有未应答事件」收紧成「有会话」：两条路径都独占**整个进程**的事件流，
+     * 与多会话的进程级路由（`dbg.pump`）不能共存。 */
+    if (autodbg::host::dbg_busy())
     {
-        lua_pushstring(L, autodbg::host::dbg_error_paused());
+        lua_pushstring(L, autodbg::host::dbg_error_busy());
         return lua_error(L);
     }
     core::RunParams      params;
@@ -1748,11 +1749,12 @@ int lua_attach(lua_State *L)
 {
     if (lua_gettop(L) != 1)
         return attach_help(L);
-    /* T7.3（plan_t7.md §2.1 第 4 条）：`dbg` 状态机停着一个未应答的事件时，`Run` / `Attach` 必须报错
-     * —— 两条路径在同一个会话上不可混用（固定文案在 dbg_bindings.hpp）。 */
-    if (autodbg::host::dbg_paused())
+    /* T7 切片 C2a（plan_t7.md §10 / D57）：**存在** dbg 会话时 `Run` / `Attach` 一律拒（固定文案在
+     * dbg_bindings.hpp）。判据从「有未应答事件」收紧成「有会话」：两条路径都独占**整个进程**的事件流，
+     * 与多会话的进程级路由（`dbg.pump`）不能共存。 */
+    if (autodbg::host::dbg_busy())
     {
-        lua_pushstring(L, autodbg::host::dbg_error_paused());
+        lua_pushstring(L, autodbg::host::dbg_error_busy());
         return lua_error(L);
     }
     LPCTSTR              suffix = TEXT(".attach.last.pid.bin");

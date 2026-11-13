@@ -64,10 +64,11 @@ const HelpEntry kHelp[] = {
         "  d:detach() / d:kill()                  -- 收尾\n"
         "\n"
         "事件是**普通表**：type pid tid ea modname rva code first_chance cont_code。\n"
-        "一次执行只能有一个会话；dbg.sessions() / dbg.session(pid) / dbg.last() 用来取回它。\n"
+        "一次执行可以有多个会话（每棵树一个）；事件按 dwProcessId 归属到各自的会话。\n"
+        "dbg.sessions() / dbg.session(pid) / dbg.last() 用来取回它们。\n"
         "dbg.* 上的同名函数仍然可用，作用在默认会话（最近一次 create/attach 的那个）上。\n"
-        "与 Run/Attach 的关系：它们是同一套引擎原语的便捷糖；两条路径在同一个会话上\n"
-        "不可混用（dbg 停着未应答事件时调 Run/Attach 会报错）。\n",
+        "与 Run/Attach 的关系：它们是同一套引擎原语的便捷糖；两条路径都独占**整个进程**的事件流，\n"
+        "所以有 dbg 会话时调 Run/Attach 会报错（先 detach/kill）。\n",
     },
     {
         "dbg.create",
@@ -94,7 +95,9 @@ const HelpEntry kHelp[] = {
         "  nil = 没等到事件（不是错误；目标还停着时下一次 pump 也是空转）\n"
         "  autocont = true -> 引擎自己 ContinueDebugEvent（record-and-continue 档）\n"
         "d:pump(...) 是**缓存优先**：d.stop 非空就立即返回它（不阻塞）。\n"
-        "事件表字段：type pid tid ea modname rva code first_chance cont_code。\n"
+        "事件表字段：type pid tid ea modname rva code first_chance cont_code session。\n"
+        "dbg.pump 是**进程级**的：读一条事件，按 ev.session 分派到归属会话后返回；\n"
+        "d:pump 只返回属于自己的事件（别人的照常分派，只是不返回）。\n"
         "timeout 按 <=250 ms 切片，每片问一次取消守卫 -> --cancel 能在空闲时插话。\n",
     },
     {
@@ -164,12 +167,12 @@ const HelpEntry kHelp[] = {
     {
         "dbg.paused",
         "当前是否停着一个未应答的事件",
-        "dbg.paused() -> true | false\n为 true 时 Run/Attach 会拒绝（两条路径不可混用）。\n",
+        "dbg.paused() -> true | false\n**任一**会话停着未应答事件就为 true（有会话时 Run/Attach 一律拒绝）。\n",
     },
     {
         "dbg.detach",
         "分离：恢复断点原字节 + DebugActiveProcessStop，目标继续活着",
-        "dbg.detach() -> true | nil, err\n"
+        "dbg.detach([pid]) -> true | nil, err   -- 给 pid = 按 root_pid 指名会话\n"
         "注意：Win95/98 没有 DebugActiveProcessStop -> 这个 key **根本不存在**（dbg.detach == nil）。\n"
         "有未应答事件时先替你放行（DBG_CONTINUE）：否则目标会停在被系统挂起的线程上。\n"
         "自己 create 的目标也能 detach（目标继续跑，不再被调试）。\n",
@@ -177,7 +180,7 @@ const HelpEntry kHelp[] = {
     {
         "dbg.kill",
         "终止目标并收尾",
-        "dbg.kill() -> true | nil, err\n先恢复断点原字节（顺带释放断点回调），再 TerminateProcess。\n",
+        "dbg.kill([pid]) -> true | nil, err\n先恢复断点原字节（顺带释放断点回调），再 TerminateProcess。\n",
     },
     {
         "dbg.caps",

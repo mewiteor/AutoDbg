@@ -21,7 +21,8 @@
  *   每片没等到事件就问一次 `on_wait_timeout`（core 仍不知道 socket / stdin）。
  *
  * ✅ T7.1（plan_t7.md §2.1）：调试主循环拆成状态机 `begin` / `pump` / `cont` / `end`，`run` 是它的
- *   封装（可观察行为逐字节不变）。T7.3 给 `end` 补上 D47 的真 detach（`to_detach()` 为真时恢复原字节 +
+ *   封装（可观察行为逐字节不变）。C2a 再把 `pump` 拆成 `wait_one` + `dispatch`（宿主层要按事件归属
+ *   做进程级路由）。T7.3 给 `end` 补上 D47 的真 detach（`to_detach()` 为真时恢复原字节 +
  *   `DebugActiveProcessStop`，没有该导出就降级成 kill 并返回 1）—— `Run`/`Attach` 的旧路径一字不变。
  *   跨 pump 的循环状态（`m_first_bp` / `m_push_fb` / `m_reset_bpx` /
  *   `m_reset_hw_bp` / `m_first_create_process` / `m_debug_active_process_stop` / `m_last_code`，加上 `begin` 存下的
@@ -132,14 +133,26 @@ public:
      * `begin` 另用 -2 上报「附加失败但 1:1 不跑收尾」。`pump` 返回调试事件码（0 = 没等到事件）。
      * ❗`begin` 存的是调用方的 `params` / `cb` 指针 —— 调用方必须保证它们活过整个状态机。 */
     int  begin(const RunParams *params, const DebugCallbacks *cb, const char **err);
-    int  pump(DWORD timeout_ms, bool autocont, const char **err);   /* autocont = false ⇒ ❗不 continue；timeout_ms 按 ≤250 ms 切片（T7.3） */
+    int  pump(DWORD timeout_ms, bool autocont, const char **err);   /* = wait_one + dispatch；autocont = false ⇒ ❗不 continue；timeout_ms 按 ≤250 ms 切片（T7.3） */
     int  pump_now(const char **err);                                /* pump(0, false) */
+    /* T7 切片 C2a（plan_t7.md §10 / D57）：把「读一条事件」与「分派一条事件」拆开，让宿主层能做
+     * **进程级的按归属分派**（`WaitForDebugEvent` 是进程级的，一个进程只有一个事件流）。
+     * `wait_one` 只做「≤250 ms 切片等待 + `on_wait_timeout`（D32 唯一的 poll 点）+ detach/取消路径」，
+     * 成功时填 `*out` 并返回 `dwDebugEventCode`，没等到返回 0，引擎错返回 -1。
+     * ❗它作用于 `this`（`proc()` / `m_debug_active_process_stop` / `term()` / `to_detach()`），但**不**按
+     *   `params->pid` 过滤 —— 所以在任意会话实例上调都能读到事件，宿主靠 `ev.dwProcessId` 找归属。
+     * `dispatch` 是 `wait_one` 之后的那一整段（回调 → switch → 记账 → `autocont` 时 continue）。 */
+    int  wait_one(DWORD timeout_ms, DEBUG_EVENT *out, const char **err);
+    int  dispatch(const DEBUG_EVENT &ev, bool autocont);            /* -1 = 引擎内部错误（文案见 `last_error()`） */
     bool cont(DWORD pid, DWORD tid, DWORD code);                    /* ContinueDebugEvent（code 显式） */
     int  end(const char **err);                                     /* 收尾；`to_detach()` 为真时先做真 detach（返回 1 = 无 DebugActiveProcessStop，已降级成 kill） */
     /* T7.3（plan_t7.md §4.1 / 已拍板第 5 条）：pump 算出来的「本来该用的 code」存在会话里，绑定层读它。
      * `pump` 的返回值只表达事件码（0 = 没等到事件）；「没等到事件」与「循环已终止」在返回值上
      * 不可区分（§2.1 记录 ②），所以 code 单独存一份 —— `cont` 必须显式带它（`pump.default-code-parity`）。 */
     DWORD last_code() const noexcept { return m_last_code; }
+    /* C2a：`dispatch` 的内部错误文案（只有它返回 -1 时才有意义）。`pump` 把它转成自己的 `*err` ——
+     * `dispatch` 不带 `err` 形参是为了让它与事件一一对应（一个事件一次分派，没有 second output）。 */
+    const char *last_error() const noexcept { return m_last_error; }
 private:
     /* `run` 的收尾（P6.4：随 run 一起进会话，使用会话自身的状态） */
     void run_shutdown(const RunParams *params);
@@ -180,6 +193,9 @@ private:
     /* T7.3：`pump` 每处理一个事件就把算出来的 code 存这里（绑定层读它做显式应答；
      * 没等到事件时不更新，读到的是上一次的 code）。 */
     DWORD m_last_code{};
+
+    /* C2a：`dispatch` 的内部错误文案（每次分派开头清空）。 */
+    const char *m_last_error{};
 };
 
 /* ---------------- 当前会话（P3.B 模块 11 引入；P6.4 后范围收窄） ----------------

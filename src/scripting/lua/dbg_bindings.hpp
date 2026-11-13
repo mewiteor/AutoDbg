@@ -6,7 +6,7 @@
  * 来源：新写。形态照 `gui` / `open_file`：注册**一个全局表** `dbg`（AGENTS.md §5 第 6 条），
  *   29 个契约名一个都不动。
  *
- * 形状（切片 C1a：D55 / D57，仍限**单会话**；切片 C1b 把数据面接上对象）：
+ * 形状（切片 C1a：D55 / D57；C1b 把数据面接上对象；**C2a 放开多会话 + 进程级事件路由**）：
  *   · `dbg.create{...}` / `dbg.attach(pid)` → **会话对象**（full userdata + metatable `AutoDbgSession`）；
  *   · 对象方法：pump / cont / step / eip / arm / hits / dropped / setcap / stopped / paused / caps /
  *     help / detach / kill（`detach` 只在平台有 `DebugActiveProcessStop` 时装，D51）；
@@ -16,8 +16,11 @@
  *   · 对象字段：`stop`（当前未应答的事件表，与 `pump` 返回的是**同一张表**）/ `root_pid` / `kind` /
  *     `state`（`running` / `stopped` / `exited`）；
  *   · 模块级保留 create / attach / pump / cont / step / eip / arm / hits / dropped / setcap / stopped /
- *     paused / detach / kill / caps / help —— 作用对象是**默认会话**（最近一次 create/attach 的那个）；
+ *     paused / detach / kill / caps / help —— 作用对象是**默认会话**（最近一次 create/attach 的那个），
+ *     `dbg.detach(pid)` / `dbg.kill(pid)` 按 root pid 指名会话；
  *   · registry 查询：`dbg.sessions()` / `dbg.session(pid)` / `dbg.last()`（D54）；
+ *   · `dbg.pump` 是**唯一的「等」**，且是**进程级**的：读一条事件 → 按 `ev.dwProcessId` 找归属会话
+ *     → 在归属会话上分派 → 返回事件表（带 `session` 字段）。`d:pump` 是它的按会话过滤版（C2a）。
  *   · `dbg.code()` 已删：事件表带 `code`（异常码）与 `cont_code`（core 算好的默认应答码）。
  *
  * 回调参数形状（新接口一律普通数字/字符串，不再用 LuaVariant）：`{ pid, tid, ea, code, modname, rva }`，
@@ -27,8 +30,8 @@
  *
  * 两条固定文案（门禁逐字断）定在本层：
  *   "pump cannot be called from a callback"      —— 回调里调状态机
- *   "cannot run while an event is unhandled"     —— `dbg` 停着一个未应答事件时调 `Run`/`Attach`
- * （后者被 bindings.cpp 的 `lua_run` / `lua_attach` 用：两条路径在同一个会话上不可混用。）
+ *   "cannot run while a dbg session exists (detach/kill it first)" —— **存在** dbg 会话时调 `Run`/`Attach`
+ * （后者被 bindings.cpp 的 `lua_run` / `lua_attach` 用：两条路径都独占整个进程的事件流，不能与 `dbg` 共存。）
  * ========================================================================== */
 #include <lua.hpp>
 
@@ -36,10 +39,14 @@ namespace autodbg::host
 {
 void register_dbg_api(lua_State *L);
 
-/* `dbg_paused()` 查**默认会话**的 `d.stop`（`Run`/`Attach` 的门禁；没有会话 = 没停着事件）。 */
+/* `dbg_paused()` = **任一**会话停着一个未应答事件（C2a：不再只是默认会话；没有会话 = 没停着事件）。 */
 bool        dbg_paused() noexcept;
+/* `dbg_busy()` = registry 非空（**存在** dbg 会话）。`Run` / `Attach` 在它为真时拒绝 —— 这是比
+ * `dbg_paused()` 更严的那个判据（a live session 就是与契约名不可混用的状态）。 */
+bool        dbg_busy() noexcept;
 const char *dbg_error_reentry() noexcept;
 const char *dbg_error_paused()  noexcept;
+const char *dbg_error_busy()    noexcept;
 
 } /* namespace autodbg::host */
 

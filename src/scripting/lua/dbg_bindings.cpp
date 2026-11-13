@@ -17,9 +17,24 @@
  *   `write` / `context` / `stack` / `mods` / `threads`。形状与对应的契约名同形（`ReadMemory` 的字节、
  *   `GetContext` 的键、`StackTrace` 的帧字段），差别只有 D52 要求的「LuaVariant → 普通整数」；
  *   「真实读取长度」靠 core 新增的 `read_some`（§2.2 第 12 条）。❗断点面（`bp` / `bp_hw` /
- *   `bps`）、`snapshot`/`restore`、`mem_regions` 不在本切片；多会话与代理在 C2 / C-remote。
+ *   `bps`）、`snapshot`/`restore`、`mem_regions` 不在本切片；代理在 C-remote。
  *
- * pump 的两层（D57，C1a 已按此落地，但只有一个会话可路由）：
+ * 切片 C2a（多会话 + **进程级事件路由**，plan_t7.md §10 / §11.9.1 / D57）：
+ *   ① **每个会话自带引擎会话**（`new core::DebuggerSession`；`release_state` 释放）—— 之前所有会话共用
+ *      宿主挂给 core 的那一份，多会话会互相踩状态。
+ *   ② `dbg.pump` = **唯一的「等」且是进程级的**：拿任意会话的 `wait_one` 读一条事件 → 按
+ *      `ev.dwProcessId` 在 registry 里找归属会话（`root_pid` 精确匹配）→ 在归属会话上 `dispatch` →
+ *      返回事件表（新增 `session` 字段 = 归属会话的句柄）。找不到归属 → `nil, err`，**不静默丢事件**。
+ *   ③ `d:pump` = 缓存优先 + **过滤**：循环 `dbg.pump` 直到出现属于自己的事件；别人的事件已经在自己
+ *      的会话里**分派完了**（D57 的「分派不能推迟」），只是不返回给本会话的调用方。
+ *   ④ 允许同时存在多个会话（删掉 C1a 的「一次执行一个会话」拒绝）；新增 `dbg.detach(pid)` /
+ *      `dbg.kill(pid)`（与 `d:detach()` / `d:kill()` 同义）。`dbg_paused()` = 任一会话停着事件；
+ *      新增 `dbg_busy()`（registry 非空）作为 `Run`/`Attach` 的拒给判据。
+ *   ⑤ 待应答槽的**诚实口径**：本切片只保证「一个会话 = 一棵单进程树」⇒ 每会话最多一个未应答事件
+ *      （OS 挂起该进程的线程直到 `ContinueDebugEvent`）。因此 `d.stop` 仍是单槽；同一会话的第二个
+ *      事件（只可能来自 C2b 的进程树）不覆盖 `d.stop`，而是诚实地报错（见 `kErrPending`）。
+ *
+ * pump 的两层（D57，C2a 起才是真的两层：有多个会话可路由）：
  *   · `dbg.pump([timeout[, autocont]])`（模块级）= **唯一的「等」**：读一条事件 → 分派（记录 + 回调 +
  *     引擎记账）→ 返回事件表；`nil` = 没等到事件；`nil, err` = 引擎错 / 回调里出错 / 被取消。
  *   · `d:pump(...)` = **缓存优先**：`d.stop` 非空就立即返回它（不阻塞、不调 core），否则走上面那条。
@@ -40,7 +55,8 @@
  *   · 默认会话转发：`dbg.create/attach/pump/cont/step/eip/arm/hits/dropped/setcap/stopped/paused/
  *     detach/kill/caps/help` 全部保留，作用对象 = **最近一次 create/attach 的那个会话**（`g_default`），
  *     错误文案逐字不变；新增 `dbg.sessions() / dbg.session(pid) / dbg.last()` 三个取回入口。
- *   · 一次执行只允许一个会话：第二次 `create`/`attach` → `nil, kErrOneSess`（多会话与进程树路由是 C2）。
+ *   · 一次执行可以同时有多个会话（每棵树一个）；`dbg.*` 作用在默认会话上，`dbg.detach(pid)` /
+ *     `dbg.kill(pid)` 指名会话（C2a）。
  *
  * 命中记录缓冲在**宿主层**（core 不认识队列）：环形、满则丢最旧、`dropped()` 可数、`setcap(1..64)` 可调。
  *   记录只在四个事件通道产生（`on_breakpoint` / `on_exception` / `on_user_exception` / `on_single_step`）；
@@ -49,16 +65,17 @@
  *   `cont_code` 只能等 core 在 `pump` 末尾算完才知道 ⇒ 泵完再把「这一轮新产生的记录」补上。
  *
  * 回调：core 的回调签名带 `void *ctx`，这里传的是 **`SessionState*`**（不是 `lua_State*`）——
- *   每会话一份，C2 的进程树路由直接可用；`lua_State` 从 `st->L` 取。回调里出错**不**长跳穿 C++ 帧
+ *   每会话一份（C2a 的多会话路由就靠它）；`lua_State` 从 `st->L` 取。回调里出错**不**长跳穿 C++ 帧
  *   （D18）：`lua_pcall` 兜住，消息存起来，下一次 `pump` 把它作为第二返回值。
  *   回调里调状态机（pump/cont/step/arm/detach/kill/create/attach）→ `nil, "pump cannot be called from
- *   a callback"`（固定文案）；`dbg` 停着未应答事件时调 `Run`/`Attach` → `"cannot run while an event is
- *   unhandled"`（`dbg_paused()` 查默认会话的 `d.stop`）。
+ *   a callback"`（固定文案）；**存在** dbg 会话时调 `Run`/`Attach` →
+ *   `"cannot run while a dbg session exists (detach/kill it first)"`（`dbg_busy()` 查 registry，C2a）。
  *
  * `current_session()` 的一致性：会话方法在调 core 前用 `SessionScope` 把 `st->sess` 挂成当前会话、
- *   返回后还原。C1a 里两者本来就是同一份（宿主 `main.cpp`/`exec.cpp` 挂给 core 的那个），交换是恒等；
- *   写成保存/还原是为了 C2 的多会话（那时每个 session 自带引擎会话）。core 调用点直接用 `st->sess->`
- *   （成员函数，作用对象明确是 this），只有仍按「当前会话」工作的内部路径才依赖 `current_session()`。
+ *   返回后还原。C2a 起每个 `SessionState` 自带一个 `DebuggerSession`（之前共用宿主挂的那一份），
+ *   所以交换不再是恒等：任何进 core 的调用都必须在对应的 `SessionScope` 里。core 调用点直接用
+ *   `st->sess->`（成员函数，作用对象明确是 this），只有仍按「当前会话」工作的内部路径
+ *   （`stack_trace.cpp` / `hide.cpp`）才依赖 `current_session()`。
  *
  * 状态是模块级（不是 thread_local、也不是函数内非平凡 static —— §11.5 / PITFALLS M10）：执行严格串行
  *   （并发 1），与 `exec_guard` 同一口径。跨 pump 的引擎状态在会话成员里，这里只存「宿主侧」的那部分。
@@ -98,8 +115,13 @@ const int kHitCapMax = 64;
 const char *const kErrReentry = "pump cannot be called from a callback";
 const char *const kErrPaused  = "cannot run while an event is unhandled";
 const char *const kErrNoSess  = "dbg: no session (call dbg.create or dbg.attach first)";
-/* 一次执行只允许一个会话（C1a）。多会话与进程树路由是 C2（plan_t7.md §10 / D56）。 */
-const char *const kErrOneSess = "dbg: only one session per execution (multi-session lands in C2)";
+/* C2a：**存在** dbg 会话时 `Run`/`Attach` 一律拒（两条路径都独占整个进程的事件流）。 */
+const char *const kErrBusy = "cannot run while a dbg session exists (detach/kill it first)";
+/* C2a：同一会话的第二个未应答事件 —— 只有 C2b 的进程树才会走到；❗不能覆盖 `d.stop`，
+ * 覆盖会让先停住的进程永远挂起（那个进程的线程在等 `ContinueDebugEvent`）。 */
+const char *const kErrPending = "dbg.pump: session already has a pending event (process trees land in C2b)";
+/* 进程级路由找不到归属会话：诚实地报错，**不**静默丢事件（事件已经被 OS 取走了）。 */
+const char *const kErrUnknownPid = "dbg.pump: event for unknown pid ";
 
 /* 会话对象（full userdata）的元表名、方法表名、以及「状态 → 活着的 userdata」弱值表。
  * 弱值表让 `d = nil` 真的能丢句柄（`lua_bound` 因此有意义），会话本体仍在 C 侧 registry 里。 */
@@ -150,7 +172,7 @@ enum SessionKind
  * 这里只存「绑定层自己要知道」的那部分：回调 ref、命中窗口、参数串、缓存的事件表。 */
 struct SessionState
 {
-    SessionState *next;      /* 侵入式链表首成员（registry 用；C1a 至多一个节点） */
+    SessionState *next;      /* 侵入式链表首成员（registry 用） */
 
     lua_State *L;            /* 本执行的 Lua 状态（回调 ref、事件表缓存都挂这里） */
 
@@ -187,16 +209,19 @@ struct SessionState
     LPXSTR s_cmdline;
     LPXSTR s_cwd;
 
-    core::DebuggerSession *sess;   /* 引擎会话（宿主挂给 core 的那一份；C1a 只有一个） */
+    core::DebuggerSession *sess;   /* 引擎会话（**本会话独有**，C2a；`release_state` 释放） */
 };
 
 /* C 侧 registry（D54）：作用域 = **一次执行**。`register_dbg_api`（每次建 Lua 状态）清空，
  * `create`/`attach` 加、`detach`/`kill` 删。容器是侵入式单链表线性扫 —— 会话数是个位数量级。
+ * ❗C2a 起可以同时有**多个**会话（每会话自带引擎会话，但仍是单进程、同一个事件流）；
+ *   事件归属由 `root_pid` 精确匹配（见 `pump_once`）。
  * ❗不是静态对象而是裸指针：手工映射的模块里别给静态对象找动态初始化的麻烦（§11.5）。 */
 SessionState *g_sessions = nullptr;
 
 /* 默认会话 = 最近一次 `create`/`attach` 的那个：29 个契约名与 `dbg.*` 的转发都作用在它上面。
- * 收尾（detach/kill）后置空 —— C1a 没有「上一个会话」可回退。 */
+ * 它被收尾（detach/kill）后置空 —— 不自动回退到别的会话（否则「`dbg.*` 打在哪个会话上」就变得
+ * 看不见了）；但 `dbg.pump` 是进程级的，它在 `g_default` 为空时拿 registry 的头一个去等。 */
 SessionState *g_default = nullptr;
 
 /* 引擎此刻是否正在执行用户回调（单线程串行 ⇒ 这是一个全局事实，与具体会话无关）：
@@ -277,10 +302,15 @@ static void free_strings(SessionState *st)
     st->s_cwd       = nullptr;
 }
 
-/* 释放一个尚未进 registry（或 registry 已经把它摘掉）的状态。 */
+/* 释放一个尚未进 registry（或 registry 已经把它摘掉）的状态。
+ * ❗C2a：每个会话自带一个 `DebuggerSession`，在这里一并释放（它的析构会解 PE/线程/断点三张链表）。
+ *   未收尾（detach/kill）就丢弃的会话不在这里做任何引擎动作 —— `__gc` / 执行结束都不做事是 D54 的
+ *   口径；引擎侧的「放行 + 关句柄」仍然只由 `end()`（`d:detach` / `d:kill`）触发。 */
 static void release_state(SessionState *st)
 {
     free_strings(st);
+    delete st->sess;
+    st->sess = nullptr;
     delete st;
 }
 
@@ -292,7 +322,9 @@ static SessionState *new_session(lua_State *L)
     st->L        = L;
     st->cap      = kHitCapMax;
     st->seq_next = 1;
-    st->sess     = &core::current_session();
+    /* C2a：**每个会话一个引擎会话**（之前共用宿主挂给 core 的那一份）。这样两棵树各自的
+     * `proc()` / `peinfos()` / `cont()` / `to_detach()` 互不干扰 —— 多会话的全部前提。 */
+    st->sess     = new core::DebuggerSession();
     /* `ZeroMem` 给的是 0，而 LUA_NOREF 是 -2 —— ref 必须逐个显式置哨兵 */
     st->stop_ref           = LUA_NOREF;
     st->ref_entry          = LUA_NOREF;
@@ -418,6 +450,9 @@ static const HitRecord *newest_hit(SessionState *st, int from_seq)
 static void record_hit_by_ea(SessionState *st, int type, DWORD pid, DWORD tid, size_t ea, DWORD code,
                              int first_chance, int ref);
 
+/* 会话句柄（定义在下面的「会话对象」段：`push_event_table` 要往事件表里塞 `session`）。 */
+static void push_handle(lua_State *L, SessionState *st);
+
 static void push_hit_table(lua_State *L, SessionState *st)
 {
     for (int i = 0; i < st->count; i++)
@@ -441,11 +476,13 @@ static void push_hit_table(lua_State *L, SessionState *st)
 }
 
 /* `pump` 的返回值 = **普通表**（无 metatable，D55）：字段与 `hits()` 记录、协议 `event` 帧同形。
- * `type` 是 `DEBUG_EVENT` 码，`code` 是异常码（没有异常的事件 = 0），`cont_code` 是默认应答码。 */
+ * `type` 是 `DEBUG_EVENT` 码，`code` 是异常码（没有异常的事件 = 0），`cont_code` 是默认应答码。
+ * `session`（C2a）= 本事件**归属的会话**：`d:pump` 靠它过滤（D57：不返回别人的事件），
+ *   脚本侧也靠它给事件归因（而不是拿 ev.pid 去猜）。 */
 static void push_event_table(lua_State *L, SessionState *st, int type, int from_seq)
 {
     const HitRecord *hit = newest_hit(st, from_seq);
-    lua_createtable(L, 0, 9);
+    lua_createtable(L, 0, 10);
     lua_pushinteger(L, (lua_Integer)type);                            lua_setfield(L, -2, "type");
     lua_pushinteger(L, (lua_Integer)st->last_pid);                    lua_setfield(L, -2, "pid");
     lua_pushinteger(L, (lua_Integer)st->last_tid);                    lua_setfield(L, -2, "tid");
@@ -457,6 +494,7 @@ static void push_event_table(lua_State *L, SessionState *st, int type, int from_
     else                                         lua_pushinteger(L, hit->first_chance ? 1 : 0);
     lua_setfield(L, -2, "first_chance");
     lua_pushinteger(L, (lua_Integer)st->sess->last_code());           lua_setfield(L, -2, "cont_code");
+    push_handle(L, st);                                               lua_setfield(L, -2, "session");
 }
 
 /* 用户回调的参数形状（§2.1 第 3 条：新接口一律普通数字/字符串，不再用 LuaVariant）：
@@ -1151,7 +1189,7 @@ static int do_threads(lua_State *L, SessionState *st)
 
 /* ---------------- worker（模块级与对象方法共用；base = 第一个真实参数的下标） ---------------- */
 
-static int do_pump(lua_State *L, SessionState *st, int base, bool cache_first);
+static int do_pump(lua_State *L, SessionState *st, int base);
 
 static void read_common_opts(lua_State *L, SessionState *st, int n)
 {
@@ -1213,7 +1251,6 @@ static int start_session(lua_State *L, SessionState *st, int kind)
 static int dbg_create(lua_State *L)
 {
     if (g_in_callback)  return reentry(L);
-    if (g_sessions)     return fail(L, kErrOneSess);
     if (!lua_istable(L, 1)) return fail(L, "dbg.create: table expected");
 
     SessionState *st = new_session(L);
@@ -1261,7 +1298,6 @@ static int dbg_create(lua_State *L)
 static int dbg_attach(lua_State *L)
 {
     if (g_in_callback) return reentry(L);
-    if (g_sessions)    return fail(L, kErrOneSess);
     if (!lua_isnumber(L, 1)) return fail(L, "dbg.attach: pid (number) expected");
 
     DWORD pid = (DWORD)lua_tointeger(L, 1);
@@ -1278,63 +1314,109 @@ static int dbg_attach(lua_State *L)
     return start_session(L, st, SESSION_ATTACH);
 }
 
-/* `pump`：`cache_first` = 对象方法（先看 `d.stop`），否则模块级（唯一的「等」）。 */
-static int do_pump(lua_State *L, SessionState *st, int base, bool cache_first)
+/* 引擎内部错误（D18：core 已自行跑过收尾）⇒ 宿主侧只收自己的那一半并把它从 registry 摘掉。
+ * ❗不 `delete st`：会话对象还可能被一个 userdata 指着（之后的方法按「没有会话」失败），
+ *   释放留给 `__gc`（那时 `!registered` ⇒ 由它收尾）。 */
+static int finish_engine_error(lua_State *L, SessionState *st, const char *err)
 {
-    if (g_in_callback) return reentry(L);
-    if (!st->started)  return fail(L, kErrNoSess);
+    free_strings(st);
+    clear_stop(st);
+    st->started = false;
+    registry_remove(st);
+    return fail(L, err ? err : "engine error");
+}
 
-    /* D57：缓存优先 —— 停着一个未应答事件就立即返回它（不阻塞、不调 core） */
-    if (cache_first && st->stop_ref != LUA_NOREF)
+/* `fail` 的「前缀 + pid」版（零 CRT 没有 snprintf；只用于「指名是哪个 pid」的文案） */
+static int fail_pid(lua_State *L, const char *prefix, DWORD pid)
+{
+    char   buf[96];
+    size_t n = 0;
+    for (size_t i = 0; prefix[i] && n < sizeof buf - 1; i++) buf[n++] = prefix[i];
+
+    char digits[12];
+    int  d = 0;
+    do
     {
-        lua_rawgeti(L, LUA_REGISTRYINDEX, st->stop_ref);
-        return 1;
-    }
+        digits[d++] = (char)('0' + (pid % 10));
+        pid /= 10;
+    } while (pid && d < (int)sizeof digits);
+    while (d > 0 && n < sizeof buf - 1) buf[n++] = digits[--d];
+    buf[n] = 0;
+    return fail(L, buf);
+}
 
-    int   top      = lua_gettop(L);
-    DWORD timeout  = (top >= base && lua_isnumber(L, base)) ? (DWORD)lua_tointeger(L, base) : 100;
-    bool  autocont = (top >= base + 1 && lua_toboolean(L, base + 1)) ? true : false;
+/* 回调里 `lua_pcall` 的错误（D18：不长跳）→ `nil, msg`，并清掉缓冲（只报一次）。 */
+static int take_cb_error(lua_State *L, SessionState *st)
+{
+    char   msg[170];
+    size_t i = 0;
+    for (; st->cb_error[i] && i < sizeof(msg) - 1; i++) msg[i] = st->cb_error[i];
+    msg[i]          = 0;
+    st->cb_error[0] = 0;
+    return fail(L, msg);
+}
 
+/* 一条事件的「等 + 路由 + 分派 + 组装事件表」—— 进程级 `dbg.pump` 的**唯一**实现（D57 / C2a）。
+ * 返回值：1 = 栈顶一个值（事件表或 `nil`）；2 = `nil, err`。
+ * `*owner` = 事件归哪张会话（返回 `nil` 时不动它）；`d:pump` 靠它过滤。
+ *
+ * 路由：`WaitForDebugEvent` 是**进程级**的（一个调试器进程只有一个事件流），所以「谁来等」不影响
+ * 「事件归谁」—— 拿默认会话（没有就 registry 的头一个）去等，再按 `ev.dwProcessId` 在 registry 里
+ * 找 `root_pid` 精确匹配的会话。找不到 ⇒ `nil, err`（**不静默丢**：事件已经从 OS 取走了）。 */
+static int pump_once(lua_State *L, DWORD timeout_ms, bool autocont, SessionState **owner)
+{
+    /* 回调里不能重入状态机（plan_t7.md §2.3：回调正在被 `pump_once` 派发）。模块级与对象方法
+     * 两个入口共用本函数，所以这条判必须在这里（C2a 把 `dbg.pump` 从 `do_pump` 改成直走本函数）。 */
+    if (g_in_callback) return reentry(L);
+
+    SessionState *waiter = g_default ? g_default : g_sessions;
+    if (!waiter) return fail(L, kErrNoSess);
+
+    DEBUG_EVENT ev;
     const char *err = nullptr;
-    int         before = st->seq_next;
     int         type;
     {
-        SessionScope scope(st);
-        type = st->sess->pump(timeout, autocont, &err);
+        SessionScope scope(waiter);
+        type = waiter->sess->wait_one(timeout_ms, &ev, &err);
     }
-    if (type < 0)
-    {
-        /* 引擎自己已经跑过清理（D18）⇒ 这里只收**宿主侧**并把它从 registry 摘掉。
-         * ❗不 `delete st`：会话对象还可能被一个 userdata 指着（方法之后按「没有会话」失败），
-         *   释放留给 `__gc`（那时 `!registered` ⇒ 由它收尾）。 */
-        free_strings(st);
-        clear_stop(st);
-        st->started = false;
-        registry_remove(st);
-        return fail(L, err ? err : "engine error");
-    }
-    /* core 在 pump 末尾才算得出默认应答码 ⇒ 这一轮新产生的记录在这里补 cont_code */
-    if (type != 0) fill_cont_code(st, before);
+    if (type < 0) return finish_engine_error(L, waiter, err);
 
-    /* 回调里出错 / 取消：与 T7.3 同序（先报回调错误，再问守卫） */
-    if (st->cb_error[0])
-    {
-        char msg[170];
-        size_t i = 0;
-        for (; st->cb_error[i] && i < sizeof(msg) - 1; i++) msg[i] = st->cb_error[i];
-        msg[i] = 0;
-        st->cb_error[0] = 0;
-        return fail(L, msg);
-    }
-    if (guard_exec_active() && guard_should_stop()) return fail(L, guard_stop_message());
-
-    /* ❗没等到事件（0）⇒ `nil`，且**不动** `d.stop`：上一轮那个未应答的事件仍然停在那儿
-     *（目标被系统挂起），清掉就等于放 `Run` 进来。 */
+    /* ❗没等到事件（0）⇒ `nil`，且**不动**任何会话的 `d.stop`：上一轮那个未应答的事件仍然停在那儿
+     *（目标被系统挂起），清掉就等于放 `Run` 进来。
+     * ❗但回调错误与取消守卫**必须先问**（与拆分前同序）：`--cancel` 在空闲期插话就是靠这条
+     *（`pump.cancel-while-idle` 的 `err=canceled by server`）。 */
     if (type == 0)
     {
+        if (waiter->cb_error[0]) return take_cb_error(L, waiter);
+        if (guard_exec_active() && guard_should_stop()) return fail(L, guard_stop_message());
         lua_pushnil(L);
         return 1;
     }
+
+    SessionState *st = registry_find(ev.dwProcessId);
+    if (!st) return fail_pid(L, kErrUnknownPid, ev.dwProcessId);
+
+    /* 待应答槽（D57 的不变量 2）：一个会话最多一个未应答事件 —— OS 会挂起该进程的线程直到
+     * `ContinueDebugEvent`。C2a 只保证「一个会话 = 一棵单进程树」，所以这第二个事件只可能来自
+     * C2b 的进程树（那时才会发生）。❗分派**仍然要做**（事件已经从 OS 取走，不分派就等于 EIP--/
+     * re-arm/记账/回调全丢），但**不覆盖** `d.stop`（覆盖会让先停住的进程永远挂起），而是诚实报错。 */
+    bool pending = (st->stop_ref != LUA_NOREF);
+
+    int before = st->seq_next;
+    int r;
+    {
+        SessionScope scope(st);
+        r = st->sess->dispatch(ev, autocont);
+    }
+    if (r < 0) return finish_engine_error(L, st, st->sess->last_error());
+    fill_cont_code(st, before);   /* core 在 dispatch 末尾才算得出默认应答码 */
+
+    /* 回调里出错 / 取消：与 T7.3 同序（先报回调错误，再问守卫） */
+    if (st->cb_error[0]) return take_cb_error(L, st);
+    if (guard_exec_active() && guard_should_stop()) return fail(L, guard_stop_message());
+    if (pending) return fail(L, kErrPending);
+
+    if (owner) *owner = st;
 
     if (autocont)
     {
@@ -1348,6 +1430,43 @@ static int do_pump(lua_State *L, SessionState *st, int base, bool cache_first)
     st->stop_ref = luaL_ref(L, LUA_REGISTRYINDEX);
     lua_rawgeti(L, LUA_REGISTRYINDEX, st->stop_ref);  /* 返回的就是缓存里那一张（同一个对象） */
     return 1;
+}
+
+/* `d:pump([timeout_ms [, autocont]])`（C1a 的「缓存优先」+ C2a 的「按会话过滤」）。
+ * ① `d.stop` 非空 ⇒ 立即返回它（不阻塞、不调 core）；
+ * ② 否则循环 `pump_once`，直到出现**属于本会话**的事件 —— 别人的事件已经在它自己的会话里分派完了
+ *    （D57 的不变量 1：分派不能推迟），这里只是不把它返回给本会话的调用方；
+ * ③ 超时（同一个预算用尽）⇒ `nil`。 */
+static int do_pump(lua_State *L, SessionState *st, int base)
+{
+    if (g_in_callback) return reentry(L);
+    if (!st->started)  return fail(L, kErrNoSess);
+
+    if (st->stop_ref != LUA_NOREF)
+    {
+        lua_rawgeti(L, LUA_REGISTRYINDEX, st->stop_ref);
+        return 1;
+    }
+
+    int   top      = lua_gettop(L);
+    DWORD timeout  = (top >= base && lua_isnumber(L, base)) ? (DWORD)lua_tointeger(L, base) : 100;
+    bool  autocont = (top >= base + 1 && lua_toboolean(L, base + 1)) ? true : false;
+
+    DWORD deadline = GetTickCount() + timeout;
+    for (;;)
+    {
+        /* 同一个 timeout 预算：每轮只把**剩余**时间交给下一次等待（`GetTickCount` 回绕靠有符号差值） */
+        LONG left = (LONG)(deadline - GetTickCount());
+        if (left < 0) left = 0;
+
+        SessionState *owner = nullptr;
+        int           n     = pump_once(L, (DWORD)left, autocont, &owner);
+        if (n == 2) return n;
+        if (lua_isnil(L, -1)) return 1;        /* 预算用尽 / 没等到事件 */
+        if (owner == st) return 1;             /* 自己的事件 */
+
+        lua_pop(L, 1);                         /* 别人的事件：已分派，继续等自己的 */
+    }
 }
 
 /* `d:cont([code])` / `dbg.cont([pid[, tid[, code]]])`。
@@ -1652,10 +1771,14 @@ static int dbg_last(lua_State *L)
 
 /* ---------------- 模块级转发（默认会话；错误文案逐字节不变） ---------------- */
 
+/* 模块级 `dbg.pump([timeout_ms [, autocont]])` = **唯一的「等」，而且是进程级的**（C2a / D57）：
+ * 读一条事件 → 按归属分派 → 返回事件表（带 `session` 字段）。没有会话 ⇒ `nil, kErrNoSess`。 */
 static int dbg_pump(lua_State *L)
 {
-    if (!g_default) return fail(L, kErrNoSess);
-    return do_pump(L, g_default, 1, false);   /* 模块级 = 唯一的「等」（D57），不做缓存优先 */
+    int   top      = lua_gettop(L);
+    DWORD timeout  = (top >= 1 && lua_isnumber(L, 1)) ? (DWORD)lua_tointeger(L, 1) : 100;
+    bool  autocont = (top >= 2 && lua_toboolean(L, 2)) ? true : false;
+    return pump_once(L, timeout, autocont, nullptr);
 }
 
 static int dbg_cont(lua_State *L)
@@ -1706,26 +1829,61 @@ static int dbg_stopped(lua_State *L)
     return do_stopped(L, g_default);
 }
 
-/* 没有会话 ⇒ 也没有未应答事件（T7.3 的口径：paused 从不报错） */
+/* 没有会话 ⇒ 也没有未应答事件（T7.3 的口径：paused 从不报错）。
+ * C2a：看**任一**会话 —— 「有事件停着」是多会话下的进程级事实。 */
 static int dbg_paused_method(lua_State *L)
 {
-    lua_pushboolean(L, (g_default && g_default->stop_ref != LUA_NOREF) ? 1 : 0);
+    lua_pushboolean(L, dbg_paused() ? 1 : 0);
     return 1;
 }
 
 static int dbg_caps(lua_State *L) { return do_caps(L, g_default); }
 static int dbg_help(lua_State *L) { return do_help(L, g_default); }
 
+/* 模块级收尾的目标：显式 `pid`（按 root_pid 找）优先，否则默认会话。
+ * `dbg.detach(pid)` / `dbg.kill(pid)` 与 `d:detach()` / `d:kill()` 同义（C2a），
+ * 多会话时代就是「按 pid 指名收尾哪一个」。 */
+static bool pick_finish_target(lua_State *L, const char *fn, SessionState **out)
+{
+    *out = nullptr;
+    int t = lua_type(L, 1);
+    if (t == LUA_TNUMBER)
+    {
+        SessionState *st = registry_find((DWORD)lua_tointeger(L, 1));
+        if (!st)
+        {
+            fail_two(L, fn, ": no session with that pid");
+            return false;
+        }
+        *out = st;
+        return true;
+    }
+    if (t != LUA_TNONE && t != LUA_TNIL)
+    {
+        fail_two(L, fn, ": pid (number) expected");
+        return false;
+    }
+    if (!g_default)
+    {
+        fail(L, kErrNoSess);
+        return false;
+    }
+    *out = g_default;
+    return true;
+}
+
 static int dbg_detach(lua_State *L)
 {
-    if (!g_default) return fail(L, kErrNoSess);
-    return do_detach(L, g_default, 1);
+    SessionState *st;
+    if (!pick_finish_target(L, "dbg.detach", &st)) return 2;
+    return do_detach(L, st, 1);
 }
 
 static int dbg_kill(lua_State *L)
 {
-    if (!g_default) return fail(L, kErrNoSess);
-    return do_kill(L, g_default, 1);
+    SessionState *st;
+    if (!pick_finish_target(L, "dbg.kill", &st)) return 2;
+    return do_kill(L, st, 1);
 }
 
 /* ---------------- 会话方法（self 在栈 1，第一个实参在栈 2） ---------------- */
@@ -1734,7 +1892,7 @@ static int session_pump(lua_State *L)
 {
     SessionState *st = self(L);
     if (!st) return fail(L, kErrNoSess);
-    return do_pump(L, st, 2, true);
+    return do_pump(L, st, 2);
 }
 
 static int session_cont(lua_State *L)
@@ -1941,9 +2099,22 @@ static void push_handle_table(lua_State *L)
 
 const char *dbg_error_reentry() noexcept { return kErrReentry; }
 const char *dbg_error_paused()  noexcept { return kErrPaused; }
-bool        dbg_paused()        noexcept
+const char *dbg_error_busy()    noexcept { return kErrBusy; }
+
+/* 任一会话停着一个未应答事件（C2a：不再只看默认会话）。 */
+bool dbg_paused() noexcept
 {
-    return g_default != nullptr && g_default->stop_ref != LUA_NOREF;
+    for (SessionState *st = g_sessions; st; st = st->next)
+    {
+        if (st->stop_ref != LUA_NOREF) return true;
+    }
+    return false;
+}
+
+/* registry 非空 = 存在 dbg 会话（`Run`/`Attach` 的拒给判据）。 */
+bool dbg_busy() noexcept
+{
+    return g_sessions != nullptr;
 }
 
 void register_dbg_api(lua_State *L)
@@ -1965,7 +2136,7 @@ void register_dbg_api(lua_State *L)
     lua_pushcfunction(L, session_gc);    lua_setfield(L, -2, "__gc");
     lua_pop(L, 1);
 
-    lua_createtable(L, 0, 20);
+    lua_createtable(L, 0, 22);
     lua_pushcfunction(L, dbg_create);   lua_setfield(L, -2, "create");   /* = Run 的原语版（CreateProcess） */
     lua_pushcfunction(L, dbg_attach);   lua_setfield(L, -2, "attach");   /* = Attach 的原语版（DebugActiveProcess；Win95/98 没有） */
     lua_pushcfunction(L, dbg_pump);     lua_setfield(L, -2, "pump");

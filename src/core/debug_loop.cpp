@@ -218,21 +218,23 @@ int DebuggerSession::begin(const core::RunParams *params, const core::DebugCallb
     return 0;
 }
 
-/* pump：一次 `WaitForDebugEvent` + 派发（T7.1）。返回调试事件码（0 = 没等到事件）；
- * -1 = 引擎内部错误（`*err` 已置，且收尾已在这条路径里跑过）。`autocont = false` ⇒ ❗不调
- * `ContinueDebugEvent`：事件停在未应答状态，由调用方显式 `cont(pid, tid, code)`。 */
 /* pump 的等待切片上限（T7.3 / plan_t7.md §4.4）：`run()` 传 100 ms ⇒ 正好一片 ⇒ 行为逐字节不变。 */
 const DWORD kPumpSliceMs = 250;
 
-int DebuggerSession::pump(DWORD timeout_ms, bool autocont, const char **err)
+/* wait_one（T7 切片 C2a / plan_t7.md §10、D57）：只做「等一条事件」，**不分派**。
+ * 返回：> 0 = `dwDebugEventCode`（`*out` 已填）；0 = 没等到事件（`timeout_ms` 用尽）；
+ *       -1 = 引擎内部错误（`*err` 已置）—— 现在的等待循环没有这条路径，-1 是与 `pump` 同口径的保留值。
+ * ❗`WaitForDebugEvent` 是**进程级**的：本函数不按 `params->pid` 过滤，所以在**任意**会话实例上调
+ *   都能读到这条进程的事件流里的事件。多会话（C2a）的进程级路由就靠这一点 —— 宿主拿任意会话去等，
+ *   再按 `ev.dwProcessId` 找归属会话分派。
+ * ❗detach / 取消那几条分支作用于 **this**（会话自己的 `proc()` / `m_debug_active_process_stop` /
+ *   `term()` / `to_detach()`），与拆分前逐字一致。 */
+int DebuggerSession::wait_one(DWORD timeout_ms, DEBUG_EVENT *out, const char **err)
 {
-    const RunParams      *params = m_params;   /* begin 存下的调用方对象（别名保留旧调用点写法） */
-    const DebugCallbacks *cb     = m_cb;
+    const DebugCallbacks *cb = m_cb;
+    (void)err;   /* 与 `pump` 同签：等待循环本身还不产生引擎错误（见上面的返回值说明） */
 
-    DEBUG_EVENT DBGEvent;
-    DWORD       DBGCode  = DBG_CONTINUE;
-    bool        detached = false;
-    bool        got      = false;
+    bool detached = false;
 
     /* T7.3：等待按 ≤ kPumpSliceMs 切片，每片没等到事件就问一次 `on_wait_timeout` —— 那是执行期
      * 唯一的 control poll 点（D32 / S13），所以 `--cancel` 能在 pump 空闲时插话。core 仍然只拿到
@@ -240,11 +242,8 @@ int DebuggerSession::pump(DWORD timeout_ms, bool autocont, const char **err)
     for (DWORD left = timeout_ms; ; )
     {
         DWORD slice = (timeout_ms == 0) ? 0 : (left > kPumpSliceMs ? kPumpSliceMs : left);
-        if (WaitForDebugEvent(&DBGEvent, slice))
-        {
-            got = true;
-            break;
-        }
+        if (WaitForDebugEvent(out, slice))
+            return (int)out->dwDebugEventCode;
         if (to_detach())
         {
             term() = false;
@@ -274,7 +273,24 @@ int DebuggerSession::pump(DWORD timeout_ms, bool autocont, const char **err)
         if (left <= slice) break; /* timeout 用尽 ⇒ 等价于旧的 `continue`（回到 while 顶） */
         left -= slice;
     }
-    if (!got) return 0;           /* pump 的「0 = 没等到事件」（与旧的 `continue` 同义） */
+    return 0;               /* 0 = 没等到事件（与旧的 `continue` 同义；detach 出口也走这里） */
+}
+
+/* dispatch（C2a）：`wait_one` 之后的那一整段 —— 回调 → ScyllaHide → 按事件码的 switch → 记账 →
+ * `autocont` 时 continue。返回调试事件码；-1 = 引擎内部错误（文案进 `m_last_error`，收尾已在这条路径里跑过）。
+ * ❗分派**不能推迟**（D57）：`cont` 必须作用在已 EIP--/已 re-arm/已记录的事件上，所以事件一从
+ *   OS 读出来就必须立刻分派 —— 多会话能做到的只是「`d:pump` 不**返回**别人的事件」。
+ * ❗`autocont = false` ⇒ 不调 `ContinueDebugEvent`：事件停在未应答状态，由调用方显式
+ *   `cont(pid, tid, code)`。
+ * ❗形参就叫 `DBGEvent`：下面这段 switch 的正文与拆分前**逐字节相同**（拆分的判据之一是
+ *   `run()` 与既有 `pump.*` 的可观察行为不变），改名只会让对照变模糊。 */
+int DebuggerSession::dispatch(const DEBUG_EVENT &DBGEvent, bool autocont)
+{
+    const RunParams      *params = m_params;   /* begin 存下的调用方对象（别名保留旧调用点写法） */
+    const DebugCallbacks *cb     = m_cb;
+
+    DWORD DBGCode = DBG_CONTINUE;
+    m_last_error  = NULL;   /* 只有本函数会写；读它的人只在返回 -1 时读 */
     if (cb->on_any_debug_event)
     {
         core::DebugEvent ev;
@@ -351,7 +367,7 @@ int DebuggerSession::pump(DWORD timeout_ms, bool autocont, const char **err)
                              * 现改为「走完清理尾部 + 返回错误码」，由绑定层在 run 返回后
                              * lua_error —— Lua 可见行为一致，但不再长跳穿 C++ 帧（D18）。*/
                             run_shutdown(params);
-                            *err = "tmp->has_orignal_byte is zero!";
+                            m_last_error = "tmp->has_orignal_byte is zero!";
                             return -1;
                         }
                         disable_breakpoint(ea, modname, rva);
@@ -807,6 +823,20 @@ int DebuggerSession::pump(DWORD timeout_ms, bool autocont, const char **err)
         }
     }
     return (int)DBGEvent.dwDebugEventCode;
+}
+
+/* pump = `wait_one` + `dispatch`（T7.1 的「一次 WaitForDebugEvent + 派发」原样保留，C2a 只是拆开）。
+ * 返回调试事件码（0 = 没等到事件）；-1 = 引擎内部错误（`*err` 已置，且收尾已在这条路径里跑过）。 */
+int DebuggerSession::pump(DWORD timeout_ms, bool autocont, const char **err)
+{
+    DEBUG_EVENT ev;
+    int         r = wait_one(timeout_ms, &ev, err);
+    if (r <= 0)
+        return r;                   /* 0 = 没等到事件 / -1 = 等待期引擎错误 */
+    r = dispatch(ev, autocont);
+    if (r < 0 && err)
+        *err = m_last_error;
+    return r;
 }
 
 /* cont：ContinueDebugEvent（T7.1）—— `code` 显式（含「原样交给程序」）。 */

@@ -630,6 +630,8 @@ Write-Output ''
 #   ❗NOT_HANDLED 的那一次会在同一个 EA 上再报一次（first chance → second chance）：autocont 段
 #     因此是 3 条记录（ntdll 初始 int3 + site int3 的两次）。first/second chance 的真值要等 T7.4
 #     （§2.2 第 5 条）才能区分，所以这里是固定数字而不是「命中次数 = 轮数」。
+#   ❗C2a（D57）：`Run`/`Attach` 的拒给判据从「停着未应答事件」收紧成「**存在** dbg 会话」
+#     （两条路径都独占整个进程的事件流）⇒ `pump.reentry-rejected` 里那句文案跟着改。
 function Find-FixtureSite([string]$path)
 {
     $b = [IO.File]::ReadAllBytes($path)
@@ -853,7 +855,7 @@ print('after_detach=' .. tostring(select(2, dbg.pump(10, false))))
 
             $r4 = Run-Client @("--remote=127.0.0.1:$Port", $s4)
             Check 'pump.reentry-rejected' ($r4.out -match 'reentry=nil pump cannot be called from a callback' -and `
-                $r4.out -match 'runwhile=cannot run while an event is unhandled') "out=[$($r4.out)]"
+                $r4.out -match 'runwhile=cannot run while a dbg session exists \(detach/kill it first\)') "out=[$($r4.out)]"
 
             $r5 = Run-Client @("--remote=127.0.0.1:$Port", $s5)
             Check 'pump.record-and-continue' ($r5.out -match 'autocont_hits=3' -and $r5.out -match 'autocont_paused=false' -and `

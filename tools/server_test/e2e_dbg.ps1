@@ -23,7 +23,15 @@
 #     context           d:context() 的 `Cip` = 停住那条 int3 的**下一条**；d:context(nil, {Cax=…})
 #                       部分更新返回 true 且读回生效（键名与 `GetContext` 逐字一致：x86 是 `Cax…Cip`）
 #     mods-threads      d:mods() 有 name 含 x86_loop.exe 且 base > 0；d:threads() 含事件的 tid
-# ❗session.* / kill.* 需要 x86 的 fixture ⇒ x64 上这两段整段 SKIP（8 条）。
+#   C2a（多会话 + 进程级事件路由，plan_t7.md §10 / §11.9.1 / D57）—— 起**两个**同名 fixture 实例：
+#     session.multi-two-stopped   两个会话各自 arm 到自己的 site → 循环 dbg.pump(300) 直到两边都 paused
+#                                 （有界轮数 + stopped() 双判）；两者 stop.rva == site、sessions() == 2
+#     pump.dispatch-attribution   dbg.pump 的事件表带 `session`；只泵 b 时 a 的事件照样被**分派**进 a
+#                                 （a.stop 非空 = D57 的「分派不能推迟」）；a:pump(0) 返回 a.stop 而不是 b 的
+#     route.same-name-two-processes 两个同名实例是两个进程（root_pid 不同）：在 a 里写一个字节，
+#                                 b 读同一地址仍是原值 ⇒ 内存走的确实是**各自的**进程句柄
+#     run.refused-with-session    存在 dbg 会话时 pcall(Run, {...}) 的第二个返回值 = 新的固定文案
+# ❗session.* / kill.* / C2a 的 4 条都需要 x86 的 fixture ⇒ x64 上这几段整段 SKIP（8 条）。
 # =============================================================================
 [CmdletBinding()]
 param(
@@ -316,6 +324,76 @@ print('kill=' .. tostring(d:kill()))
         "d:context() 的 Cip = 停住那条 int3 的下一条；d:context(nil, {Cax=…}) 部分更新生效；out=[$($r.out)]"
     Check 'session.mods-threads' ($r.out -match 'mod_ok=true' -and $r.out -match 'nthreads=[1-9]\d* tid_ok=true') `
         "d:mods() 有 x86_loop.exe 且 base > 0；d:threads() 含事件 tid；out=[$($r.out)]"
+
+    # ------------------------------------------------------------ ⑥ C2a：多会话 + 进程级路由
+    # 两个**同名**实例（同一份 fixture）：这是「每会话一个引擎会话」与「按 pid 归属分派」的最小现场。
+    # `arm` 走**延迟武装**（D57）：create 之后模块还没加载也能登记，CREATE_PROCESS 时补 0xCC。
+    $s_multi = Write-Lua 'multi.lua' @"
+local EXE = '$fxLua'
+local SITE = $($site.rva) + 5
+local a, ea = dbg.create{ imagepath = EXE }
+local b, eb = dbg.create{ imagepath = EXE }
+print('multi_obj=' .. tostring(a ~= nil) .. '/' .. tostring(b ~= nil) .. ' err=' .. tostring(ea) .. '|' .. tostring(eb))
+if not a or not b then return end
+print('pids_differ=' .. tostring(a.root_pid ~= b.root_pid) .. ' n=' .. #dbg.sessions())
+print('arm=' .. tostring(a:arm('x86_loop.exe', SITE, function() end)) .. '/' ..
+                tostring(b:arm('x86_loop.exe', SITE, function() end)))
+-- 有界超时 + stopped() 双判：两边都停到自己的 site 才退出
+local rounds = 0
+while not (a:paused() and b:paused()) do
+    rounds = rounds + 1
+    if rounds > 200 then break end
+    if a:stopped() or b:stopped() then break end
+    local ev = dbg.pump(300, false)
+    if ev ~= nil and ev.rva ~= SITE then ev.session:cont() end
+end
+print('both=' .. tostring(a:paused() and b:paused()) .. ' rounds=' .. tostring(rounds < 200))
+print('ra=' .. tostring(a.stop and a.stop.rva) .. ' rb=' .. tostring(b.stop and b.stop.rva) ..
+      ' n2=' .. #dbg.sessions())
+-- 同名两个进程：各自 mods()/read 都要走自己的句柄
+local ab, bb
+for _, m in ipairs(a:mods()) do if m.name and string.lower(m.name):find('x86_loop.exe', 1, true) then ab = m.base end end
+for _, m in ipairs(b:mods()) do if m.name and string.lower(m.name):find('x86_loop.exe', 1, true) then bb = m.base end end
+print('base_pos=' .. tostring(ab ~= nil and bb ~= nil and ab > 0 and bb > 0))
+print('cc=' .. tostring(a:read_u8(ab + SITE) == 0xCC) .. '/' .. tostring(b:read_u8(bb + SITE) == 0xCC))
+-- 在 a 的进程里改一个字节（SITE-4 = 那条 mov 的立即数首字节，改了不影响控制流）：
+-- b 读同一个地址必须还是原值 —— 这是「同名两实例 = 两个进程、各走各的句柄」的硬证据。
+print('wa=' .. tostring(a:write(ab + SITE - 4, string.char(0xAA))) ..
+      ' ra=' .. tostring(a:read_u8(ab + SITE - 4) == 0xAA) ..
+      ' rb=' .. tostring(b:read_u8(bb + SITE - 4) == 0x44))
+print('runwhile=' .. tostring(select(2, pcall(Run, { imagepath = EXE }))))
+print('detach=' .. tostring(a:detach()) .. ' kill=' .. tostring(b:kill()) .. ' left=' .. #dbg.sessions())
+"@
+    $r = Run-Local $s_multi 90000
+    Check 'session.multi-two-stopped' ($r.out -match 'multi_obj=true/true' -and $r.out -match 'pids_differ=true n=2' -and `
+        $r.out -match 'arm=true/true' -and $r.out -match 'both=true rounds=true' -and `
+        $r.out -match "ra=$($site.site) rb=$($site.site) n2=2" -and `
+        $r.out -match 'detach=true kill=true left=0') `
+        "两个会话各停在自己的 site（$($siteHex)）、sessions() 从 2 到 0；out=[$($r.out)]"
+    Check 'route.same-name-two-processes' ($r.out -match 'base_pos=true' -and $r.out -match 'cc=true/true' -and `
+        $r.out -match 'wa=true ra=true rb=true') `
+        "同名两实例：各自 mods() 有 base>0、各读自己的 site 是 CC；在 a 里写 0xAA 后 b 读同一地址仍是 0x44（各走自己的进程句柄）；out=[$($r.out)]"
+    Check 'run.refused-with-session' ("$($r.out)".Contains('runwhile=cannot run while a dbg session exists (detach/kill it first)')) `
+        "存在 dbg 会话时 Run 必须拒绝（新固定文案）；out=[$($r.out)]"
+
+    # `pump.dispatch-attribution`：只泵 b 的时候，a 的事件照样被分派进 a（D57 的不变量 1），
+    # 而 `a:pump(0)`（a 停着）返回的是 a 自己的 d.stop，绝不是 b 的事件。
+    $s_attr = Write-Lua 'attribution.lua' @"
+local EXE = '$fxLua'
+local a = dbg.create{ imagepath = EXE }
+local b = dbg.create{ imagepath = EXE }
+if not a or not b then print('attr_create=false') return end
+local evb = b:pump(3000)                      -- 事件流是**进程级**的：a 的事件也会被读出来
+print('own=' .. tostring(evb ~= nil and evb.session == b) ..
+      ' a_pending=' .. tostring(a.stop ~= nil) ..
+      ' a_session=' .. tostring(a.stop ~= nil and a.stop.session == a))
+print('cached=' .. tostring(a:pump(0) == a.stop) .. ' distinct=' .. tostring(a.stop ~= b.stop))
+print('kill=' .. tostring(a:kill()) .. '/' .. tostring(b:kill()) .. ' left=' .. #dbg.sessions())
+"@
+    $r = Run-Local $s_attr
+    Check 'pump.dispatch-attribution' ($r.out -match 'own=true a_pending=true a_session=true' -and `
+        $r.out -match 'cached=true distinct=true' -and $r.out -match 'kill=true/true left=0') `
+        "dbg.pump 的事件表带 session；只泵 b 时 a 的事件也被分派进 a（a.stop 非空）；a:pump(0) 返回 a.stop 而不是 b 的；out=[$($r.out)]"
 }
 
 Write-Output ''
