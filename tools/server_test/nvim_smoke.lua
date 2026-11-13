@@ -2,7 +2,8 @@
 -- tools/server_test/nvim_smoke.lua —— neovim 客户端的无头验收（T5：raw TCP）
 --
 -- 由 `nvim_smoke.ps1` 用 `nvim --headless -u NONE --cmd "set rtp+=<repo>/nvim"` 跑。
--- 环境变量（PS 侧给）：AUTODBG_HOST / AUTODBG_PORT / AUTODBG_EXE。
+-- 环境变量（PS 侧给）：AUTODBG_HOST / AUTODBG_PORT / AUTODBG_EXE / AUTODBG_TOKEN_PORT /
+--   AUTODBG_TOKEN / AUTODBG_REPL_PORT / AUTODBG_EVENT_TARGET。
 -- 覆盖：
 --   ① 远程执行（`script` 帧 → `out` → `result` → `end`）+ 结果 buffer
 --   ② 异步路径不爆 `E5560`（uv fast event context）
@@ -10,6 +11,8 @@
 --   ④ `M.cancel`（控制帧，另一条连接）能打断正在跑的脚本
 --   ⑤ `M.health` / `M.version`（`info` 帧）
 --   ⑥ 文件 I/O 走帧：`open_file` 写 → 读回（`open`/`data`/`close`/`read_req`）
+--   ⑨ T7 §12.3 ② 的 REPL（连第三台 server）：跨命令 `lua_State` 存活 + `out.id` 归因
+--      + `result.id` = 该行的 Lua 错误码 + `event` 帧（16）渲染进 scratch buffer
 -- 退出码：0 = 全通过；1 = 有失败
 -- =============================================================================
 
@@ -245,5 +248,83 @@ else
   -- 没有第二台 server（带 token）：跳过 token 用例
   print("[skip] token.*（PS 侧没起带 token 的 server）")
 end
+
+-- ------------------------------------------------ ⑨ REPL（T7 §12.3 ②：连已经在跑的 `--repl --server`）
+-- 第三台 server（PS 侧起的）。命令号从 1 开始递增；这里把「语法错」那条排在第 5 条，
+-- 这样 `result.id`（= 错误码 3）与命令号（= 5）能分开，断言才不是在赌巧合。
+local rport = tonumber(os.getenv("AUTODBG_REPL_PORT") or "0")
+if rport and rport > 0 then
+  ad.setup({
+    mode = "remote",
+    host = host,
+    port = rport,
+    open = "none",
+    focus = false,
+    sync_timeout_ms = 30000,
+    lsp = { enable = false },
+    snippets = { enable = false },
+    repl = { read_timeout_ms = 30000 },   -- `d:pump` 可能跑几秒，用默认 5000 会把它断掉
+  })
+
+  local ropen = ad.repl_open({ sync = true })
+  print(("[info] repl.open  buf=%s  %s:%s  ok=%s"):format(
+    tostring(ropen and ropen.buf), tostring(ropen and ropen.host), tostring(ropen and ropen.port),
+    tostring(ropen and ropen.ok)))
+
+  local function detail(r)
+    if not r then
+      return "nil"
+    end
+    return ("cmd=%d code=%s out=[%s]"):format(r.cmd, tostring(r.code), tostring(r.out))
+  end
+
+  local c1 = ad.repl_eval("x = 41", { sync = true })
+  local c2 = ad.repl_eval("= x + 1", { sync = true })
+  check("repl.cross-command-state",
+    ropen ~= nil and ropen.ok == true and c1 ~= nil and c2 ~= nil
+      and c1.cmd == 1 and c2.cmd == 2 and c2.ok and c2.code == 0
+      and (c2.out or ""):find("42", 1, true) ~= nil
+      and c2.outs and #c2.outs > 0 and c2.outs[1].id == c2.cmd,
+    ("open=[%s] "):format(tostring(ropen and ropen.error)) .. detail(c1) .. " | " .. detail(c2) ..
+    " out.id=" .. tostring(c2 and c2.outs and c2.outs[1] and c2.outs[1].id))
+
+  -- `event` 帧：`dbg.create` 的初始 int 3（与 e2e_tcp.ps1 的 `proto.event-frame` 同一个源）
+  local target = os.getenv("AUTODBG_EVENT_TARGET") or ""
+  local c3 = ad.repl_eval(string.format("d = dbg.create{ imagepath = %q, cmdline = '/c exit' }", target), { sync = true })
+  local c4 = ad.repl_eval("for i = 1, 12 do local ev = d:pump(2000); if ev == nil then break end; d:cont(); if #d:hits() > 0 then break end end; print('hits=' .. #d:hits())", { sync = true })
+  local ev = (c4 and c4.events and c4.events[1]) or nil
+  local btext = ""
+  if ropen and ropen.buf then
+    btext = table.concat(vim.api.nvim_buf_get_lines(ropen.buf, 0, -1, false), "\n")
+  end
+  local evline = nil
+  if c4 then
+    for _, l in ipairs(vim.split(btext, "\n", { plain = true })) do
+      if l:find(("[event] cmd=%d type=1"):format(c4.cmd), 1, true) then
+        evline = l
+        break
+      end
+    end
+  end
+  check("repl.event-render",
+    ev ~= nil and ev.id == c4.cmd and ev.type == 1 and evline ~= nil
+      and evline:find("pid=" .. tostring(ev.pid), 1, true) ~= nil
+      and evline:find("tid=" .. tostring(ev.tid), 1, true) ~= nil
+      and evline:find("rva=" .. tostring(ev.rva), 1, true) ~= nil,
+    "target=[" .. target .. "] create=[" .. tostring(c3 and (c3.out or c3.error)) ..
+    "] pump=[" .. tostring(c4 and (c4.out or c4.error)) .. "] line=[" .. tostring(evline) .. "]")
+
+  local c5 = ad.repl_eval("local y = ", { sync = true })
+  check("repl.error-code",
+    c5 ~= nil and c5.ok == false and c5.code == 3 and c5.cmd ~= 3,
+    "cmd=" .. tostring(c5 and c5.cmd) .. " result.id=" .. tostring(c5 and c5.code) ..
+    " err=[" .. tostring(c5 and c5.err) .. "]")
+
+  ad.repl_eval("d:kill()", { sync = true })   -- 收尾：会话按归属 detach/kill（D54 安全网）
+  ad.repl_close()
+else
+  print("[skip] repl.*（PS 侧没起 `--repl --server`）")
+end
+
 print(("nvim_smoke: pass=%d fail=%d"):format(pass, fail))
 vim.cmd(fail > 0 and "cq" or "qa!")

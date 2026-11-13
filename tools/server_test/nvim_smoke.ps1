@@ -2,10 +2,12 @@
 # tools/server_test/nvim_smoke.ps1 —— neovim 客户端的无头验收（T5：raw TCP）
 #
 # 来源：原 S3 版本（HTTP `/run`），T5 删掉 HTTP 后按 **raw TCP 帧** 重写。
-# 做三件事：起一个临时 TCP server → 用 headless nvim 跑 nvim_smoke.lua → 停 server。
+# 做四件事：起三台临时 TCP server（主 / 带 token / `--repl`）→ 用 headless nvim 跑
+# nvim_smoke.lua → 停 server。`repl.*` 三条断言连的是第三台（已经在跑的 `--repl --server`：
+# 跨命令 `lua_State` 存活 + `out.id` 归因 + `event` 渲染）。
 # 用法：
 #   pwsh -File tools/server_test/nvim_smoke.ps1 [-Render 64|86] [-Variant modern|legacy] [-Port 18710]
-# 退出码：0 = 全通过；1 = 有失败；2 = 前置缺失（产物 / nvim / nvim_smoke.lua）
+# 退出码：0 = 全通过；1 = 有失败；2 = 前置缺失（产物 / nvim / nvim_smoke.lua / 插件文件）
 # =============================================================================
 [CmdletBinding()]
 param(
@@ -27,6 +29,7 @@ $Smoke = Join-Path $PSScriptRoot 'nvim_smoke.lua'
 if (-not (Test-Path $Exe)) { Write-Output "SKIP: 产物不存在：$Exe（先 make.bat a $Render）"; exit 2 }
 if (-not (Test-Path $Smoke)) { Write-Output "SKIP: 缺少 $Smoke"; exit 2 }
 if (-not (Test-Path (Join-Path $Rtp 'lua/autodbg/tcp.lua'))) { Write-Output "SKIP: 插件没有 tcp.lua（子模块未更新？）"; exit 2 }
+if (-not (Test-Path (Join-Path $Rtp 'lua/autodbg/repl.lua'))) { Write-Output "SKIP: 插件没有 repl.lua（`:AutoDbgRepl` 的门禁跑不了，子模块未更新？）"; exit 2 }
 if (-not (Get-Command $Nvim -ErrorAction SilentlyContinue)) { Write-Output "SKIP: nvim 不在 PATH"; exit 2 }
 
 $TmpDir = Join-Path ([System.IO.Path]::GetTempPath()) 'autodbg_nvim_smoke'
@@ -87,6 +90,36 @@ try {
         catch { Start-Sleep -Milliseconds 120 }
     }
 
+    # 第三台 server：`--repl --server`（`repl.*` 三条断言连的是它；插件不 spawn 进程）
+    $replPort = $Port + 2
+    $replOut = Join-Path $TmpDir 'server_repl.out'
+    $replErr = Join-Path $TmpDir 'server_repl.err'
+    $replArgs = @('--repl', '--server=tcp', "--server-port=$replPort", '--server-no-echo')
+    if ($Variant) { $replArgs += "--variant=$Variant" }
+    $script:replProc = Start-Process -FilePath $Exe -ArgumentList $replArgs -RedirectStandardOutput $replOut `
+        -RedirectStandardError $replErr -PassThru -NoNewWindow
+    $replReady = $false
+    $deadline3 = (Get-Date).AddSeconds(10)
+    while ((Get-Date) -lt $deadline3) {
+        if ($script:replProc.HasExited) { break }
+        try {
+            $rc = [System.Net.Sockets.TcpClient]::new()
+            $rc.Connect('127.0.0.1', $replPort)
+            $rc.Close()
+            $replReady = $true
+            break
+        }
+        catch { Start-Sleep -Milliseconds 120 }
+    }
+    if ($replReady) { $env:AUTODBG_REPL_PORT = "$replPort" }
+
+    # `event` 帧的靶子：`dbg.create` 的初始 int 3（与 e2e_tcp.ps1 的 `proto.event-frame` 同源）。
+    # 位数必须与产物一致（32 位调试器只能调 32 位目标）。
+    $evDir = if ($Render -eq '86') { 'SysWOW64' } else { 'System32' }
+    $evExe = Join-Path $env:WINDIR "$evDir\cmd.exe"
+    if (-not (Test-Path $evExe)) { $evExe = Join-Path $env:WINDIR 'system32\cmd.exe' }
+    $env:AUTODBG_EVENT_TARGET = $evExe
+
     $env:AUTODBG_HOST = '127.0.0.1'
     $env:AUTODBG_PORT = "$Port"
     $env:AUTODBG_EXE = $Exe
@@ -99,6 +132,9 @@ try {
     Write-Output "nvim exit=$code"
 }
 finally {
+    if ($script:replProc -and -not $script:replProc.HasExited) {
+        try { $script:replProc.Kill() } catch { }
+    }
     if ($script:tokProc -and -not $script:tokProc.HasExited) {
         try { $script:tokProc.Kill() } catch { }
     }
