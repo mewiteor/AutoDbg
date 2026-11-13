@@ -81,11 +81,15 @@
  *   a callback"`（固定文案）；**存在** dbg 会话时调 `Run`/`Attach` →
  *   `"cannot run while a dbg session exists (detach/kill it first)"`（`dbg_busy()` 查 registry，C2a）。
  *
- * `current_session()` 的一致性：会话方法在调 core 前用 `SessionScope` 把 `st->sess` 挂成当前会话、
- *   返回后还原。C2a 起每个 `SessionState` 自带一个 `DebuggerSession`（之前共用宿主挂的那一份），
- *   所以交换不再是恒等：任何进 core 的调用都必须在对应的 `SessionScope` 里。core 调用点直接用
- *   `st->sess->`（成员函数，作用对象明确是 this），只有仍按「当前会话」工作的内部路径
- *   （`stack_trace.cpp` / `hide.cpp`）才依赖 `current_session()`。
+ * `current_session()` 的一致性（C2a 的回归修正）：每会话自带 `DebuggerSession`（`SessionState::sess`），
+ *   而 29 个契约名走 `current_session()` —— 所以「当前会话」必须**持久**跟随 `dbg.last()`：
+ *   `dbg.create` / `dbg.attach` 成功后 `sync_current_session()` 把 `st->sess` 挂上，
+ *   `detach` / `kill` 收尾时回退到 registry 里剩下的最近一个会话、最后退回宿主会话
+ *   （`g_host_sess` = `main.cpp` / `repl.cpp` / `exec.cpp` 挂的那一份）。
+ *   `SessionScope` 只在会话方法调用期间强制切换到 `st->sess`，析构回到同一份 `sync_current_session()`
+ *   （而不是「进入前的那个」），所以嵌套调用（会话方法里再调 29 名）也指向同一个引擎。
+ *   core 调用点直接用 `st->sess->`（成员函数，作用对象明确是 this），仍按「当前会话」工作的
+ *   内部路径（`stack_trace.cpp` / `hide.cpp`）则因此能取到正确的会话。
  *
  * 状态是模块级（不是 thread_local、也不是函数内非平凡 static —— §11.5 / PITFALLS M10）：执行严格串行
  *   （并发 1），与 `exec_guard` 同一口径。跨 pump 的引擎状态在会话成员里，这里只存「宿主侧」的那部分。
@@ -233,9 +237,27 @@ struct SessionState
 SessionState *g_sessions = nullptr;
 
 /* 默认会话 = 最近一次 `create`/`attach` 的那个：29 个契约名与 `dbg.*` 的转发都作用在它上面。
- * 它被收尾（detach/kill）后置空 —— 不自动回退到别的会话（否则「`dbg.*` 打在哪个会话上」就变得
- * 看不见了）；但 `dbg.pump` 是进程级的，它在 `g_default` 为空时拿 registry 的头一个去等。 */
+ * 它被收尾（detach/kill）后置空，并回退到 registry 里剩下的最近一个会话（见 `sync_current_session`）；
+ * `dbg.pump` 是进程级的，它在 `g_default` 为空时拿 registry 的头一个去等。 */
 SessionState *g_default = nullptr;
+
+/* 宿主**原来的**会话（`main.cpp` / `repl.cpp` / `exec.cpp` 挂给 `core::set_current_session()` 的那一份）：
+ * dbg 会话全部收尾后，29 个契约名必须回到它身上（否则回退成 nullptr 就一调就踩空）。
+ * ❗取两个时点：`register_dbg_api`（一次执行的开头，可能还没挂 —— `--server` 口径下 `exec.cpp`
+ *   是 `create_state_with_libs()` **之后**才 `set_current_session`）与 `start_session`（那时脚本正在跑，
+ *   宿主会话一定已挂；只在 registry 为空时补抓，免得把上一个 dbg 会话当成宿主会话）。 */
+core::DebuggerSession *g_host_sess = nullptr;
+
+/* 把「当前会话」（29 个契约名走的那一份）对准默认会话，并作为 dbg 会话收尾后的回退链：
+ *   g_default → registry 里剩下的最近一个会话 → 宿主会话。
+ * 调用点：`start_session`（成功后持久挂上）、`registry_remove`（收尾）、`registry_clear`（一次执行的开头）、
+ *   `SessionScope` 析构（会话方法返回后 —— 不回到「进入前的那个」，所以嵌套调用也指向同一个引擎）。 */
+static void sync_current_session()
+{
+    SessionState          *st   = g_default ? g_default : g_sessions;
+    core::DebuggerSession *sess = (st != nullptr) ? st->sess : g_host_sess;
+    if (sess != nullptr) core::set_current_session(sess);   /* 两边都空 ⇒ 宿主根本没挂，保持原样 */
+}
 
 /* 引擎此刻是否正在执行用户回调（单线程串行 ⇒ 这是一个全局事实，与具体会话无关）：
  * 回调里再调状态机一律拒（plan_t7.md §2.3）。 */
@@ -274,6 +296,7 @@ static void registry_remove(SessionState *st)
     st->next       = nullptr;
     st->registered = false;
     if (g_default == st) g_default = nullptr;
+    sync_current_session();   /* 收尾的正是默认会话 ⇒ 回退到剩下的最近一个 / 宿主会话 */
 }
 
 static SessionState *registry_find(DWORD root_pid)
@@ -301,6 +324,7 @@ static void registry_clear()
     }
     g_sessions = nullptr;
     g_default  = nullptr;
+    if (g_host_sess != nullptr) core::set_current_session(g_host_sess);   /* 释放掉的会话不能再当「当前」 */
 }
 
 /* ---------------- 小工具 ---------------- */
@@ -696,24 +720,23 @@ static int h_wait_timeout(void *ctx, bool can_detach_without_term)
 
 /* ---------------- current_session 的交换 ---------------- */
 
-/* 会话方法调 core 前把**本会话的引擎会话**挂成「当前会话」，返回后还原（§11.4 的接缝 / D55）。
- * C1a 只有一个会话、且它就是宿主挂给 core 的那一份 ⇒ 交换是恒等；写成保存/还原是为了 C2 的多会话
- * （那时每个 session 自带 `DebuggerSession`，`current_session()` 必须对准本会话）。
+/* 会话方法调 core 前把**本会话的引擎会话**挂成「当前会话」（§11.4 的接缝 / D55 / C2a）。
+ * ❗C2a 起每个会话自带 `DebuggerSession`（与宿主那一份不是同一个）⇒ 交换不再是恒等，
+ *   而析构**不回到「进入前的那个」**：它恢复到 `g_default`（没有则 registry 剩下的最近一个，
+ *   再没有则宿主会话）—— 因为默认会话就是「当前会话」的持久定义（`sync_current_session`）。
+ *   这样嵌套调用（会话方法里再调 29 个契约名）也指向同一个引擎。
  * ❗不是 thread_local：手工映射的模块禁用 TLS（§11.5），这里只是栈上的 RAII。 */
 class SessionScope
 {
 public:
-    explicit SessionScope(SessionState *st) : m_prev(&core::current_session())
+    explicit SessionScope(SessionState *st)
     {
         core::set_current_session(st->sess);
     }
-    ~SessionScope() { core::set_current_session(m_prev); }
+    ~SessionScope() { sync_current_session(); }
 
     SessionScope(const SessionScope &)            = delete;
     SessionScope &operator=(const SessionScope &) = delete;
-
-private:
-    core::DebuggerSession *m_prev;
 };
 
 /* ---------------- 会话对象（userdata + metatable） ---------------- */
@@ -1259,6 +1282,11 @@ static void read_common_opts(lua_State *L, SessionState *st, int n)
 /* 装好 `DebugCallbacks` 调 core 的 `begin`，成功后把会话进 registry 并返回 userdata。 */
 static int start_session(lua_State *L, SessionState *st, int kind)
 {
+    /* 宿主会话的兜底抓取：`register_dbg_api` 时可能还没挂（`--server` 口径，见 `g_host_sess` 的注释）。
+     * ❗只在 registry 为空时抓：那时 `current_session()` 一定还是宿主那一份，不会是别的 dbg 会话。 */
+    if (g_host_sess == nullptr && g_sessions == nullptr)
+        g_host_sess = core::current_session_or_null();
+
     st->cb.context                 = st;    /* ❗ctx = SessionState*（不是 lua_State） */
     st->cb.on_any_debug_event      = h_any_event;
     st->cb.on_exception            = h_exception;
@@ -1294,6 +1322,7 @@ static int start_session(lua_State *L, SessionState *st, int kind)
     push_handle(L, st);
     registry_add(st);
     g_default = st;
+    sync_current_session();   /* 持久挂上：29 个契约名从此刻起就作用在本会话的引擎上（切片 C2a 的回归修正） */
     return 1;
 }
 
@@ -2379,9 +2408,12 @@ static int dbg_remote(lua_State *L)
 
 void register_dbg_api(lua_State *L)
 {
+    /* 宿主会话先记下来（可能还是空的，见 `g_host_sess` 的注释），再清一次执行的 registry ——
+     * 否则 `registry_clear` 里释放掉的会话还可能被当成「当前会话」。 */
+    g_host_sess   = core::current_session_or_null();
+    g_in_callback = false;
     /* 一次执行一个 registry（D43/D54）：上一条执行留下的 C 侧状态在这里统一释放 */
     registry_clear();
-    g_in_callback = false;
     g_has_detach  = (resolve_detach() != nullptr);   /* D51：平台能力，建表时定一次 */
 
     /* 远端代理的连接对象（D56）：`__gc` 关 socket —— 它是**纯本地资源**（不是调试会话），

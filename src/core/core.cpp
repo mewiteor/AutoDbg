@@ -32,6 +32,11 @@ DebuggerSession &current_session() noexcept
     return *g_current_session;
 }
 
+DebuggerSession *current_session_or_null() noexcept
+{
+    return g_current_session;   /* 宿主还没挂上时就是 nullptr，调用方降级（见 core.hpp） */
+}
+
 DebuggerSession::DebuggerSession() noexcept
 {
     /* 原 init()：三个链表头置空（现在由 `OwnedIntrusiveList` 的默认构造负责，无需手写） */

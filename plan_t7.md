@@ -636,6 +636,22 @@ type  pid  tid  ea  modname  rva  code  first_chance  cont_code
 - **能力边界（写进注释与 help）**：函数 / userdata / session 对象过不了线（回调必须留在本机，所以 `d:arm(mod,rva,cb)` 在代理上返回 `nil, err`）；单次请求体受 `--repl` 的 **4096 字节 chunk** 上限约束（`d:write` 一次约 >1.8 KB 会语法错）；服务端 REPL 会把返回值 print 进 `out` 帧（代理丢弃）；`open_file` 在代理路径不支持（`read_req` 等帧被显式丢弃）。
 - 本机实测：`e2e_dbg` 86 **27** / 86 legacy 27 / 64 8；`e2e_tcp` 59/59/51；`e2e_repl` 10/10/9；`e2e_json` 32；`e2e_gui` 21；`check_skill` 15；`nvim_smoke` 32；`--selftest` 73；导入表 13 产物。手测：LuaJIT 客户端/服务端（跨 flavor）、`h:attach(pid)`、错 token、函数实参、无监听端口四条错误路径都走通。
 - 残留：`h:attach` **没进**门禁（只手测过）；`dbg.remote` 还没写进 skill 包（只有 `help('dbg.remote')`）；C2b/C3/nvim `:AutoDbgRepl` 未动。
+**C2a 回归修正（29 个契约名跟随 dbg 会话）**：
+
+- **现象**：dbg 会话活着时 `GetModBase('x86_loop.exe')` 返回 **nil**（静默，不报错），`ReadMemory`/`GetContext` 之类也作用在错的引擎上 —— 因为它们走 `current_session()`，而 C2a 起每个 dbg 会话**自带** `DebuggerSession`，宿主那一份是空的。
+- **修法**：`dbg.create`/`attach` 成功后 **持久**把「当前会话」指向该会话；`detach`/`kill` 走**回退链** `g_default → registry 里剩下的最近一个 → 宿主会话（g_host_sess）`。`SessionScope` 的析构不再回到「进入前的那个」，而是回到同一条 `sync_current_session()` —— 所以「会话方法里再调 29 名」也指向同一个引擎。core 新增一个**可空**的访问器 `current_session_or_null()`（`--server` 口径下 `exec.cpp` 是 `create_state_with_libs()` **之后**才 `set_current_session`，注册时直接取会让断言踩空）。
+- 门禁：`e2e_dbg` 27 → **28**（`session.default-parity`：同一脚本里 `GetModBase` / `ReadMemory` / `Ea2ModnameRva` 与 `d:mods()` / `d:read` 逐字节一致）。
+- 实测：`GetModBase` 由 `nil` 变成 `0x00C70000`（= `13041664`，与会话方法的 `d:mods()[1].base` 同值）；`e2e_dbg` 28/28/8、`e2e_tcp` 59/59/51、`e2e_repl` 10、`e2e_json` 32、`e2e_gui` 21、`check_skill` 16、`nvim_smoke` 32、`--selftest` 73、导入表 13 全绿。
+
+**§9.9 的另一半要改正（实测推翻了「LuaVariant 算术有坑」）**：
+
+```	ext
+U32(0x401000) + 0x1028   -> 0x00402028        ✓
+U64(0x7FF9067A5384) ± 4  -> 精确              ✓
+U32(5) == U32(5)  -> true     U32(5) == 5  -> false   ← 真正的坑：跨类型比较
+```
+
+元表里 `__add/__sub/__mul/__div/__mod/__pow/__unm/__eq/__lt/__le/__idiv/__shl/__shr/__band/__bor/__bxor/__bnot` 都在。所以「`GetModBase(...) + 0x1028` 变成 `0x28`」**在本机复现不出来**；更可能的真身是**宽度不匹配**：`SetBreakpoint` 里是 `lv_check(L, -1, LV_U32)->val.u32`，而 `GetModBase` 在 x64 返回 `LV_U64`（`LV_UZ` 在 x64 = `LV_U64`），`lv_check` 的 U64→U32 转换表里没有这一项；x86 上 `LV_UZ` 恰好吃好是 `LV_U32`，所以「同一脚本在 32 位对、64 位上错」。今后引用这条时按「跨类型比较 + 宽度不匹配」写，不要写成「算术 bug」。
 ### 11.9 多 session 的脚本面（D57 / D58，随切片 C / T7.6）
 
 #### 11.9.1 pump 的两层（D57）

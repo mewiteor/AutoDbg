@@ -207,6 +207,11 @@ private:
  * `session` 为 nullptr 时 `current_session()` 会断言失败（fail-fast）。 */
 void            set_current_session(DebuggerSession *session) noexcept;
 DebuggerSession &current_session() noexcept;
+/* 与 `current_session()` 同源，但**允许宿主还没挂上**（返回 nullptr 而不断言）。
+ * 用途：宿主层要在「自己也可能没挂」的时刻记一份「宿主会话」—— `dbg` 的收尾回退链
+ *   （`scripting/lua/dbg_bindings.cpp` 的 `g_host_sess`）就是这样取的：`--server` 口径下
+ *   `exec.cpp` 是 `create_state_with_libs()` **之后**才 `set_current_session()`。 */
+DebuggerSession *current_session_or_null() noexcept;
 }
 
 #endif /* AUTODBG_CORE_CORE_HPP */

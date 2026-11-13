@@ -23,6 +23,14 @@
 #     context           d:context() 的 `Cip` = 停住那条 int3 的**下一条**；d:context(nil, {Cax=…})
 #                       部分更新返回 true 且读回生效（键名与 `GetContext` 逐字一致：x86 是 `Cax…Cip`）
 #     mods-threads      d:mods() 有 name 含 x86_loop.exe 且 base > 0；d:threads() 含事件的 tid
+#   session.default-parity（C2a 回归门禁，plan_t7.md §11.9.1）—— 同一脚本里用**契约名**与**会话方法**
+#                       读同一个事实并逐字节比对：dbg 会话活着时，29 个契约名必须作用在**同一个**引擎上
+#                       （而不是宿主那个空会话）：
+#     GetModBase('x86_loop.exe')   == d:mods() 里那一项的 base（归一后比）
+#     ReadMemory(U32(ea), U32(4))  == d:read(ea, 4) 的四个字节
+#     Ea2ModnameRva(U32(ea))       == 由 d:mods() 推出的 (modname, rva)
+#                       ❗归一：LuaVariant 取 `.val`（十进制字符串）、number 取 `tostring`，两边
+#                         都成十进制串再比 —— 所以 `d:mods().base` 将来变成 LuaVariant 也照样过。
 #   C2a（多会话 + 进程级事件路由，plan_t7.md §10 / §11.9.1 / D57）—— 起**两个**同名 fixture 实例：
 #     session.multi-two-stopped   两个会话各自 arm 到自己的 site → 循环 dbg.pump(300) 直到两边都 paused
 #                                 （有界轮数 + stopped() 双判）；两者 stop.rva == site、sessions() == 2
@@ -341,6 +349,76 @@ print('kill=' .. tostring(d:kill()))
         "d:context() 的 Cip = 停住那条 int3 的下一条；d:context(nil, {Cax=…}) 部分更新生效；out=[$($r.out)]"
     Check 'session.mods-threads' ($r.out -match 'mod_ok=true' -and $r.out -match 'nthreads=[1-9]\d* tid_ok=true') `
         "d:mods() 有 x86_loop.exe 且 base > 0；d:threads() 含事件 tid；out=[$($r.out)]"
+
+    # ------------------------------------------ ⑤b 契约名 vs 会话方法（C2a 回归：default-parity）
+    # 现场：dbg 会话活着（`g_default == st`）且**停住**在 fixture 的 int3 上。此时 29 个契约名走的
+    # `current_session()` 必须就是本会话的引擎：三组值逐字节相同才算通过。
+    $s_parity = Write-Lua 'parity.lua' @"
+local EXE = '$fxLua'
+local SITE = $($site.site)
+local d, err = dbg.create{ imagepath = EXE }
+print('parity_create=' .. tostring(d ~= nil) .. ' err=' .. tostring(err))
+if not d then return end
+d:arm('x86_loop.exe', SITE, function() end)
+local ev, rounds = nil, 0
+while rounds < 200 do
+    rounds = rounds + 1
+    ev = dbg.pump(3000, false)
+    if ev == nil then break end
+    if ev.rva == SITE then break end
+    ev.session:cont(ev.cont_code)
+    if ev.session:stopped() then break end
+end
+print('parity_hit=' .. tostring(ev ~= nil and ev.rva == SITE))
+if not ev or ev.rva ~= SITE then print('kill=' .. tostring(d:kill())) return end
+
+local base
+for _, m in ipairs(d:mods()) do
+    if m.name and string.lower(m.name):find('x86_loop.exe', 1, true) then base = m.base end
+end
+
+-- 归一：LuaVariant（userdata，`.val` 是十进制字符串）取 `.val`；number 用 tostring
+-- （下一切片把 d:mods().base 也变成 LuaVariant 时，这条断言照样过）
+local function dec(v)
+    if type(v) == 'userdata' or type(v) == 'table' then return tostring(v.val) end
+    return tostring(v)
+end
+local function hexbytes(t, is_table)
+    local h = {}
+    for i = 1, #t do h[i] = string.format('%02X', is_table and t[i] or t:byte(i)) end
+    return table.concat(h, ' ')
+end
+
+-- ① GetModBase（契约名，LuaVariant）vs d:mods().base（会话方法，现在是 number）
+local cbase = GetModBase('x86_loop.exe')
+print('p_base_contract=' .. (cbase ~= nil and dec(cbase) or 'nil') ..
+      ' session=' .. dec(base) ..
+      ' same=' .. tostring(cbase ~= nil and base ~= nil and dec(cbase) == dec(base)))
+
+-- ② ReadMemory(LuaVariant 参数) vs d:read(number 参数)：四个字节相同
+local cmem = ReadMemory(U32(base + SITE - 5), U32(4))
+local smem = d:read(base + SITE - 5, 4)
+print('p_read_contract=' .. hexbytes(cmem, true) .. ' session=' .. hexbytes(smem, false) ..
+      ' same=' .. tostring(hexbytes(cmem, true) == hexbytes(smem, false)))
+
+-- ③ Ea2ModnameRva(LuaVariant) vs 由 d:mods() 推出的 (modname, rva)
+local cmod, crva = Ea2ModnameRva(U32(base + SITE))
+local want_rva = (base + SITE) - base
+print('p_ea_contract=' .. tostring(cmod) .. '/' .. (crva ~= nil and dec(crva) or 'nil') ..
+      ' session=x86_loop.exe/' .. tostring(want_rva) ..
+      ' same=' .. tostring(tostring(cmod) == 'x86_loop.exe' and crva ~= nil and dec(crva) == tostring(want_rva)))
+
+-- 收尾之后契约名必须回到宿主会话（空引擎 ⇒ nil），不能悬在已删除的会话上
+print('kill=' .. tostring(d:kill()))
+print('p_after_teardown=' .. tostring(GetModBase('x86_loop.exe')))
+"@
+    $r = Run-Local $s_parity
+    Check 'session.default-parity' ($r.out -match 'parity_create=true' -and $r.out -match 'parity_hit=true' -and `
+        $r.out -match 'p_base_contract=\d+ session=\d+ same=true' -and `
+        $r.out -match 'p_read_contract=([0-9A-F]{2} ){3}[0-9A-F]{2} session=([0-9A-F]{2} ){3}[0-9A-F]{2} same=true' -and `
+        $r.out -match 'p_ea_contract=x86_loop\.exe/\d+ session=x86_loop\.exe/\d+ same=true' -and `
+        $r.out -match 'p_after_teardown=nil') `
+        "dbg 会话活着时契约名必须作用在**同一个**引擎上（GetModBase / ReadMemory / Ea2ModnameRva 与会话方法逐字节相同），收尾后回到宿主会话；out=[$($r.out)]"
 
     # ------------------------------------------------------------ ⑥ C2a：多会话 + 进程级路由
     # 两个**同名**实例（同一份 fixture）：这是「每会话一个引擎会话」与「按 pid 归属分派」的最小现场。
