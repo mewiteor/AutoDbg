@@ -335,7 +335,7 @@ session.default-parity         契约名与 sess: 方法逐字节一致
 
 ## 11. 对象化 API、命名、Help 与 session 生命周期（设计已拍板，D51–D55）
 
-> 本节是 **T7.3 之后的方向**：`dbg` 从「一个全局表 + 一堆函数」变成「会话对象 + 停止对象」，
+> 本节是 **T7.3 之后的方向**：`dbg` 从「一个全局表 + 一堆函数」变成「会话对象 + 普通事件表」，
 > 并顺带定下命名、帮助、能力探测与 session 归属。代码落地在 §11.7 的切片 A→D 里；
 > 已定的决策进 `AGENTS.md` §13（D51–D55）。
 
@@ -402,40 +402,64 @@ AI 侧的能力探测（写进 skill）：
 2. `inspect(dbg)` —— 给人看（键名一排），**明确标注「给人看，机器别解析」**；
 3. `dbg.caps()` —— 一次问全，形状稳定，可门禁。
 
-### 11.4 对象化 API（D55）
+### 11.4 对象化：Session 对象 + **事件就是普通表**（D55，已按此修订：删掉 Stop 对象）
 
-形态照 `open_file` 的文件对象（D44/D49）——本仓已有先例：
+形态照 `open_file` 的文件对象（D44/D49）——本仓已有先例。但 **`pump` 的返回值不做对象**：
+它是一张**普通表**（无 metatable），会话把「当前未应答的那个」缓存在 `d.stop`。
 
 ```lua
 local d = dbg.create{ imagepath = 'x86_loop.exe' }   -- 或 dbg.attach(pid)
 d.root_pid, d.kind('create'|'attach'), d.state       -- stopped | running | exited
-d:pump([msec])            -- → Stop 对象；nil = 没等到事件（不是错误）；nil,err = 引擎错
-d:cont([code])            -- 无参 = 用上一个事件的默认 code；显式 code = swallow/pass
-d:step([tid]) / d:stop()  -- stop() = 当前未应答的那个 Stop
-d:bp(modname, rva, cb) / d:bp_hw(ea, reg, type, size, cb)
-d:bps()                   -- 含 enable/hits/原始字节
+d.stop                        -- 当前未应答事件（就是 pump 返回的那个表）；nil = 没有
+d:pump([msec])                -- → 事件表；nil = 没等到事件（不是错误）；nil,err = 引擎错
+d:cont([code])                -- 缺省 = d.stop.cont_code；可传 dbg.continue / dbg.not_handled
+d:step([tid])
+d:bp(modname, rva, cb) / d:bp_hw(ea, reg, type, size, cb) / d:bps()
 d:read(addr, n) → string / d:read_u8|u16|u32|u64 / d:read_str
 d:write(addr, data [, {dry_run=true}]) → {written=, old=}
-d:context([tid[, t]]) / d:stack([tid[, depth]]) / d:mods() / d:threads() / d:mem_regions()
+d:context([tid[, t]]) / d:stack([tid[, depth]]) / d:trace([tid[, ea]])
+d:mods() / d:threads() / d:mem_regions()
 d:snapshot(addr, n) / d:restore(snap | snap_id)
-d:detach() / d:kill()     -- detach 在 9x 上不存在
--- Stop
-s.type, s.pid, s.tid, s.ea, s.modname, s.rva, s.code, s.first_chance, s.seq
-s:trace([depth]), s:context(), s:cont([code]), s:swallow(), s:pass()
+d:detach() / d:kill()         -- detach 在 9x 上不存在（D51）
 ```
 
-三条硬规则（不写清就会出现「随机复现的诡异 bug」）：
+事件表形状（与 `hits()` 的记录、协议的 `event` 帧 **同一形状**，见下面第 3 条）：
 
-1. **`d.root_pid` ≠ `s.pid`**：session 的键是一棵进程树（§10），`root_pid` 是树根，`s.pid` 是事件的
+```text
+type  pid  tid  ea  modname  rva  code  first_chance  cont_code
+```
+
+为什么要删掉上一版草案里的 Stop 对象（四条，按重要性排）：
+
+1. **单会话交互里 pid/tid 没有第二个来源**：pump 之后就是「最近一次事件」，缓存在会话里就够了。
+   真要看另一个线程就**显式给 tid**（`d:context(tid)` / `d:stack(tid)`）—— 这本来就是必须有的入口。
+2. **代次问题自动消失**：`d:cont()` 应答的永远是「当前那个」，旧表只是数据。想判「还是不是那一个」
+   用**表身份**：`pump` 返回的就是存进 `d.stop` 的同一个表 ⇒ `e == d.stop` 就够了，不需要 `seq` 字段、
+   也不需要「过期 Stop」的报错路径。
+3. **形状统一就好进 JSON**：`hits()` 记录 / `pump()` 返回值 / `event` 帧的 json 同形 ⇒
+   `jsonx.encode(d.stop)` 直接可用，不用给 userdata 写序列化（S12 的教训：形状不稳每个 agent 都要重猜）。
+   userdata 对象在这里是最贵的东西，而它带来的只是 `s:` 这几个方法。
+4. **少一套名字**：`s:cont/context/trace` 全变成会话方法，人/AI 的记忆负担减半。
+
+必须写清的规则（替代上一版的「三条硬规则」）：
+
+1. **`d.root_pid` ≠ `e.pid`**：session 的键是一棵进程树（§10），`root_pid` 是树根，`e.pid` 是事件的
    真实进程。字段名必须分开，否则 AI 会把子进程事件当成根进程。
-2. **`context()` 的 setter 必须返回值**：无参/带 tid → 表；`d:context(tid, t)` → **部分更新**（只改
+2. **`e.code`（异常码）与 `e.cont_code`（该回的应答码）是两个字段**：前者告诉 AI「这是什么异常」，
+   后者是 core 算好的默认应答（BREAKPOINT → `DBG_CONTINUE`，其余 → `DBG_EXCEPTION_NOT_HANDLED`）。
+   有了它 **`dbg.code()` 取消**（T7.3 里那个访问器只是为了补 pump 返回值不携带 code 的缺口）。
+3. **`d:pump()` 返回 nil 不清 `d.stop`**（没等到事件 ≠ 事件已被应答）；`d:cont()` 之后 `d.stop = nil`；
+   `hits()` 是历史窗口的**副本** ⇒ `hits()[n] ~= d.stop` 即便它们是同一个事件（要「当前」就读 `d.stop`）。
+4. **`context()` 的 setter 必须返回值**：无参/带 tid → 表；`d:context(tid, t)` → **部分更新**（只改
    给出的键），返回 `true` / `nil, err`。理由是 `types.hpp` 的既定口径「错误一律当值返回、不长跳」；
    一个悄悄失败/悄悄写错寄存器的 setter 是这类 API 最贵的 bug。**返回值不影响「像语句一样用」**。
-3. **Stop 有代次**：`s.seq` 与 `d.stop_seq` 不符 ⇒ `s:cont()` 返回 `nil, "no pending event"`。
-   否则「拿旧 Stop 去 cont」会命中下一个事件，变成不可复现的错误。
+5. **不要假设「其它线程没意义」**：fixture 是单线程，但真实目标里别的线程可能正停在有意义的地方
+   （等锁、在系统调用里、持有堆锁）。缺省用 `d.stop.tid` 只是**便利**，`d:threads()` + 显式 tid 才是
+   看别处的入口。
 
 `d:pump()` 返回 `nil`（不再是现在的 `0`）让 `while d:pump(100) do ... end` 读起来自然；
-「没等到事件」与「引擎出错」靠第二返回值区分。
+「没等到事件」与「引擎出错」靠第二返回值区分。`first_chance` 的真值仍要等 T7.4（§2.2 第 5 条）
+由 core 补上（现在通用 `on_exception` 通道不传）。
 
 ### 11.5 session 生命周期与 registry（D54）
 
@@ -475,7 +499,7 @@ s:trace([depth]), s:context(), s:cont([code]), s:swallow(), s:pass()
 | --- | --- | --- | --- |
 | **A** | `close` → `detach`/`kill`（9x 无 `detach`）；`dbg.caps()`；`help()` 纯文本表 | ~200 行 | `detach.*`、`caps.*`、`help.plain-when-piped` |
 | **B** | help 上色（`core::print_styled` + 探测 + `NO_COLOR` + `--json` 口径） | ~80 行 | `help.no-color-when-piped` |
-| **C** | Session/Stop 对象 + registry + `dbg.sessions/session/last/detach(pid)/kill(pid)`；29 名转薄转发；`Var` 退出新面 | ~600 行 | `session.*`（含 §10 那组 `route.*`）、`session.default-parity` |
+| **C** | Session 对象（事件是**普通表**，无 Stop 对象）+ registry + `dbg.sessions/session/last/detach(pid)/kill(pid)`；29 名转薄转发；`Var` 退出新面 | ~550 行 | `session.*`（含 §10 那组 `route.*`）、`session.default-parity` |
 | **D** | REPL 本体（T7.5：`event` 帧 / `out.id` 归因 / proto 2 / ABI 5 / `=` 简写 / 多行 / 退出收尾报告） | 按 §8 | `repl.*` |
 
 顺序硬约束：**A 必须早于 C**（`detach`/`kill` 就是 Session 对象的方法）；**C 必须早于 D**（REPL 里
