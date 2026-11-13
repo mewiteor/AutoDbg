@@ -249,6 +249,123 @@ cannot run while a dbg session exists (detach/kill it first)
   —— C 侧 registry 里**存在**任何 dbg 会话就拒（两条路径都独占整个进程的事件流）。
 - 没有会话（或已收尾）时：`dbg: no session (call dbg.create or dbg.attach first)`。
 
+## 进程树与进程对象（`d:procs()` / `d:proc(pid)` / `d:current_pid()`，切片 C2b / D61）
+
+> 事实来源（改这一层时同步这里）：`src/scripting/lua/dbg_bindings.cpp` 的 `kProcMethods`（2424-2429）、
+> `push_proc_table`（2431-2448）、`session_proc`（2452-2465）、`session_procs`（2468-2482）、
+> `session_current_pid`（2487-2498）；`src/core/process.cpp` 的 `add_pid`（90-97）、`owns_pid`（99-105）、
+> `pid_at`（107-111）、`handle_for_pid`（116-152）；`src/core/memory.cpp` 的 `read_some(pid, …)`（70-78）。
+
+一个会话的键是**一棵进程树**：根 pid（`d.root_pid`）+ 调试期间出现的全部 `CREATE_PROCESS` 的 pid
+（一棵树只有一个调试器 ⇒ 子进程自动归同一个会话）。所以子进程的 `CREATE_PROCESS` / 断点命中 / 异常 /
+退出事件都路由进**同一个**会话（`registry_find()` 按 `sess->owns_pid(pid)`，`dbg_bindings.cpp:380-386`），
+`ev.session` 仍是同一个会话对象。`d.root_pid`（树根）与 `ev.pid`（事件的真实进程）必须分开用。
+
+### 三个入口
+
+| 调用 | 返回 | 口径 |
+| --- | --- | --- |
+| `d:procs()` | `{ pid, ... }`（**pid 数组**，不是进程对象） | 插入序 = `CREATE_PROCESS` 序、**根在第一个**（`pid_at(i)`，越界返回 0） |
+| `d:proc(pid)` | **普通表**（`pid` 字段 + 方法）/ `nil, err` | `pid` 必须是本会话树里的（`owns_pid`）；不在 → `d:proc: pid is not in this session's tree: <pid>` |
+| `d:current_pid()` | number | 回调里 = 那个事件的 pid（可能是子进程）；顶层没有事件 ⇒ 只能是 `d.root_pid` |
+
+- `d:current_pid()` 的回调判据是 `cb_active()` + `cb_session()`（`dbg_bindings.cpp:2491-2496`）——与 `V()`
+  的回调归属（D60）是同一条事实的两个面：回调里「我该读谁」就问它，**不要假设根进程**。
+- `d:procs()` 是「本次调试**见过**的 pid」，不是「还活着的」：进程退出时只关掉它的缓存句柄
+  （`close_pid_handle`，`debug_loop.cpp:681`），pid 仍留在树里（`debug_loop.cpp:680`）⇒ 之后再读那个 pid
+  会 `nil, err`（句柄已关）。上限 16（`kMaxPids`，`core.hpp:232`）：满了 `add_pid` 直接忽略
+  （`process.cpp:95`），多出来的 pid 既不进树也不给句柄（`handle_for_pid` 会拒，`process.cpp:120`）。
+  会话未开始 / 已收尾 ⇒ `nil, err`（`kErrNoSess`）。
+- 按 pid 的句柄用于**内存读写、断点补丁与模块名解析**（`handle_for_pid`：根用 `proc().hProcess`，其它走
+  `OpenProcess` + 9x 不认 `PROCESS_QUERY_INFORMATION` 时去掉它重试，`process.cpp:129-132`；`LOAD_DLL` 的
+  `GetMappedFileNameW` 也用它，`debug_loop.cpp:712`）。
+
+### 进程对象的方法（`kProcMethods`，11 个）
+
+| 方法 | 与 `d:` 同名方法的差别 |
+| --- | --- |
+| `p:read(addr, n)` / `p:read_u8 / read_u16 / read_u32 / read_u64(addr)` / `p:read_str(addr)` / `p:write(addr, data)` | 同一份实现（`proc_data` → `do_read*` / `do_write`，`dbg_bindings.cpp:2361-2376`），只把句柄换成 `handle_for_pid(pid)`（`memory.cpp:78`） |
+| `p:mods()` | 只列**那个进程**的模块（`do_mods` 的 pid 过滤：`pe->dwProcessId != pid` 跳过，`dbg_bindings.cpp:1358`） |
+| `p:v(addr)` | `Var` 绑 **(本会话, 该 pid)**（`dbg_bindings.cpp:2420`）；`[off]` 追下去仍是同一个 (会话, pid)（`bindings.cpp:2116`）。入参错误文案是 `d:proc:v: addr (number or LuaVariant) expected` / `d:proc:v: addr must be positive`（2417-2418） |
+| `p:context([tid[, t]])` / `p:stack([tid[, depth]])` | **只按 tid**：线程表是整棵树的（`ThreadInfo::ProcessId`，`types.hpp:52`）⇒ `pid` 只用于「会话还活着」的校验，不参与句柄解析（`dbg_bindings.cpp:2388-2406`） |
+
+它是**普通表**（不是 userdata）：`inspect` / `jsonx.encode` 直接可用，只有 `pid` 字段与方法。类型口径与
+会话一致（D59）：`pid` 是 number，`p:mods().base` / `p:read_u64` / `p:v(...):to('I')` 是 **LuaVariant**，
+`p:read_u8|u16|u32` 是 number，`p:read` / `p:read_str` 是字节串（`p:read` 返回**实际读到的**字节，可能短）。
+
+### `d:read` 与 `p:read`（最容易混的一条）
+
+会话上的同名方法**永远是根进程**：`session_read` 那一批传的是 `pid = 0`，而 core 里 `pid == 0` 就等于
+`proc().dwProcessId`（`core.hpp:90`、`process.cpp:118`）。
+
+| 写法 | 作用在哪个进程 |
+| --- | --- |
+| `d:read` / `d:read_u8 / read_u16 / read_u32 / read_u64` / `d:read_str` / `d:write` / `d:v(addr)` | **根进程**（`d:v` 绑 `root_pid`，`dbg_bindings.cpp:2326`） |
+| `p:read` / `p:read_u8 / read_u16 / read_u32 / read_u64` / `p:read_str` / `p:write` / `p:v(addr)` | **`p` 那个 pid** |
+| `d:mods()` | 整棵树的模块（`pid = 0` ⇒ 不过滤） |
+| `p:mods()` | 只有那个进程的模块 |
+| `d:threads()` | 整棵树的线程，每项 `{ tid, pid }`（`pid` 是 C2b 新加的字段，`dbg_bindings.cpp:1407`） |
+| 29 个契约名（`ReadMemory` / `LoadStr` / `GetContext` …） | 根进程 —— 它们走的是不带 pid 的旧签名（`memory.cpp:12-16`），契约不变 |
+
+回调里的 `V(addr)` 解析的是**事件那个进程**（`var_pid()`：显式 pid 优先，否则取回调上下文的事件 pid，
+`bindings.cpp:1996-2000`）——这就是「回调里只写 addr」在进程树下仍然成立的原因；顶层用 `d:v`（根）或 `p:v`。
+
+```lua
+-- 进程树：根进程 + 它派生的子进程 —— 同一个 RVA、两个进程、两个值
+local d, err = dbg.create{ imagepath = [[C:\path\parent.exe]] }   -- 靶子会 CreateProcess 起子进程
+if not d then error(err) end
+local root = d.root_pid
+
+for _ = 1, 200 do                                  -- 有界轮数：目标可能提前退出
+    local ev = d:pump(500)                        -- 默认不放行
+    if ev then
+        if ev.pid ~= root then print('event from child pid', ev.pid) end   -- ev.pid = 事件的真实进程
+        ev.session:cont(ev.cont_code)             -- ev.session 仍是同一个会话（同一棵树）
+    elseif d:stopped() then
+        break
+    end
+    if #d:procs() >= 2 then break end             -- d:procs() 是 pid 数组，根在第一个
+end
+
+local child
+for _, pid in ipairs(d:procs()) do
+    if pid ~= root then child = pid end
+end
+if not child then print('no child in the tree') return end
+
+local p = d:proc(child)                           -- 普通表：pid + 方法（不是 userdata）
+for _, m in ipairs(p:mods()) do                   -- p:mods() 只列那个进程的模块
+    if m.name then
+        print(m.name, m.base.hex)                 -- base 是 LuaVariant：用 .hex / .val，别 == 数字
+        print('u32 via pid handle =', tostring(p:read_u32(tonumber(m.base.val) + 0x1028)))
+    end
+end
+print('top current_pid =', d:current_pid(), '(只能是 root_pid)')
+```
+
+### 两个已知限制（照 `PITFALLS.md` 的 **S27** / **S28**，不是 bug）
+
+- **`d:arm` 在进程树里只能打到第一个进程**（S27）：断点记录的 key 是 `(modname, rva)`、
+  `orignal_byte` 只有**一个字节**（`types.hpp:61`，`#pragma pack(1)` 布局不可动），
+  `apply_breakpoints_for_module` 看到 `has_orignal_byte` 已置位就跳过（`breakpoints.cpp:126`）
+  ⇒ 同名模块在第二个进程里不会被补 `0xCC`（断点记录有、补丁打不上）。现在的做法：子进程用**它自己的**
+  `int 3` / 异常 + `d:current_pid()` + `d:proc(pid)` 定位，命中后显式 `cont`；按 pid 的断点记录层
+  （`plan_t7.md` §10 第 4 条）留给后续。
+- **新树的第一条 `CREATE_PROCESS` 归「发起这次 pump 的会话」**（S28）：`DEBUG_EVENT` 里没有 parent pid
+  （要精确归属得读 PEB 的 `InheritedFromUniqueProcessId`，那是 NT-only 的 `NtQueryInformationProcess`，
+  9x 没有）⇒ 只能靠「谁在 pump」推断（`pump_once` 的 `hint`，`dbg_bindings.cpp:1629-1637`）；两个会话
+  都在等时，先 pump 的那个会认领。所以一个执行里**串行**驱动（这是设计前提），要判归属就显式用
+  `d:procs()` 核对；单进程树（绝大多数用例）不受影响。这条只管**新树的第一条**事件：同一个 pid 的后续
+  事件按 `owns_pid` 精确归属。
+
+❗`dbg.remote` 的代理上**没有** `proc` / `procs` / `current_pid`（`lualib/dbglib.lua` 的 `SESSION_METHODS`
+白名单里没有，`dbglib.lua:301-307`）⇒ 进程对象只在本地会话上有。
+
+门禁对照（`tools/server_test/e2e_dbg.ps1`）：`route.child-process`（`d:procs()` 长度 2、根在第一个、
+`ev.session` 仍是同一个）/ `route.child-handle`（各自 `p:mods()` 的 base 读到各自的 `MZ`；子进程栈上的
+标记只有子进程句柄看得到）/ `d:current-pid`（回调里 = 事件 pid、顶层 = `d.root_pid`）/ `d:v-child`
+（同一 RVA 上父 42、子 7）。可跑的 recipe 是 `recipes/child-process.md`。
+
 ## V 与 d:v：指针链走查
 
 `V(addr)` 是 29 个契约名之一，但切片 C1d 起它**只在调试回调里可用** —— 回调里「产生该事件的

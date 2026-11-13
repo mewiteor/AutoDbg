@@ -86,6 +86,7 @@ if d.detach then d:detach() else d:kill() end
 | --- | --- |
 | `recipes/run-and-break.md` | launch a target, break on a function, dump arguments (`Run` + callbacks) |
 | `recipes/stop-and-inspect.md` | **`dbg`**: two sessions stopped at the same time, read each `context()` / memory, then finish |
+| `recipes/child-process.md` | the target spawns a **child process**: `d:procs()` finds the child pid, `p:read` reads that process's own memory, `d:current_pid()` identifies parent vs child in callbacks |
 | `recipes/attach-existing.md` | attach to something already running (incl. `gui.pick()` / `--pid`) |
 | `recipes/scan-and-patch.md` | find a pattern with `FindMemory`, patch it, verify |
 | `recipes/gui-automation.md` | drive a GUI app via the `gui` table (click / type / screenshot) |
