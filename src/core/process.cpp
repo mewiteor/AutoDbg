@@ -1,7 +1,9 @@
 ﻿/* =============================================================================
  * src/core/process.cpp —— 进程 / 线程控制（P3.B 模块 7，逐字从 bindings.cpp 迁入）
  *
- * 内容：get_thread_by_tid / detach_process / find_pid_by_mouse（+ 内部辅助 FlashWin）
+ * 内容：get_thread_by_tid / detach_process / find_pid_by_mouse（+ 内部辅助 FlashWin），
+ *   以及 T7 切片 C2b 的进程树（`add_pid` / `owns_pid` / `pid_at` / `handle_for_pid` /
+ *   `close_pid_handle(s)`，plan_t7.md §10 第 1/3 条）。
  *
  * 跨模块改动（仅这些，其余逐字节不变）：
  *   · get_thread_by_tid / detach_process 去掉 `static`（绑定层调用）；
@@ -12,6 +14,8 @@
  *   · 两处 `free(...)` → `free_(...)`（同名桥接：`core/util.hpp` 的 `free_` 就是
  *     `common::release` → msvcrt `free`，且多一个 NULL 判断）；引擎侧不再直接依赖
  *     CRT 的 `free` 声明（旧文件是从 `<stdlib.h>` 传递性拿到的）。
+ *   · C2b 追加进程树：pid 集合（根 + 调试期间出现的 CREATE_PROCESS）与 pid→HANDLE 缓存
+ *     （非根进程走 `OpenProcess`；`PROCESS_QUERY_INFORMATION` 在 9x 上不认，去掉它重试）。
  * ❗ 控制台输入策略（CheckConsoleInput）**不在这里** —— 见 Q27 / process.hpp 的说明。
  * 依赖：memory（write）、pe（get_base）、engine（g_breakpoint_list）、util（打印）。
  * ========================================================================== */
@@ -74,6 +78,100 @@ static void FlashWin(HWND hwnd)
 {
     /* Win95 兼容：`FlashWindowEx` 不在 Win95 的 user32 里 → 走 util.cpp 的动态解析 + 回落 */
     LjFlashWindow(hwnd);
+}
+
+/* ========================= 进程树（T7 切片 C2b，plan_t7.md §10） =========================
+ * 会话的键是**一棵树**：根 pid + 调试期间出现的全部 `CREATE_PROCESS` 的 pid（一棵树只有一个调试器
+ * ⇒ 那个 pid 一定属于本会话）。这里只放**集合与句柄**：
+ *   · 归属维护在两个事件分支（`debug_loop.cpp` 的 CREATE_PROCESS / EXIT_PROCESS）；
+ *   · 内存 API 的 pid 重载在 `memory.cpp`（真正用句柄的地方）；
+ *   · 容器是两个定长数组（零 CRT 下不为它引入容器；单棵树的进程数是个位数，见 core.hpp）。 */
+
+void DebuggerSession::add_pid(DWORD pid) noexcept
+{
+    if (!pid) return;
+    for (int i = 0; i < m_pid_count; i++)
+        if (m_pids[i] == pid) return;
+    if (m_pid_count >= kMaxPids) return;   /* 满了：多出来的 pid 不归本会话（`handle_for_pid` 会拒） */
+    m_pids[m_pid_count++] = pid;
+}
+
+bool DebuggerSession::owns_pid(DWORD pid) const noexcept
+{
+    if (!pid) return false;
+    for (int i = 0; i < m_pid_count; i++)
+        if (m_pids[i] == pid) return true;
+    return false;
+}
+
+DWORD DebuggerSession::pid_at(int index) const noexcept
+{
+    if (index < 0 || index >= m_pid_count) return 0;
+    return m_pids[index];
+}
+
+/* 内存/断点补丁该用哪个进程句柄（plan_t7.md §10 第 3 条：旧实现一律 `proc().hProcess` ⇒
+ * 子进程的断点补丁会打到根进程上）。`pid == 0` 与根 pid 都返回 `proc().hProcess` ——
+ * 那个句柄是 `DEBUG_PROCESS` 换来的（权限最全），由 `run_shutdown` 关，不归这里的缓存。 */
+HANDLE DebuggerSession::handle_for_pid(DWORD pid)
+{
+    if (!pid || pid == proc().dwProcessId) return proc().hProcess;
+
+    if (!owns_pid(pid)) return NULL;   /* 不是本会话树里的进程：不替调用方去开别人的进程 */
+
+    for (int i = 0; i < kMaxPids; i++)
+        if (m_pid_handles[i].pid == pid) return m_pid_handles[i].handle;
+
+    /* 非根进程：`OpenProcess` 拿一份自己拥有的句柄并**缓存**（进程退出时 `close_pid_handle`、
+     * 收尾/析构时 `close_pid_handles`）。`kernel32!OpenProcess` 全 w95 可（`tools/api_check`
+     * 的 w95 段里有它）；9x 不认 `PROCESS_QUERY_INFORMATION` ⇒ 去掉它再试一次 —— 与
+     * `util.cpp` 里 `mapped_name_from_psapi` 的降级同一口径。 */
+    HANDLE h = OpenProcess(PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_VM_OPERATION | PROCESS_QUERY_INFORMATION,
+                           FALSE, pid);
+    if (h == NULL)
+        h = OpenProcess(PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_VM_OPERATION, FALSE, pid);
+    if (h == NULL)
+    {
+        E("OpenProcess(%lu)", (unsigned long)pid);
+        return NULL;
+    }
+    for (int i = 0; i < kMaxPids; i++)
+    {
+        if (m_pid_handles[i].pid == 0)
+        {
+            m_pid_handles[i].pid    = pid;
+            m_pid_handles[i].handle = h;
+            return h;
+        }
+    }
+    /* 缓存表满（与 pid 集合同一上限）：不缓存就该关掉 —— 漏一个句柄比“读不到”更糟。 */
+    CloseHandle(h);
+    E("OpenProcess(%lu): handle table full", (unsigned long)pid);
+    return NULL;
+}
+
+void DebuggerSession::close_pid_handle(DWORD pid) noexcept
+{
+    for (int i = 0; i < kMaxPids; i++)
+    {
+        if (m_pid_handles[i].pid != pid) continue;
+        if (m_pid_handles[i].handle) CloseHandle(m_pid_handles[i].handle);
+        m_pid_handles[i].pid    = 0;
+        m_pid_handles[i].handle = NULL;
+        return;
+    }
+}
+
+/* 全关 + 把树也作废：调用点只有 `begin`（同一会话重用时的第二轮）与 `run_shutdown`/析构。 */
+void DebuggerSession::close_pid_handles() noexcept
+{
+    for (int i = 0; i < kMaxPids; i++)
+    {
+        if (m_pid_handles[i].handle) CloseHandle(m_pid_handles[i].handle);
+        m_pid_handles[i].pid    = 0;
+        m_pid_handles[i].handle = NULL;
+    }
+    m_pid_count = 0;
 }
 
 DWORD find_pid_by_mouse(const char **err)

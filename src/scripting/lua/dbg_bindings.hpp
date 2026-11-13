@@ -15,6 +15,10 @@
  *     键名与帧字段跟 `GetContext` / `StackTrace` 同源；
  *   · **C1d**：`v(addr)`（会话绑定的 `Var`，解引用一律走本会话的引擎）+ `context()` **全变体**
  *     （与 `GetContext` 逐字段同型，见 dbg_bindings.cpp 的类型口径块）；
+ *   · **C2b（进程树）**：`proc(pid)` → **普通表**（`pid` 字段 + read / read_u8..u64 / read_str /
+ *     write / v / context / stack / mods，都作用在**那个进程**上）、`procs()` → `{ pid, ... }`（根在第一个）、`current_pid()`（回调里 =
+ *     事件 pid，顶层 = `root_pid`）。会话上的同名方法仍是**根进程**的视角；`d:v` 绑根进程、
+ *     `p:v` 绑那个进程（`Var` 载荷的 pid 字段）；
  *   · 对象字段：`stop`（当前未应答的事件表，与 `pump` 返回的是**同一张表**）/ `root_pid` / `kind` /
  *     `state`（`running` / `stopped` / `exited`）；
  *   · 模块级保留 create / attach / pump / cont / step / eip / arm / hits / dropped / setcap / stopped /

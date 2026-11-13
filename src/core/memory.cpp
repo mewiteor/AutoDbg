@@ -8,6 +8,12 @@
  * T7 切片 C1b 追加 `read_some`（plan_t7.md §2.2 第 12 条）：逐页读、在第一个读不了的页处停下，
  *   把「真实读到的字节数」交给调用方。`read()` 变成它的全有或全无包装（签名与 29 个契约名的
  *   可观察行为都不变），`write` / `update_memory` / `loadstr` 一个字未改。
+ *
+ * T7 切片 C2b（plan_t7.md §10 第 3 条）追加 **pid 重载**：`read_some` / `read` / `write` /
+ *   `update_memory` / `loadstr` 的首参数都可以显式给进程 pid，句柄由 `handle_for_pid(pid)` 取
+ *   （根进程 = `proc().hProcess`，其它进程 = 缓存的 `OpenProcess` 句柄）。旧签名全部**保留**并转发
+ *   给 `proc().dwProcessId` ⇒ 29 个契约名与既有调用点零改动。`pid == 0` 等价于根进程。
+ *   内存搜索（`find_memory_*`）与区域遍历（`get_memory_region_*`）不在本切片范围内，仍只认根进程。
  * ========================================================================== */
 #include "memory.hpp"
 #include "core.hpp" /* P6.4：引擎函数是会话成员（本 TU 多数定义即成员，直接用自身状态） */ /* 模块 11：proc() 等状态现在通过 current_session() 取（宏别名） */
@@ -33,17 +39,18 @@ using autodbg::core::MemRegionIter;
  * ❗本函数**不刷错误日志**：逐页路径里「碰到不可读的页」是**正常路径**（partial read 的全部意义），
  *   在那里报错会把一次正常的短读变成满屏噪音。诊断留给 `read()`（它失败时打一行，见下）。
  * ❗`ReadProcessMemory` 失败时按 0 字节算，**即使它报了部分拷贝** —— 旧 `read()` 对任何
- * `ReadProcessMemory` 失败都整体返回 false，这一条不能因为有了 `read_some` 就松动。 */
-static size_t read_block(DebuggerSession &sess, size_t addr, void *data, size_t size)
+ * `ReadProcessMemory` 失败都整体返回 false，这一条不能因为有了 `read_some` 就松动。
+ * ❗C2b：句柄由调用方按 pid 解析好传进来（旧实现直取 `proc().hProcess`）。 */
+static size_t read_block(HANDLE hProcess, size_t addr, void *data, size_t size)
 {
     DWORD old_protect;
-    if (!VirtualProtectEx(sess.proc().hProcess, (LPVOID)addr, size, PAGE_EXECUTE_READ, &old_protect))
+    if (!VirtualProtectEx(hProcess, (LPVOID)addr, size, PAGE_EXECUTE_READ, &old_protect))
         return 0;
     size_t got      = 0;
     SIZE_T new_size = 0;
-    if (ReadProcessMemory(sess.proc().hProcess, (LPVOID)addr, data, size, &new_size) && new_size <= size)
+    if (ReadProcessMemory(hProcess, (LPVOID)addr, data, size, &new_size) && new_size <= size)
         got = (size_t)new_size;
-    if (!VirtualProtectEx(sess.proc().hProcess, (LPVOID)addr, size, old_protect, &old_protect))
+    if (!VirtualProtectEx(hProcess, (LPVOID)addr, size, old_protect, &old_protect))
         E("VirtualProtectEx");
     return got;
 }
@@ -56,11 +63,22 @@ static size_t read_block(DebuggerSession &sess, size_t addr, void *data, size_t 
  *   `GetContext` 之类）的行为一个字节都没变；`bindings.cpp` 里读内存的代码一律没动。 */
 size_t DebuggerSession::read_some(size_t addr, void *data, size_t size)
 {
+    return read_some(0, addr, data, size);   /* 0 = 根进程（旧签名原样保留，见文件头） */
+}
+
+size_t DebuggerSession::read_some(DWORD pid, size_t addr, void *data, size_t size)
+{
     if (!addr || !data || !size)
     {
         LOG(TEXT("参数错误: addr: %zu, data: %p, size: %zu"), addr, data, size);
         return 0;
     }
+    /* C2b：句柄按 pid 取（根 = `proc().hProcess`，子进程 = 缓存的 OpenProcess 句柄）。
+     * 拿不到就是 0 字节 —— 与“一字节都读不到”同一口径，不另立错误码。 */
+    HANDLE hProcess = handle_for_pid(pid);
+    if (!hProcess)
+        return 0;
+
     SYSTEM_INFO si;
     ZeroMem(si);
     GetSystemInfo(&si);
@@ -74,7 +92,7 @@ size_t DebuggerSession::read_some(size_t addr, void *data, size_t size)
         size_t inpage = page - (cur % page); /* 这一块最多到页尾 */
         size_t chunk  = size - done;
         if (chunk > inpage) chunk = inpage;
-        size_t got = read_block(*this, cur, out + done, chunk);
+        size_t got = read_block(hProcess, cur, out + done, chunk);
         done += got;
         if (got != chunk) break; /* 第一块读不了 ⇒ 停；后面的字节一个都不碰 */
     }
@@ -83,12 +101,17 @@ size_t DebuggerSession::read_some(size_t addr, void *data, size_t size)
 
 bool DebuggerSession::read(size_t addr, void *data, size_t size)
 {
+    return read(0, addr, data, size);   /* 0 = 根进程（旧签名原样保留，见文件头） */
+}
+
+bool DebuggerSession::read(DWORD pid, size_t addr, void *data, size_t size)
+{
     if (!addr || !data || !size)
     {
         LOG(TEXT("参数错误: addr: %zu, data: %p, size: %zu"), addr, data, size);
         return false;
     }
-    size_t got = read_some(addr, data, size);
+    size_t got = read_some(pid, addr, data, size);
     if (got == size)
         return true;
     /* 旧实现在这里打的是「哪个系统调用失败」（`VirtualProtectEx(addr, size)` / `ReadProcessMemory`）。
@@ -99,52 +122,70 @@ bool DebuggerSession::read(size_t addr, void *data, size_t size)
 
 bool DebuggerSession::write(size_t addr, const void *data, size_t size, bool up_intrin)
 {
+    return write(0, addr, data, size, up_intrin);   /* 0 = 根进程（旧签名原样保留，见文件头） */
+}
+
+bool DebuggerSession::write(DWORD pid, size_t addr, const void *data, size_t size, bool up_intrin)
+{
     if (!addr || !data || !size)
     {
         LOG(TEXT("参数错误"));
         return false;
     }
+    HANDLE hProcess = handle_for_pid(pid);
+    if (!hProcess)
+        return false;
     DWORD old_protect;
-    if (!VirtualProtectEx(proc().hProcess, (LPVOID)addr, size, PAGE_EXECUTE_READWRITE, &old_protect))
+    if (!VirtualProtectEx(hProcess, (LPVOID)addr, size, PAGE_EXECUTE_READWRITE, &old_protect))
     {
         E("VirtualProtectEx");
         return false;
     }
     bool   r = true;
     SIZE_T new_size;
-    if (!WriteProcessMemory(proc().hProcess, (LPVOID)addr, data, size, &new_size))
+    if (!WriteProcessMemory(hProcess, (LPVOID)addr, data, size, &new_size))
     {
         E("WriteProcessMemory");
         r = false;
     }
     else if (size != new_size)
         r = false;
-    else if (up_intrin && !FlushInstructionCache(proc().hProcess, NULL, 0))
+    else if (up_intrin && !FlushInstructionCache(hProcess, NULL, 0))
     {
         E("FlushInstructionCache");
         r = false;
     }
-    if (!VirtualProtectEx(proc().hProcess, (LPVOID)addr, size, old_protect, &old_protect))
+    if (!VirtualProtectEx(hProcess, (LPVOID)addr, size, old_protect, &old_protect))
         E("VirtualProtectEx");
     return r;
 }
 
 bool DebuggerSession::update_memory(size_t addr, void *old_data, const void *new_data, size_t size, bool is_up_intrin)
 {
+    return update_memory(0, addr, old_data, new_data, size, is_up_intrin);   /* 0 = 根进程 */
+}
+
+bool DebuggerSession::update_memory(DWORD pid, size_t addr, void *old_data, const void *new_data, size_t size, bool is_up_intrin)
+{
     if (!addr || !size || (!old_data && !new_data))
     {
         LOG(TEXT("参数错误"));
         return false;
     }
-    if (old_data && !read(addr, old_data, size))
+    if (old_data && !read(pid, addr, old_data, size))
         return false;
-    return !new_data || write(addr, new_data, size, is_up_intrin);
+    return !new_data || write(pid, addr, new_data, size, is_up_intrin);
 }
 
 /* P3.B 模块 8：从 bindings.cpp 迁入（符号表原本归 memory；`lua_load_str` 与
  * `get_cpp_class_name` 都用它）。逐字搬入，只把 `realloc` 换成 `common::resize`、
  * `memcpy` 换成 `CopyMem`（等价，见 memory.hpp 的说明）。 */
 bool DebuggerSession::loadstr(size_t addr, char **pp, size_t *nn)
+{
+    return loadstr(0, addr, pp, nn);   /* 0 = 根进程（旧签名原样保留，见文件头） */
+}
+
+bool DebuggerSession::loadstr(DWORD pid, size_t addr, char **pp, size_t *nn)
 {
     char   buf[16];
     size_t i;
@@ -153,7 +194,7 @@ bool DebuggerSession::loadstr(size_t addr, char **pp, size_t *nn)
     *pp      = NULL;
     do
     {
-        if (!read(addr, buf, sizeof buf))
+        if (!read(pid, addr, buf, sizeof buf))
             return false;
         addr += n;
 

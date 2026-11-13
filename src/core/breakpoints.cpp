@@ -9,6 +9,8 @@
  *   · set_breakpoint / update_breakpoints 去掉 static（bindings.cpp 调用）；
  *   · del_breakpoint 的 lua_State *L → const core::DebugCallbacks *cb —— 旧代码在此
  *     直接 lua_unref，现改为走销毁通知（令牌由调用方释放，见 Plan 5.5）。
+ *   · C2b：`apply_breakpoints_for_module` 的读写改走 `peinfo->dwProcessId` 的句柄
+ *     （进程树里子进程的断点补丁不能打到根进程）。
  * 依赖：memory（读写）、pe（get_peinfo_* 与 parse_pe）、engine（g_breakpoint_list）。
  * ========================================================================== */
 #include "breakpoints.hpp"
@@ -98,6 +100,12 @@ void DebuggerSession::del_breakpoints_by_modname_without_update_memory(const cor
  * apply_breakpoints_for_module - 为模块应用所有断点
  * @param modname 模块名
  * @param base 模块基址
+ *
+ * ❗T7 切片 C2b（plan_t7.md §10 第 3 条）：读写一律走 **`peinfo->dwProcessId`** 的句柄。
+ *   旧实现直取 `proc().hProcess`（根进程）⇒ 在进程树里，子进程的 `CREATE_PROCESS` / `LOAD_DLL`
+ *   会拿根进程的句柄去改子进程的代码页：要么改错地方、要么改失败（断点记录有，补丁没打上）。
+ *   断点记录的 key 仍是 `(modname, rva)`（`BreakpointInfo` 无 pid 且布局不可动）⇒ 同名模块在
+ *   树里每个进程各打一份 `0xCC`，这是本切片的已有口径（“断点的进程维度落在新记录层”留给后续）。
  */
 void DebuggerSession::apply_breakpoints_for_module(PEInfo *peinfo)
 {
@@ -128,7 +136,7 @@ void DebuggerSession::apply_breakpoints_for_module(PEInfo *peinfo)
             continue;
 
         BYTE *sec_buf = AllocX(BYTE, sec_size);
-        if (!read(sec_addr, sec_buf, sec_size))
+        if (!read(peinfo->dwProcessId, sec_addr, sec_buf, sec_size))
             continue;
         for (BreakpointInfo *info = breakpoints().head(); info; info = info->next)
         {
@@ -143,7 +151,7 @@ void DebuggerSession::apply_breakpoints_for_module(PEInfo *peinfo)
             sec_buf[offset]        = 0xCC;
             info->has_orignal_byte = 1;
         }
-        write(sec_addr, sec_buf, sec_size, true);
+        write(peinfo->dwProcessId, sec_addr, sec_buf, sec_size, true);
     }
 }
 

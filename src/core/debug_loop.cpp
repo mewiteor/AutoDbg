@@ -19,6 +19,9 @@
  *   · `run_shutdown` 是 `run` 的私有成员（P6.4：它要用会话自身的状态）；
  *   · ScyllaHide 条件块从 bindings.cpp 整体搬来（98 构建的 `NO_SCYLLA_HIDE` 空实现）；
  *   · `lua_on_*` 适配器 / `LuaDebugAdapter` / `pcall` 仍留绑定层（宿主适配）。
+ *   · T7 切片 C2b（plan_t7.md §10）：`CREATE_PROCESS` 把 pid 记进会话的进程树（`add_pid`），
+ *     `EXIT_PROCESS` 关掉按 pid 的缓存句柄；`LOAD_DLL` 填 `PEInfo::dwProcessId` 并用**事件那个
+ *     进程**的句柄去解析模块名（否则子进程的 DLL 断点会打到根进程上）。
  * ❗错误不用长跳：内部错误走「返回 -1 + *err」（D18），绑定层在 run 返回后 lua_error。
  * ❗空闲轮询（Q27）：`WaitForDebugEvent` 超时时调 `DebugCallbacks::on_wait_timeout`，
  *   引擎只执行结论（继续等 / 分离并终止 / 分离但保留目标）。
@@ -112,6 +115,11 @@ void DebuggerSession::run_shutdown(const core::RunParams *params)
     }
     if (params->use_scylla_hide)
         scylla_hide_on_stop();
+
+    /* C2b：按 pid 的句柄归本函数。子进程的缓存句柄先关（根进程那两个上面刚关完）；
+     * 同时把进程树作废 —— `close_pid_handles()` 会清 `m_pid_count`，所以 `end()` 之后
+     * `d:procs()` 不再报上一轮那棵树（`d:*` 数据面在 `started == false` 时本来就会拒）。 */
+    close_pid_handles();
 }
 
 /* begin：Attach / CreateProcess + 跨 pump 的会话状态（不循环）。
@@ -209,6 +217,13 @@ int DebuggerSession::begin(const core::RunParams *params, const core::DebugCallb
     m_reset_bpx.rva     = 0;
     m_reset_bpx.ea      = 0;
     m_reset_hw_bp       = 0; /* 原 `reset_hwbpx`：DR0-3 的位掩码 */
+
+    /* C2b（plan_t7.md §10 第 1 条）：会话的键是一棵**进程树** —— 先清掉上一轮的（同一个
+     * `DebuggerSession` 可能被 `Run` 重用多轮），再把根进程记成树根。create 路径的 pid 由
+     * `CreateProcess` 填好，attach 路径上面已经写成 `params->pid`；两条路径失败时它是 0
+     * （`add_pid` 忽略 0，`owns_pid` 也不会把 0 当成任何进程）。 */
+    close_pid_handles();
+    add_pid(proc().dwProcessId);
 
     /* `DebugActiveProcessStop` 在 begin 里解析一次（原来每次 run 在栈上解析）：取不到 → D47 的降级
      * （只能 terminate；`on_wait_timeout` 拿到的 can_detach_without_term = false，`end` 的返回值也据此上报） */
@@ -574,6 +589,10 @@ int DebuggerSession::dispatch(const DEBUG_EVENT &DBGEvent, bool autocont)
                 proc().dwThreadId = DBGEvent.dwThreadId;
             }
         }
+        /* C2b（plan_t7.md §10 第 1 条）：调试期间出现的每个 `CREATE_PROCESS` 都归本会话 ——
+         * 一棵树只能有一个调试器（子进程自动归同一个）⇒ 这个 pid 一定属于我们，
+         * 宿主层的按 pid 路由（`owns_pid`）就靠这条。 */
+        add_pid(DBGEvent.dwProcessId);
         {
             TCHAR image_name[MAX_FILEPATH];
 #ifdef _UNICODE
@@ -657,6 +676,9 @@ int DebuggerSession::dispatch(const DEBUG_EVENT &DBGEvent, bool autocont)
         {
             if (DBGEvent.dwProcessId == proc().dwProcessId)
                 cont() = false;
+            /* C2b：本会话为这个 pid 打开的缓存句柄该关了（根进程不在这张表里 ⇒ 空操作）。
+             * pid 仍留在树里（`owns_pid` 继续为真）：会话的身份是一棵**树**，不是“当前活着的进程”。 */
+            close_pid_handle(DBGEvent.dwProcessId);
             DBGCode            = DBG_CONTINUE;
             for (PEInfo *tmp = peinfos().head(); tmp; )
             {
@@ -677,7 +699,7 @@ int DebuggerSession::dispatch(const DEBUG_EVENT &DBGEvent, bool autocont)
         unique_handle load_dll_file(DBGEvent.u.LoadDll.hFile);
         TCHAR         image_name[MAX_FILEPATH];
 #if !defined(_UNICODE)
-        DWORD image_name_len = LjGetMappedFileNameA(proc().dwProcessId, DBGEvent.u.LoadDll.lpBaseOfDll, image_name, _countof(image_name));
+        DWORD image_name_len = LjGetMappedFileNameA(DBGEvent.dwProcessId, DBGEvent.u.LoadDll.lpBaseOfDll, image_name, _countof(image_name));
         if (!image_name_len)
             E("LjGetMappedFileNameA(0x%zX)", DBGEvent.u.LoadDll.lpBaseOfDll);
 #elif defined(_WIN64)
@@ -685,7 +707,9 @@ int DebuggerSession::dispatch(const DEBUG_EVENT &DBGEvent, bool autocont)
         if (!image_name_len)
             E("GetFinalPathNameByHandleW(0x%zX)", DBGEvent.u.LoadDll.lpBaseOfDll);
 #else
-        DWORD image_name_len = GetMappedFileNameW(proc().hProcess, DBGEvent.u.LoadDll.lpBaseOfDll, image_name, _countof(image_name));
+        /* C2b：句柄属于**这个事件的那个进程**（进程树里子进程的 DLL 地址在根进程的地址空间里
+         * 根本不存在 —— 用 `proc().hProcess` 会解析失败，PEInfo 就没名字、断点也挂不上）。 */
+        DWORD image_name_len = GetMappedFileNameW(handle_for_pid(DBGEvent.dwProcessId), DBGEvent.u.LoadDll.lpBaseOfDll, image_name, _countof(image_name));
         if (!image_name_len)
             E("GetMappedFileNameW(0x%zX)", DBGEvent.u.LoadDll.lpBaseOfDll);
 #endif
@@ -697,6 +721,10 @@ int DebuggerSession::dispatch(const DEBUG_EVENT &DBGEvent, bool autocont)
             /* P6.2：变长节点由链表一次分配（与旧 `alloc_(sizeof(PEInfo) + n*sizeof(TCHAR))` 同算法） */
             info         = peinfos().create_front(image_name_len * sizeof(TCHAR));
             info->base        = (size_t)DBGEvent.u.LoadDll.lpBaseOfDll;
+            /* C2b：`dwProcessId` 是「这个模块属于哪个进程」的唯一记录（`apply_breakpoints_for_module`
+             * 靠它选句柄）。旧实现从不填它（`create_front` 给 0 ⇒ 归成根进程），单进程树下看不出
+             * 区别，进程树里就会把子进程的 DLL 补丁打到根进程。 */
+            info->dwProcessId = DBGEvent.dwProcessId;
             info->name_offset = PathFindFileName(translated_name) - translated_name;
             /* ❗同 CREATE_PROCESS 那处：legacy（ANSI）的 TCHAR 是 1 字节，`__movsw` 会
              * 按 2 字节拷 → 溢出分配的 `image_name_len` 字节 → 堆损坏（随机 AV）。 */

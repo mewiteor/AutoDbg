@@ -66,6 +66,18 @@
 #                                 每张 ok == true / exit == 0x4000001F / hits >= 1，返回后 sessions() == 0
 #                                 ❗exit 是**实测值**：不武装断点时 fixture 的第二个 int3 走 NOT_HANDLED，
 #                                 进程被系统以 WOW64 断点状态终止（不是 fixture 契约的 42）；见下面的说明
+#   T7 C2b（进程树 + 按 pid 的句柄 + 进程对象，plan_t7.md §10 / §11.7）—— 靶子是
+#   `.out/fixtures/x86_spawn.exe`（父进程起自己当子进程、父子各写自己的标记变量、子进程抛一次裸 int3）：
+#     route.child-process     create 后泵到 d:procs() 长度 2（根在第一个），且事件表的 ev.session
+#                             仍是**同一个**句柄（子进程的 CREATE_PROCESS 归同一个会话）
+#     route.child-handle      每个进程用**自己的** p:mods() 的 base 读到自己的 MZ（4D5A）；再用子进程的
+#                             句柄在它的栈上写一个标记 ⇒ 子进程读得到、root 的句柄读不到同一个字节
+#                             ❗「root 读不到子进程的 image base」不能当判据：ASLR 只有 8 bit 熵，
+#                              实测父子常常撞同一个 base（本轮两次实测都是 0x80000 / 0xD10000 同值）
+#     d:current-pid           回调里 d:current_pid() == 事件 pid（父与子两个 pid 都出现过）、顶层 == root_pid
+#                             （回调走 `on_breakpoint`：子进程那次是它自己的 ntdll 初始断点 + 裸 int3）
+#     d:v-child               p:v 绑 (会话, 该 pid)：同一 RVA 上父读 42、子读 7（各自进程的句柄）；
+#                             p:v(...):to('H') 与 p:read_u16 一致
 #   T7 C-remote（跨位数会话代理，plan_t7.md §10.1 / D56）—— **只在 86 宿主上跑**（需两个位数）：
 #     本机跑 32 位 `AutoDbg_86.exe <script>`，脚本里用 `dbg.remote` 连一个 64 位的
 #     `--repl --server`（PowerShell 起，`finally` 里 `Kill`），在那边 create 一个 64 位 cmd.exe：
@@ -75,10 +87,11 @@
 #     remote.data-plane      `d:read(m.base, 4)` = 四字节 PE 头 / `d:read_u16` 是 number
 #                            （字节走 `__hex`、LuaVariant 走 `__u64` 十进制串，见 dbglib.lua 的文件头）
 #     remote.teardown        `d:kill()` 真终止那个 64 位目标（PowerShell 用 Get-Process 复查）
-# ❗session.* / kill.* / C2a 的 4 条 / sugar.* 的 2 条 / remote.* 的 4 条 / var.* + context.all-variant
-#   都需要 x86 宿主（前几段还要 x86 fixture）⇒ x64 上这几段整段 SKIP（8 条）。
-#   x86（含 legacy）是 **32** 条（C1c 加了 session.lv-types；C1d 加了 var.callback-only /
-#   context.all-variant / var.d-v-bound）。
+# ❗session.* / kill.* / C2a 的 4 条 / sugar.* 的 2 条 / C2b 的 4 条 / remote.* 的 4 条 /
+#   var.* + context.all-variant 都需要 x86 宿主（前几段还要 x86 fixture）⇒ x64 上这几段整段 SKIP（8 条）。
+#   x86（含 legacy）是 **36** 条（C1c 加了 session.lv-types；C1d 加了 var.callback-only /
+#   context.all-variant / var.d-v-bound；C2b 加了 route.child-process / route.child-handle /
+#   d:current-pid / d:v-child）。
 # =============================================================================
 [CmdletBinding()]
 param(
@@ -181,6 +194,41 @@ function Find-FixtureSite([string]$path)
         }
     }
     return @{ count = $hits.Count; rva = $rva; site = $rva + 5 }
+}
+
+# 扫 fixture 文件里的任意字节模式，返回 @{ count; rva }（文件偏移 → RVA 的映射规则同 Find-FixtureSite）。
+# C2b 的 `x86_spawn.exe` 靠这个定位它的标记变量 `g_tag`（初值 0x53575030 ⇒ 文件里是 30 50 57 53，
+# 全文件只出现一次）：同一 RVA、父进程读 42、子进程读 7 —— 见 tests/fixtures/bin/x86_spawn.c 的文件头。
+function Find-FixturePattern([string]$path, [byte[]]$pattern)
+{
+    $b = [IO.File]::ReadAllBytes($path)
+    $peOff = [BitConverter]::ToUInt32($b, 60)
+    $soh = [BitConverter]::ToUInt16($b, $peOff + 20)
+    $nsec = [BitConverter]::ToUInt16($b, $peOff + 6)
+    $secOff = $peOff + 24 + $soh
+    $hits = New-Object System.Collections.Generic.List[int]
+    for ($i = 0; $i -le $b.Length - $pattern.Length; $i++)
+    {
+        $ok = $true
+        for ($k = 0; $k -lt $pattern.Length; $k++)
+        {
+            if ($b[$i + $k] -ne $pattern[$k]) { $ok = $false; break }
+        }
+        if ($ok) { $hits.Add($i) }
+    }
+    $rva = -1
+    foreach ($h in $hits)
+    {
+        for ($s = 0; $s -lt $nsec; $s++)
+        {
+            $e = $secOff + $s * 40
+            $va = [BitConverter]::ToUInt32($b, $e + 12)
+            $rawsize = [BitConverter]::ToUInt32($b, $e + 16)
+            $raw = [BitConverter]::ToUInt32($b, $e + 20)
+            if ($h -ge $raw -and $h -lt ($raw + $rawsize)) { $rva = $va + ($h - $raw) }
+        }
+    }
+    return @{ count = $hits.Count; rva = $rva }
 }
 
 # ---------------------------------------------------------------- ① caps / 能力
@@ -750,6 +798,166 @@ print('left=' .. #dbg.sessions() .. ' cb_hits=' .. tostring(hits > 0))
         $r.out -match "r1 $rwant" -and $r.out -match "r2 $rwant" -and `
         $r.out -match 'left=0 cb_hits=true') `
         "run_all 返回两张结果表（ok/exit/hits/root_pid），跑完不留下会话；out=[$($r.out)]"
+
+    # ------------------------------------------------------------ ⑦b C2b：进程树 + 按 pid 的句柄
+    # 靶子是 `.out/fixtures/x86_spawn.exe`：父进程用 CreateProcessA 起**自己**当子进程，父子各写
+    # 自己的标记变量（同一 RVA：父 = 42、子 = 7）、子进程再抛一次裸 `int 3`。四个断言分两组：
+    #   route.child-process / route.child-handle  —— 归属 + 句柄真的按 pid 分
+    #   d:current-pid / d:v-child                 —— 回调里的 pid 归属 + `p:v` 绑到那个进程
+    $spawn = Join-Path $Root '.out/fixtures/x86_spawn.exe'
+    if (-not (Test-Path $spawn))
+    {
+        Write-Output "SKIP: route.* / d:current-pid / d:v-child 需要 .out/fixtures/x86_spawn.exe（先 make.bat a 86）"
+    }
+    else
+    {
+        $spawnLua = $spawn.Replace('\', '/')
+        $tagPat = Find-FixturePattern $spawn ([byte[]](0x30, 0x50, 0x57, 0x53))
+        $tagRva = $tagPat.rva
+
+        # route.child-process + route.child-handle
+        $s_route = Write-Lua 'route.lua' @"
+local EXE = '$spawnLua'
+local TAG_RVA = $tagRva
+local d, err = dbg.create{ imagepath = EXE }
+print('cp_create=' .. tostring(d ~= nil) .. ' err=' .. tostring(err))
+if not d then return end
+-- 泵到进程树里有 2 个 pid（子进程的 CREATE_PROCESS 已被分派进**同一个**会话）
+local same_session, nev = true, 0
+for i = 1, 200 do
+    local ev = d:pump(500)
+    if ev ~= nil then
+        if ev.session ~= d then same_session = false end
+        nev = nev + 1
+        ev.session:cont(0x00010002)   -- DBG_CONTINUE：子进程的裸 int3 必须显式放行
+    elseif d:stopped() then break end
+    if #d:procs() >= 2 then break end
+end
+local root_pid = d.root_pid
+local child_pid
+for _, pid in ipairs(d:procs()) do if pid ~= root_pid then child_pid = pid end end
+print('cp_procs=' .. #d:procs() .. ' root_first=' .. tostring(d:procs()[1] == root_pid) ..
+      ' child_pos=' .. tostring(child_pid ~= nil and child_pid > 0) ..
+      ' same_session=' .. tostring(same_session) .. ' events=' .. tostring(nev > 3))
+if not child_pid then print('kill=' .. tostring(d:kill())) return end
+
+-- ① 每个进程用**自己的** p:mods() 取 base，各读到自己的 MZ（4D5A）
+local function base_of(pid)
+    local p = d:proc(pid)
+    for _, m in ipairs(p:mods()) do
+        if m.name and string.lower(m.name):find('x86_spawn.exe', 1, true) then return m.base, p end
+    end
+end
+local function hexstr(s)
+    if s == nil then return 'nil' end
+    local t = {}
+    for i = 1, #s do t[#t + 1] = string.format('%02X', s:byte(i)) end
+    return table.concat(t)
+end
+local rb, rp = base_of(root_pid)
+local cb, cp = base_of(child_pid)
+print('cp_base_found=' .. tostring(rb ~= nil and cb ~= nil) ..
+      ' base_differ=' .. tostring(rb ~= nil and cb ~= nil and rb.val ~= cb.val))
+print('cp_mz=' .. hexstr(rp and rp:read(rb, 2)) .. '/' .. hexstr(cp and cp:read(cb, 2)) ..
+      ' mz_ok=' .. tostring(rb ~= nil and cb ~= nil and hexstr(rp:read(rb, 2)) == '4D5A' and
+                              hexstr(cp:read(cb, 2)) == '4D5A'))
+
+-- ② 句柄真的按 pid 分：用**子进程**的句柄在它的栈上写一个标记 ⇒ 子进程读得到；
+--    同一个地址用 root 的句柄读**不是**那个标记（父子活着的内存区间不重叠，这条不会 flake）。
+--    ❗「root 读不到子进程的 image base」不能当判据：ASLR 只有 8 bit 熵，实测父子常撞同一个
+--      base（本轮实测两次都是同一个值）⇒ 那一句只在 base 不同时才成立，这里只做记录。
+local child_tid
+for _, t in ipairs(d:threads()) do if t.pid == child_pid and child_tid == nil then child_tid = t.tid end end
+local split = false
+if child_tid then
+    local sp = cp:context(child_tid).Csp
+    local probe = sp - 8
+    local wrote = cp:write(probe, string.char(0xDE, 0xAD, 0xBE, 0xEF))
+    local got = cp:read(probe, 4)
+    local from_root = d:read(probe, 4)
+    split = wrote and got ~= nil and hexstr(got) == 'DEADBEEF' and
+            (from_root == nil or hexstr(from_root) ~= 'DEADBEEF')
+    print('cp_probe=' .. tostring(wrote) .. ' child=' .. hexstr(got) ..
+          ' root=' .. hexstr(from_root) .. ' tid=' .. tostring(child_tid > 0))
+end
+print('cp_handle_split=' .. tostring(split))
+print('kill=' .. tostring(d:kill()))
+"@
+        $r = Run-Local $s_route 60000
+        Check 'route.child-process' ($r.out -match 'cp_create=true' -and $r.out -match 'cp_procs=2 root_first=true child_pos=true' -and `
+            $r.out -match 'same_session=true events=true' -and $r.out -match 'kill=true') `
+            "被调试进程创建的子进程归**同一个**会话：d:procs() 长度 2、根在第一个、事件表的 ev.session 仍是同一个句柄；out=[$($r.out)]"
+        Check 'route.child-handle' ($r.out -match 'cp_base_found=true' -and $r.out -match 'cp_mz=4D5A/4D5A mz_ok=true' -and `
+            $r.out -match 'cp_probe=true child=DEADBEEF' -and $r.out -match 'cp_handle_split=true') `
+            "读子进程必须用**该进程**的句柄：各自 p:mods() 的 base 读到各自的 MZ；子进程栈上的标记只有子进程句柄看得到（root 读不到同一个字节）；out=[$($r.out)]"
+
+        # d:current-pid + d:v-child
+        $s_tree = Write-Lua 'tree.lua' @"
+local EXE = '$spawnLua'
+local TAG_RVA = $tagRva
+local S = {}                     -- 回调里要用会话对象，而 create 的表构造在赋值之前 ⇒ 用 upvalue 表
+local bp_ok, bp_n, child_bp = true, 0, false
+local d, err = dbg.create{ imagepath = EXE, on_breakpoint = function(ev)
+    bp_n = bp_n + 1
+    if S.d:current_pid() ~= ev.pid then bp_ok = false end
+    if ev.pid ~= S.d.root_pid then child_bp = true end
+end }
+S.d = d
+print('dv_create=' .. tostring(d ~= nil) .. ' err=' .. tostring(err))
+if not d then return end
+
+local function base_of(pid)
+    local p = d:proc(pid)
+    for _, m in ipairs(p:mods()) do
+        if m.name and string.lower(m.name):find('x86_spawn.exe', 1, true) then return m.base, p end
+    end
+end
+
+-- 泵到「两个进程 + 子进程的 tag 已经是 7（= 它的 pass_tag 跑过了）+ 子进程的断点回调已发生」
+local root_pid = d.root_pid
+local child_pid, child_ready = nil, false
+for i = 1, 300 do
+    local ev = d:pump(500)
+    if ev ~= nil then ev.session:cont(0x00010002)
+    elseif d:stopped() then break end
+    if child_pid == nil and #d:procs() >= 2 then
+        for _, pid in ipairs(d:procs()) do if pid ~= root_pid then child_pid = pid end end
+    end
+    if child_pid ~= nil and not child_ready then
+        local cb, cp = base_of(child_pid)
+        if cb ~= nil and cp:read_u32(cb + TAG_RVA) == 7 then child_ready = true end
+    end
+    if child_ready and child_bp then break end
+end
+print('dv_ready=' .. tostring(child_ready) .. ' child_bp=' .. tostring(child_bp) ..
+      ' procs=' .. #d:procs())
+-- 回调里 d:current_pid() 必须等于事件 pid（父与子两个 pid 都出现过）；顶层 = root_pid
+print('current_pid_cb=' .. tostring(bp_ok and bp_n >= 2) .. ' bp_n=' .. bp_n ..
+      ' top_root=' .. tostring(d:current_pid() == root_pid))
+if not child_ready then print('kill=' .. tostring(d:kill())) return end
+
+-- p:v 绑的是 **(会话, 那个 pid)**：同一 RVA、两个进程、两个值（父 42 / 子 7）
+local rb, rp = base_of(root_pid)
+local cb, cp = base_of(child_pid)
+local rt = rp:v(rb + TAG_RVA):to('I')
+local ct = cp:v(cb + TAG_RVA):to('I')
+print('tag_root=' .. tostring(rt and rt.val) .. ' tag_child=' .. tostring(ct and ct.val) ..
+      ' tag_differ=' .. tostring(rt ~= nil and ct ~= nil and rt.val ~= ct.val))
+-- p:v(...):to('H') 必须与 p:read_u16 一致（同一个进程、同一个地址）
+local hv = cp:v(cb + TAG_RVA):to('H')
+local n16 = cp:read_u16(cb + TAG_RVA)
+print('tag_h=' .. tostring(hv and hv.val) .. ' u16=' .. tostring(n16) ..
+      ' h_same=' .. tostring(hv ~= nil and tonumber(hv.val) == n16))
+print('kill=' .. tostring(d:kill()))
+"@
+        $r = Run-Local $s_tree 60000
+        Check 'd:current-pid' ($r.out -match 'dv_create=true' -and $r.out -match 'current_pid_cb=true bp_n=[2-9]\d* top_root=true' -and `
+            $r.out -match 'child_bp=true' -and $r.out -match 'kill=true') `
+            "回调里 d:current_pid() == 事件 pid（父与子两个 pid 都出现过）、顶层 == d.root_pid；out=[$($r.out)]"
+        Check 'd:v-child' ($r.out -match 'dv_ready=true' -and $r.out -match 'tag_root=42 tag_child=7 tag_differ=true' -and `
+            $r.out -match 'h_same=true' -and $r.out -match 'kill=true') `
+            "p:v 绑到 (会话, 该 pid)：同一 RVA 上父读 42、子读 7（各自进程的句柄）；p:v(...):to('H') 与 p:read_u16 一致；out=[$($r.out)]"
+    }
 }
 
 # ---------------------------------------------------------------- ⑧ T7 C-remote：跨位数会话代理

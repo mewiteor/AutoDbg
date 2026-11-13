@@ -79,6 +79,7 @@ using autodbg::host::arg_num_or_lv;
 using autodbg::host::CallbackScope;
 using autodbg::host::cb_active;
 using autodbg::host::cb_session;
+using autodbg::host::cb_pid;   /* C2b：`Var` 解引用按**事件 pid** 选进程（`var_pid`） */
 using autodbg::host::dbg_session_alive;
 
 /* P6.4：引擎函数已从「全局自由函数」改成 `autodbg::core` 里的会话成员（各模块头保留了同名转发）→
@@ -1942,12 +1943,15 @@ int lua_force_kill(lua_State *L)
 
 /* ---------------- `Var` 的载荷（T7 切片 C1d） ----------------
  *
- * 载荷 = `{ base, sess }`：
+ * 载荷 = `{ base, sess, pid }`：
  *   · `base` 是地址（`Var` 的所有方法都以它为起点）；
  *   · `sess` 是**用哪个引擎去读写**。两个构造者就是两条路径：
  *       `V(addr)`    —— 29 名里的老名字，**只在调试回调里可用**（`sess = nullptr` 就是
  *                       「按回调上下文现取」，那个上下文是 `CallbackScope` 置的）；
  *       `d:v(addr)`  —— 会话方法，`sess` = 该会话的引擎，不受「当前会话」影响。
+ *   · `pid`（C2b）= 解引用读**哪个进程**：非 0 = 显式进程（`d:v` 给 `root_pid`、`p:v` 给那个
+ *       进程的 pid）；0 = 「按回调上下文现取」（只有 `V()` 的产物 —— 它只在回调里可用，而回调
+ *       里的事件 pid 就是答案）。所以进程树里 `V()` 读的是**事件那个进程**，`d:v` 读的是根进程。
  *
  * 为什么要消灭「猜当前会话」：C2a 起每个 `dbg` 会话自带引擎，而 `current_session()` 只是
  *   「最近一次 create/attach」的代理 ⇒ 顶层调 `V()` 读到的可能是宿主会话、也可能是别的会话，
@@ -1964,24 +1968,36 @@ struct VarPayload
 {
     size_t                 base;
     core::DebuggerSession *sess;   /* nullptr ⇒ 仅回调上下文可用（V() 的产物） */
+    DWORD                  pid;    /* 0 ⇒ 按回调上下文现取（V()）；非 0 ⇒ 显式进程（d:v / p:v） */
 };
 
-/* 造一个 Var（`d:v` 与 V() 共用；载荷的解读规则只在下面三个 helper 里）。 */
-void push_bound_var(lua_State *L, size_t base, core::DebuggerSession *sess)
+/* 造一个 Var（`d:v` / `p:v` 与 V() 共用；载荷的解读规则只在下面三个 helper 里）。 */
+void push_bound_var(lua_State *L, size_t base, core::DebuggerSession *sess, DWORD pid)
 {
     VarPayload *p = (VarPayload *)lua_newuserdata(L, sizeof(VarPayload));
     p->base       = base;
     p->sess       = sess;
+    p->pid        = pid;
     luaL_getmetatable(L, "Var");
     lua_setmetatable(L, -2);
 }
 
 /* `Var` 方法的统一入口：取载荷（参数错照旧由 `luaL_checkudata` 抛）。 */
-static void var_payload(lua_State *L, int idx, size_t *base, core::DebuggerSession **sess)
+static void var_payload(lua_State *L, int idx, size_t *base, core::DebuggerSession **sess, DWORD *pid)
 {
     VarPayload *p = (VarPayload *)luaL_checkudata(L, idx, "Var");
     *base         = p->base;
     *sess         = p->sess;
+    *pid          = p->pid;
+}
+
+/* 解引用该读哪个进程（C2b）：显式 pid 优先，否则回调上下文的事件 pid，都没有就 0。
+ * ❗`0` 在 core 的 pid 重载里就等于根进程，所以两条 fallback 都是安全的。 */
+static DWORD var_pid(DWORD pid) noexcept
+{
+    if (pid != 0) return pid;
+    if (cb_active()) return cb_pid();
+    return 0;
 }
 
 /* 这个 Var 当前该用哪个引擎：显式绑定的会话 → 回调上下文 → 都没有就报错（固定文案）。
@@ -2018,7 +2034,7 @@ int lua_v(lua_State *L)
         lua_pushstring(L, kVarNoCallback);
         return 2;
     }
-    push_bound_var(L, (size_t)addr, nullptr);
+    push_bound_var(L, (size_t)addr, nullptr, 0);
     return 1;
 }
 
@@ -2027,7 +2043,8 @@ int lua_var_index(lua_State *L)
     /* 获取self和key */
     size_t                 base = 0;
     core::DebuggerSession *sess = nullptr;
-    var_payload(L, 1, &base, &sess);
+    DWORD                  pid  = 0;
+    var_payload(L, 1, &base, &sess, &pid);
 
     size_t addr = 0;
     if (lua_type(L, 2) == LUA_TUSERDATA)
@@ -2049,8 +2066,8 @@ int lua_var_index(lua_State *L)
         /* 读取指针大小的数据（用**本 Var 的**引擎；指针追下去得到的还是同一个 Var） */
         core::DebuggerSession *eng = var_session(L, sess);
         size_t                 ptr_value;
-        if (eng->read(addr, &ptr_value, sizeof(size_t)))
-            push_bound_var(L, ptr_value, sess);
+        if (eng->read(var_pid(pid), addr, &ptr_value, sizeof(size_t)))
+            push_bound_var(L, ptr_value, sess, pid);
         else
             lua_pushnil(L);
         return 1;
@@ -2073,7 +2090,8 @@ int lua_var_off(lua_State *L)
     /* 获取self和key */
     size_t                 base = 0;
     core::DebuggerSession *sess = nullptr;
-    var_payload(L, 1, &base, &sess);
+    DWORD                  pid  = 0;
+    var_payload(L, 1, &base, &sess, &pid);
     if (!base)
     {
         lua_pushnil(L);
@@ -2095,7 +2113,7 @@ int lua_var_off(lua_State *L)
     }
     else if (lua_type(L, 2) == LUA_TNUMBER)
         addr = base + (SSIZE_T)lua_tointeger(L, 2);
-    push_bound_var(L, addr, sess);   /* 派生 Var 继续用同一个引擎（`d:v` 的绑定不会在链条里丢掉） */
+    push_bound_var(L, addr, sess, pid);   /* 派生 Var 继续用同一个引擎与同一个进程（绑定不在链条里丢掉） */
     return 1;
 }
 
@@ -2103,7 +2121,8 @@ int lua_var_to(lua_State *L)
 {
     size_t                 base = 0;
     core::DebuggerSession *sess = nullptr;
-    var_payload(L, 1, &base, &sess);
+    DWORD                  pid  = 0;
+    var_payload(L, 1, &base, &sess, &pid);
     if (!base)
         return 0;
 
@@ -2187,7 +2206,7 @@ int lua_var_to(lua_State *L)
     core::DebuggerSession *eng = var_session(L, sess);   /* 用本 Var 的引擎（不是 current_session） */
     struct LuaVariant      *lv  = lv_push(L, type);
 
-    if (!eng->read(addr, lv->buf, type_size))
+    if (!eng->read(var_pid(pid), addr, lv->buf, type_size))
     {
         lua_pop(L, 1);
         luaL_traceback(L, L, NULL, 1);
@@ -2206,7 +2225,8 @@ int lua_var_tos(lua_State *L)
 {
     size_t                 base = 0;
     core::DebuggerSession *sess = nullptr;
-    var_payload(L, 1, &base, &sess);
+    DWORD                  pid  = 0;
+    var_payload(L, 1, &base, &sess, &pid);
     if (!base)
         return 0;
 
@@ -2309,7 +2329,7 @@ int lua_var_tos(lua_State *L)
         return lua_error(L);
     }
 
-    if (!eng->read(addr, buffer, total_size))
+    if (!eng->read(var_pid(pid), addr, buffer, total_size))
     {
         free_(buffer);
 
@@ -2353,7 +2373,8 @@ int lua_var_sto(lua_State *L)
 {
     size_t                 base = 0;
     core::DebuggerSession *sess = nullptr;
-    var_payload(L, 1, &base, &sess);
+    DWORD                  pid  = 0;
+    var_payload(L, 1, &base, &sess, &pid);
     if (!base)
         return 0;
 
@@ -2450,7 +2471,7 @@ int lua_var_sto(lua_State *L)
         return lua_error(L);
     }
 
-    if (!eng->read(addr, buffer, total_size))
+    if (!eng->read(var_pid(pid), addr, buffer, total_size))
     {
         free_(buffer);
 
@@ -2510,7 +2531,8 @@ int lua_var_write(lua_State *L)
 {
     size_t                 base = 0;
     core::DebuggerSession *sess = nullptr;
-    var_payload(L, 1, &base, &sess);
+    DWORD                  pid  = 0;
+    var_payload(L, 1, &base, &sess, &pid);
     if (!base)
         return 0;
 
@@ -2553,7 +2575,7 @@ int lua_var_write(lua_State *L)
         return lua_error(L);
     }
 
-    if (!var_session(L, sess)->write(addr, lv_val->buf, type_size, false))
+    if (!var_session(L, sess)->write(var_pid(pid), addr, lv_val->buf, type_size, false))
     {
         luaL_traceback(L, L, NULL, 1);
         size_t n;
@@ -2570,7 +2592,8 @@ int lua_var_writes(lua_State *L)
 {
     size_t                 base = 0;
     core::DebuggerSession *sess = nullptr;
-    var_payload(L, 1, &base, &sess);
+    DWORD                  pid  = 0;
+    var_payload(L, 1, &base, &sess, &pid);
     if (!base)
         return 0;
 
@@ -2639,7 +2662,7 @@ int lua_var_writes(lua_State *L)
         p += size;
     }
 
-    bool b = eng->write(addr, buf, allsize, false);
+    bool b = eng->write(var_pid(pid), addr, buf, allsize, false);
     free_(buf);
 
     if (!b)
@@ -2659,7 +2682,8 @@ int lua_var_swrite(lua_State *L)
 {
     size_t                 base = 0;
     core::DebuggerSession *sess = nullptr;
-    var_payload(L, 1, &base, &sess);
+    DWORD                  pid  = 0;
+    var_payload(L, 1, &base, &sess, &pid);
     if (!base)
         return 0;
 
@@ -2691,7 +2715,7 @@ int lua_var_swrite(lua_State *L)
     else if (lua_type(L, 3) == LUA_TNUMBER)
         addr += (SSIZE_T)lua_tointeger(L, 3);
 
-    if (!var_session(L, sess)->write(addr, val, n, false))
+    if (!var_session(L, sess)->write(var_pid(pid), addr, val, n, false))
     {
         luaL_traceback(L, L, NULL, 1);
         size_t n;

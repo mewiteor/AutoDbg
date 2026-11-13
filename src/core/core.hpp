@@ -29,6 +29,12 @@
  *   `m_params` / `m_cb`）**必须是会话成员** —— 手工映射的模块禁止 `thread_local` 与函数内非平凡
  *   构造的 static（§11.5、PITFALLS M10），留在栈上就是跨 pump 状态丢失。
  *
+ * ✅ T7 切片 C2b（plan_t7.md §10）：会话的键从「一个 pid」变成**一棵进程树** —— `m_pids` 是
+ *   根 pid + 调试期间出现的全部 `CREATE_PROCESS` 的 pid（`owns_pid()`），`m_pid_handles` 是
+ *   `OpenProcess` 出来的按 pid 句柄缓存（`handle_for_pid()`）。内存 API 因此多出 pid 重载，
+ *   断点补丁按 `PEInfo::dwProcessId` 打（否则子进程的补丁会写到根进程上）。
+ *   仍限单进程树的旧口径（每会话一个待应答槽）不变：进程树的“停住”只指最近那个事件。
+ *
  * 链表字段目前仍是**裸指针 + 首成员 next**（与旧实现 1:1）；P6.2 换成
  *   `common::IntrusiveList<T>`（容器已实现并有单测）。
  * ========================================================================== */
@@ -78,14 +84,22 @@ public:
      * 命名暂时保持旧名字（snake_case 统一留给 P6.6 风格批）。
      * 模块头里还留着同名 inline 转发（过渡期，给尚未迁移的调用方用），迁移完即删。 */
 
-    /* --- 内存（memory.cpp） --- */
+    /* --- 内存（memory.cpp） ---
+     * 每个内存原语有**两个重载**：不带 pid 的（= 根进程，1:1 保留旧签名，29 个契约名与既有
+     * 调用点零改动）与带 pid 的（进程树里的任意进程，T7 切片 C2b）。`pid == 0` 等价于根进程
+     * （`proc().dwProcessId`），句柄由 `handle_for_pid()` 按 pid 取。 */
     bool read(size_t addr, void *data, size_t size);
+    bool read(DWORD pid, size_t addr, void *data, size_t size);
     /* T7 切片 C1b（plan_t7.md §2.2 第 12 条）：逐页读，**在第一个读不了的页处停下**，
      * 返回**实际读到的字节数**（0 = 一字节都没读到）。`read()` 是它的全有或全无包装。 */
     size_t read_some(size_t addr, void *data, size_t size);
+    size_t read_some(DWORD pid, size_t addr, void *data, size_t size);
     bool write(size_t addr, const void *data, size_t size, bool up_intrin);
+    bool write(DWORD pid, size_t addr, const void *data, size_t size, bool up_intrin);
     bool update_memory(size_t addr, void *old_data, const void *new_data, size_t size, bool is_up_intrin);
+    bool update_memory(DWORD pid, size_t addr, void *old_data, const void *new_data, size_t size, bool is_up_intrin);
     bool loadstr(size_t addr, char **pp, size_t *nn);
+    bool loadstr(DWORD pid, size_t addr, char **pp, size_t *nn);
     void find_memory_init(FindMemoryContext *ctx, const void *pattern, size_t len);
     FindMemoryKind find_memory_next(FindMemoryContext *ctx, FindMemoryMatch *out, char *errbuf, size_t errcap);
     void find_memory_release(FindMemoryContext *ctx);
@@ -121,6 +135,21 @@ public:
     /* --- 进程 / 线程（process.cpp） --- */
     HANDLE get_thread_by_tid(DWORD tid);
     void   detach_process(const DebugCallbacks *cb);
+
+    /* ------------------------- 进程树（T7 切片 C2b） -------------------------
+     * plan_t7.md §10 第 1/3 条：一个会话的键是**一棵树**（根进程 + 它派生出来的全部进程）。
+     * 「调试期间出现的 CREATE_PROCESS」一定归同一个调试器 ⇒ 那个 pid 属于本会话（一棵树只有一个
+     * 调试器，不可能有第二个会话认领它）。
+     *
+     * `handle_for_pid()` 是这个集合的唯一用途：内存/断点补丁必须打在**属于那个 pid 的**句柄上
+     * （旧实现一律 `proc().hProcess` ⇒ 子进程的断点补丁会写到根进程）。根 pid 直接用
+     * `proc().hProcess`（调试事件给的句柄）；其它 pid 走 `OpenProcess`（`kernel32!OpenProcess`
+     * 全 w95 可，见 plan_t7.md §10 第 3 条）并**缓存**（pid→HANDLE 小表，进程退出 / 会话析构时关）。
+     * 9x 不认 `PROCESS_QUERY_INFORMATION` ⇒ 沿用 `util.cpp` 的降级重试（去掉那一项再试一次）。 */
+    bool   owns_pid(DWORD pid) const noexcept;
+    HANDLE handle_for_pid(DWORD pid);
+    int    pid_count() const noexcept { return m_pid_count; }
+    DWORD  pid_at(int index) const noexcept;   /* 越界返回 0；插入序 = 根在前 */
 
     /* --- 栈 / C++ 类名（stack_trace.cpp） --- */
     bool get_cpp_class_name(size_t addr, char *out, size_t cap, bool *has_name);
@@ -196,6 +225,25 @@ private:
 
     /* C2a：`dispatch` 的内部错误文案（每次分派开头清空）。 */
     const char *m_last_error{};
+
+    /* ---------------- T7 切片 C2b：进程树的 pid 集合 + 按 pid 的句柄缓存 ----------------
+     * 两个数组的容量是同一个上限（一棵树里超过 16 个进程就只剩根进程的句柄能取，其余会在
+     * `handle_for_pid()` 里失败并报错）—— 零 CRT 下不为它引入容器；会话数也是个位数。 */
+    static const int kMaxPids = 16;
+
+    void add_pid(DWORD pid) noexcept;          /* 已存在 / 满 / pid == 0 ⇒ 无操作 */
+    void close_pid_handle(DWORD pid) noexcept; /* 关掉缓存里那个 pid 的句柄（进程退出） */
+    void close_pid_handles() noexcept;         /* 全关（`run_shutdown` / 析构） */
+
+    DWORD m_pids[kMaxPids]{};
+    int   m_pid_count{};
+    /* pid → HANDLE（pid == 0 = 空槽）。根 pid 不进这里（它是 `proc().hProcess`，归调试事件）。 */
+    struct PidHandle
+    {
+        DWORD  pid;
+        HANDLE handle;
+    };
+    PidHandle m_pid_handles[kMaxPids]{};
 };
 
 /* ---------------- 当前会话（P3.B 模块 11 引入；P6.4 后范围收窄） ----------------

@@ -51,6 +51,22 @@
  *      （OS 挂起该进程的线程直到 `ContinueDebugEvent`）。因此 `d.stop` 仍是单槽；同一会话的第二个
  *      事件（只可能来自 C2b 的进程树）不覆盖 `d.stop`，而是诚实地报错（见 `kErrPending`）。
  *
+ * 切片 C2b（**进程树 + 按 pid 的句柄**，plan_t7.md §10 / §11.5）：
+ *   ① 会话的键是**一棵进程树**：`registry_find(pid)` 按 `sess->owns_pid(pid)` 找归属（根 + 调试期间
+ *      出现的全部 `CREATE_PROCESS`）⇒ 子进程的事件（断点命中 / 异常 / `CREATE_PROCESS` / 退出）
+ *      都归同一个会话，`ev.session` 仍是同一个句柄。
+ *   ② **进程对象** `d:proc(pid)` → 一张**普通表**（不是 userdata；`pid` 字段 + 一组方法）：
+ *      `read` / `read_u8|u16|u32|u64` / `read_str` / `write` / `v` / `context([tid])` /
+ *      `stack([tid[,depth]])` / `mods()`。方法的 upvalue 是（会话句柄, pid），所以它复用 `d:` 的
+ *      同一批实现，只把 pid 换掉（core 的 pid 重载选 `handle_for_pid`）。**会话上的同名方法是根进程**。
+ *   ③ `d:procs()` → `{ pid, ... }`（根在第一个）；`d:current_pid()` → 回调里是事件 pid、顶层是
+ *      `d.root_pid`（进程树里「我该读谁」最自然的问法）。
+ *   ④ `Var` 载荷多了 `pid`：`d:v` 绑 `(sess, root_pid)`、`p:v` 绑 `(sess, pid)`、`V()` 的 0 表示
+ *      「按回调上下文现取」⇒ **回调里 `V()` 解引用的是事件那个进程**（C1d 的口径在进程树下成立）。
+ *   ❗仍未做（明确不属本切片）：按 pid 的**待应答槽**（每会话仍只有一个 `d.stop`）、断点记录的 pid
+ *     维度（`BreakpointInfo` 无 pid 且布局不可动 ⇒ 同名模块在树里各进程都打 `0xCC`）、
+ *     `dbg.remote` 代理上的进程对象（`dbglib` 的方法白名单里没有它们）。
+ *
  * pump 的两层（D57，C2a 起才是真的两层：有多个会话可路由）：
  *   · `dbg.pump([timeout[, autocont]])`（模块级）= **唯一的「等」**：读一条事件 → 分派（记录 + 回调 +
  *     引擎记账）→ 返回事件表；`nil` = 没等到事件；`nil, err` = 引擎错 / 回调里出错 / 被取消。
@@ -182,9 +198,11 @@ const char *const kErrPaused  = "cannot run while an event is unhandled";
 const char *const kErrNoSess  = "dbg: no session (call dbg.create or dbg.attach first)";
 /* C2a：**存在** dbg 会话时 `Run`/`Attach` 一律拒（两条路径都独占整个进程的事件流）。 */
 const char *const kErrBusy = "cannot run while a dbg session exists (detach/kill it first)";
-/* C2a：同一会话的第二个未应答事件 —— 只有 C2b 的进程树才会走到；❗不能覆盖 `d.stop`，
- * 覆盖会让先停住的进程永远挂起（那个进程的线程在等 `ContinueDebugEvent`）。 */
-const char *const kErrPending = "dbg.pump: session already has a pending event (process trees land in C2b)";
+/* 同一会话的第二个未应答事件 —— 只有进程树才会走到；❗不能覆盖 `d.stop`，
+ * 覆盖会让先停住的进程永远挂起（那个进程的线程在等 `ContinueDebugEvent`）。
+ * ❗C2b 落地后**待应答槽仍是单槽**（每个会话一个）：按 pid 的多槽没有进这一轮 —— 脚本的常规写法
+ * 是「泵到一条就 cont 一条」，要真让两个进程同时停住才会撞到这条错误（那时它诚实地报错）。 */
+const char *const kErrPending = "dbg.pump: session already has a pending event (cont it first)";
 /* 进程级路由找不到归属会话：诚实地报错，**不**静默丢事件（事件已经被 OS 取走了）。 */
 const char *const kErrUnknownPid = "dbg.pump: event for unknown pid ";
 
@@ -356,11 +374,14 @@ static void registry_remove(SessionState *st)
     sync_current_session();   /* 收尾的正是默认会话 ⇒ 回退到剩下的最近一个 / 宿主会话 */
 }
 
-static SessionState *registry_find(DWORD root_pid)
+/* 按 pid 找会话（C2b）：键是**一棵进程树**，不只是根 pid —— 子进程的 `CREATE_PROCESS` / 断点命中
+ * / 异常都带它自己的 pid，路由必须落到同一棵树的会话上（plan_t7.md §10 第 1 条）。
+ * ❗`owns_pid()` 只认「根 + 调试期间出现过的 CREATE_PROCESS」⇒ 不会把别的调试器的进程认成自己的。 */
+static SessionState *registry_find(DWORD pid)
 {
     for (SessionState *st = g_sessions; st; st = st->next)
     {
-        if (st->root_pid == root_pid) return st;
+        if (st->sess != nullptr && st->sess->owns_pid(pid)) return st;
     }
     return nullptr;
 }
@@ -977,7 +998,7 @@ static int fail_two(lua_State *L, const char *a, const char *b)
 /* `d:read(addr, n)` → **实际读到的字节**（Lua string，可能短于 n）。0 字节 ⇒ `nil, err`。
  * 与契约名 `ReadMemory` 的差别只有形状：那边返回字节数组（且部分读被吞成整体失败），
  * 这边返回字节串 + 真实长度（plan_t7.md §2.2 第 12 条）。 */
-static int do_read(lua_State *L, SessionState *st, int base)
+static int do_read(lua_State *L, SessionState *st, int base, DWORD pid)
 {
     if (!st->started) return fail(L, kErrNoSess);
 
@@ -993,7 +1014,7 @@ static int do_read(lua_State *L, SessionState *st, int base)
     size_t got;
     {
         SessionScope scope(st);
-        got = st->sess->read_some(addr, buf, size);
+        got = st->sess->read_some(pid, addr, buf, size);
     }
     if (!got)
     {
@@ -1008,7 +1029,7 @@ static int do_read(lua_State *L, SessionState *st, int base)
 /* `d:read_u8/u16/u32(addr)` → 普通 number；`d:read_u64(addr)` → `LV_U64` variant
  * （宽度由函数名给出，D52；x86 上 `LV_UZ` 是 4 字节，装不下 64 位读值 ⇒ u64 必须走 LV_U64）。
  * 读不到 ⇒ `nil, err`。 */
-static int read_int(lua_State *L, SessionState *st, int base, size_t nbytes, bool as_variant)
+static int read_int(lua_State *L, SessionState *st, int base, size_t nbytes, bool as_variant, DWORD pid)
 {
     if (!st->started) return fail(L, kErrNoSess);
 
@@ -1022,7 +1043,7 @@ static int read_int(lua_State *L, SessionState *st, int base, size_t nbytes, boo
     size_t got;
     {
         SessionScope scope(st);
-        got = st->sess->read_some(addr, buf, nbytes);
+        got = st->sess->read_some(pid, addr, buf, nbytes);
     }
     if (got != nbytes) return fail(L, "d:read_*: unreadable address");
 
@@ -1033,15 +1054,15 @@ static int read_int(lua_State *L, SessionState *st, int base, size_t nbytes, boo
     return 1;
 }
 
-static int do_read_u8(lua_State *L, SessionState *st, int base)  { return read_int(L, st, base, 1, false); }
-static int do_read_u16(lua_State *L, SessionState *st, int base) { return read_int(L, st, base, 2, false); }
-static int do_read_u32(lua_State *L, SessionState *st, int base) { return read_int(L, st, base, 4, false); }
-static int do_read_u64(lua_State *L, SessionState *st, int base) { return read_int(L, st, base, 8, true); }
+static int do_read_u8(lua_State *L, SessionState *st, int base, DWORD pid)  { return read_int(L, st, base, 1, false, pid); }
+static int do_read_u16(lua_State *L, SessionState *st, int base, DWORD pid) { return read_int(L, st, base, 2, false, pid); }
+static int do_read_u32(lua_State *L, SessionState *st, int base, DWORD pid) { return read_int(L, st, base, 4, false, pid); }
+static int do_read_u64(lua_State *L, SessionState *st, int base, DWORD pid) { return read_int(L, st, base, 8, true, pid); }
 
 /* `d:read_str(addr)` → 以 NUL 结尾的字节串。复用 core 的 `loadstr`（`LoadStr` 用的同一个函数），
  * 所以语义逐字一致：每 16 字节一块、不含结尾 NUL、**字节原样**（不转码 —— UNICODE 变体也不转，
  * 与 `LoadStr` 相同；目标里的串是 UTF-8 还是 GBK 由目标的编译器决定）。 */
-static int do_read_str(lua_State *L, SessionState *st, int base)
+static int do_read_str(lua_State *L, SessionState *st, int base, DWORD pid)
 {
     if (!st->started) return fail(L, kErrNoSess);
 
@@ -1056,7 +1077,7 @@ static int do_read_str(lua_State *L, SessionState *st, int base)
     bool   ok;
     {
         SessionScope scope(st);
-        ok = st->sess->loadstr(addr, &s, &len);
+        ok = st->sess->loadstr(pid, addr, &s, &len);
     }
     if (!ok)
     {
@@ -1074,7 +1095,7 @@ static int do_read_str(lua_State *L, SessionState *st, int base)
  *   · 整数：**u32 小端 4 字节**（宽度靠字节串表达 —— 新面不加 `d:write_u16/_u64`，D52 的
  *     「宽度靠函数名」在这里体现为「要别的宽度就给字节串」）。
  * 走 core 的 `write(..., up_intrin = true)`（写代码页时要刷指令缓存）。 */
-static int do_write(lua_State *L, SessionState *st, int base)
+static int do_write(lua_State *L, SessionState *st, int base, DWORD pid)
 {
     if (!st->started) return fail(L, kErrNoSess);
 
@@ -1108,7 +1129,7 @@ static int do_write(lua_State *L, SessionState *st, int base)
     bool ok;
     {
         SessionScope scope(st);
-        ok = st->sess->write(addr, data, size, true);
+        ok = st->sess->write(pid, addr, data, size, true);
     }
     if (!ok) return fail(L, "d:write: cannot write");
     lua_pushboolean(L, 1);
@@ -1324,18 +1345,25 @@ static int do_stack(lua_State *L, SessionState *st, int base)
 }
 
 /* `d:mods()` → `{ {name, base, size, path}, ... }`：**纯投影**（`peinfos()` 的只读视图）。
- * 不在这里解析 PE、也不过滤 pid —— 同名多实例的区分交给 `(name, base)` 这两个字段（§2.2 第 1 条）。 */
-static int do_mods(lua_State *L, SessionState *st)
+ * 不在这里解析 PE；同名多实例的区分交给 `(name, base)` 这两个字段（§2.2 第 1 条）。
+ * ❗C2b：`pid != 0` ⇒ 只列**那个进程**的模块（`p:mods()`）—— 进程树的 `peinfos()` 里混着树里
+ *   所有进程的节点，`dwProcessId` 是唯一的 pid 归属（同 `apply_breakpoints_for_module` 的依据）。 */
+static int do_mods(lua_State *L, SessionState *st, DWORD pid)
 {
     if (!st->started) return fail(L, kErrNoSess);
 
     int n = 0;
-    for (core::PEInfo *pe = st->sess->peinfos().head(); pe; pe = pe->next) n++;
+    for (core::PEInfo *pe = st->sess->peinfos().head(); pe; pe = pe->next)
+    {
+        if (pid && pe->dwProcessId != pid) continue;
+        n++;
+    }
     lua_createtable(L, n, 0);
 
     int i = 0;
     for (core::PEInfo *pe = st->sess->peinfos().head(); pe; pe = pe->next)
     {
+        if (pid && pe->dwProcessId != pid) continue;
         LPCTSTR name = pe->Path + pe->name_offset;
         char    namebuf[64];
         copy_name(namebuf, sizeof namebuf, name);   /* 与事件表的 `modname` 同一口径（截断到 63 字节） */
@@ -1358,8 +1386,10 @@ static int do_mods(lua_State *L, SessionState *st)
     return 1;
 }
 
-/* `d:threads()` → `{ {tid}, ... }`：`threads()` 的只读投影。
- * ❗缺省 tid 只对「当前停住的线程」方便；看别的线程必须显式给 tid（D55 第 5 条）。 */
+/* `d:threads()` → `{ {tid, pid}, ... }`：`threads()` 的只读投影。
+ * ❗缺省 tid 只对「当前停住的线程」方便；看别的线程必须显式给 tid（D55 第 5 条）。
+ * ❗C2b：`ThreadInfo::ProcessId` 是进程树里「这个线程属于哪个进程」的唯一来源（`p:context(tid)` /
+ *   门禁挑子进程的线程都靠它）；字段是**新增**的，既有断言只读 `tid`，不受影响。 */
 static int do_threads(lua_State *L, SessionState *st)
 {
     if (!st->started) return fail(L, kErrNoSess);
@@ -1371,9 +1401,11 @@ static int do_threads(lua_State *L, SessionState *st)
     int i = 0;
     for (core::ThreadInfo *t = st->sess->threads().head(); t; t = t->next)
     {
-        lua_createtable(L, 0, 1);
+        lua_createtable(L, 0, 2);
         lua_pushinteger(L, (lua_Integer)t->dwThreadId);
         lua_setfield(L, -2, "tid");
+        lua_pushinteger(L, (lua_Integer)t->ProcessId);
+        lua_setfield(L, -2, "pid");
         lua_rawseti(L, -2, ++i);
     }
     return 1;
@@ -1560,8 +1592,10 @@ static int take_cb_error(lua_State *L, SessionState *st)
  *
  * 路由：`WaitForDebugEvent` 是**进程级**的（一个调试器进程只有一个事件流），所以「谁来等」不影响
  * 「事件归谁」—— 拿默认会话（没有就 registry 的头一个）去等，再按 `ev.dwProcessId` 在 registry 里
- * 找 `root_pid` 精确匹配的会话。找不到 ⇒ `nil, err`（**不静默丢**：事件已经从 OS 取走了）。 */
-static int pump_once(lua_State *L, DWORD timeout_ms, bool autocont, SessionState **owner)
+ * 找 `owns_pid(pid)` 的会话（C2b：一棵进程树，不只是根 pid）。找不到 ⇒ `nil, err`
+ * （**不静默丢**：事件已经从 OS 取走了）。唯一的例外是新进程的 `CREATE_PROCESS`（它的 pid 还不在
+ * 任何树里）—— 归给 `hint`（发起这次 pump 的会话），见下面那段注释。 */
+static int pump_once(lua_State *L, DWORD timeout_ms, bool autocont, SessionState *hint, SessionState **owner)
 {
     /* 回调里不能重入状态机（plan_t7.md §2.3：回调正在被 `pump_once` 派发）。模块级与对象方法
      * 两个入口共用本函数，所以这条判必须在这里（C2a 把 `dbg.pump` 从 `do_pump` 改成直走本函数）。 */
@@ -1592,6 +1626,16 @@ static int pump_once(lua_State *L, DWORD timeout_ms, bool autocont, SessionState
     }
 
     SessionState *st = registry_find(ev.dwProcessId);
+    if (!st && ev.dwDebugEventCode == CREATE_PROCESS_DEBUG_EVENT && hint != nullptr && hint->started)
+    {
+        /* C2b：**新进程的第一个事件**——它的 pid 还不在任何会话的树里，而 `DEBUG_EVENT` 不带 parent
+         * pid（要精确归属得读 PEB 的 InheritedFromUniqueProcessId，那是 NT-only 的
+         * `NtQueryInformationProcess`，9x 没有）。所以归属给**发起这次 pump 的会话**（`hint`）：
+         * 单会话（mainline）下这是唯一答案；多会话下退化成「谁在等就归谁」——
+         * 同时派生多个树时脚本必须一次只 pump 一个（`d:pump` 天然就是这样）。
+         * ❗`dispatch` 会把这个 pid 记进那棵树（core 的 `add_pid`），所以它的**后续事件**按 pid 精确归属。 */
+        st = hint;
+    }
     if (!st) return fail_pid(L, kErrUnknownPid, ev.dwProcessId);
 
     /* 待应答槽（D57 的不变量 2）：一个会话最多一个未应答事件 —— OS 会挂起该进程的线程直到
@@ -1658,7 +1702,7 @@ static int do_pump(lua_State *L, SessionState *st, int base)
         if (left < 0) left = 0;
 
         SessionState *owner = nullptr;
-        int           n     = pump_once(L, (DWORD)left, autocont, &owner);
+        int           n     = pump_once(L, (DWORD)left, autocont, st, &owner);
         if (n == 2) return n;
         if (lua_isnil(L, -1)) return 1;        /* 预算用尽 / 没等到事件 */
         if (owner == st) return 1;             /* 自己的事件 */
@@ -1996,7 +2040,8 @@ static int dbg_pump(lua_State *L)
     int   top      = lua_gettop(L);
     DWORD timeout  = (top >= 1 && lua_isnumber(L, 1)) ? (DWORD)lua_tointeger(L, 1) : 100;
     bool  autocont = (top >= 2 && lua_toboolean(L, 2)) ? true : false;
-    return pump_once(L, timeout, autocont, nullptr);
+    /* 模块级没有「我在 pump 谁」⇒ 新进程的归属猜默认会话（最近一次 create/attach 的那个）。 */
+    return pump_once(L, timeout, autocont, g_default, nullptr);
 }
 
 static int dbg_cont(lua_State *L)
@@ -2179,54 +2224,56 @@ static int session_paused(lua_State *L)
 static int session_caps(lua_State *L) { return do_caps(L, self(L)); }
 static int session_help(lua_State *L) { return do_help(L, self(L)); }
 
-/* 数据面（C1b）：全部是 `d:` 调用，没有模块级转发（它们天然属于某一个会话） */
+/* 数据面（C1b）：全部是 `d:` 调用，没有模块级转发（它们天然属于某一个会话）。
+ * ❗C2b：这些方法作用在**根进程**上（`pid = 0` 在 core 里就等于 `proc().dwProcessId`）；
+ *   要看进程树里的别的进程用 `d:proc(pid)` 返回的进程对象（同一批原语的按 pid 版）。 */
 static int session_read(lua_State *L)
 {
     SessionState *st = self(L);
     if (!st) return fail(L, kErrNoSess);
-    return do_read(L, st, 2);
+    return do_read(L, st, 2, 0);
 }
 
 static int session_read_u8(lua_State *L)
 {
     SessionState *st = self(L);
     if (!st) return fail(L, kErrNoSess);
-    return do_read_u8(L, st, 2);
+    return do_read_u8(L, st, 2, 0);
 }
 
 static int session_read_u16(lua_State *L)
 {
     SessionState *st = self(L);
     if (!st) return fail(L, kErrNoSess);
-    return do_read_u16(L, st, 2);
+    return do_read_u16(L, st, 2, 0);
 }
 
 static int session_read_u32(lua_State *L)
 {
     SessionState *st = self(L);
     if (!st) return fail(L, kErrNoSess);
-    return do_read_u32(L, st, 2);
+    return do_read_u32(L, st, 2, 0);
 }
 
 static int session_read_u64(lua_State *L)
 {
     SessionState *st = self(L);
     if (!st) return fail(L, kErrNoSess);
-    return do_read_u64(L, st, 2);
+    return do_read_u64(L, st, 2, 0);
 }
 
 static int session_read_str(lua_State *L)
 {
     SessionState *st = self(L);
     if (!st) return fail(L, kErrNoSess);
-    return do_read_str(L, st, 2);
+    return do_read_str(L, st, 2, 0);
 }
 
 static int session_write(lua_State *L)
 {
     SessionState *st = self(L);
     if (!st) return fail(L, kErrNoSess);
-    return do_write(L, st, 2);
+    return do_write(L, st, 2, 0);
 }
 
 static int session_context(lua_State *L)
@@ -2247,7 +2294,7 @@ static int session_mods(lua_State *L)
 {
     SessionState *st = self(L);
     if (!st) return fail(L, kErrNoSess);
-    return do_mods(L, st);
+    return do_mods(L, st, 0);
 }
 
 static int session_threads(lua_State *L)
@@ -2262,6 +2309,8 @@ static int session_threads(lua_State *L)
  * 直接报固定错误）；这里靠**自己绑定的那个会话**，所以它不受「当前会话」影响、也不需要 `SessionScope`。
  * `addr` 收 number 也收 LuaVariant（`arg_num_or_lv`）；解引用（`[...]` / `:to` / `:write` …）
  * 全在 `bindings.cpp` 的 `Var` 方法里，走的都是这个会话。
+ * ❗C2b：会话方法是**根进程**的视角 ⇒ 载荷里带上 `root_pid`（解引用走 core 的 pid 重载）；
+ *   进程树里别的进程用 `p:v(addr)`（`d:proc(pid)` 返回的进程对象的方法）。
  * ❗**代理（`dbg.remote`）暂不支持**：`Var` 载荷带本机引擎指针，过不了线（`lualib/dbglib.lua`
  *   的 `SESSION_METHODS` 是白名单，`v` 不在里面 ⇒ 代理上调用会得到 unknown method）。 */
 static int session_v(lua_State *L)
@@ -2274,7 +2323,177 @@ static int session_v(lua_State *L)
     if (!arg_num_or_lv(L, 2, &a64)) return fail(L, "d:v: addr (number or LuaVariant) expected");
     if (!a64) return fail(L, "d:v: addr must be positive");
 
-    push_bound_var(L, (size_t)a64, st->sess);
+    push_bound_var(L, (size_t)a64, st->sess, st->root_pid);
+    return 1;
+}
+
+/* ---------------- 进程对象（T7 切片 C2b，plan_t7.md §10 / §11.5） ----------------
+ * `d:proc(pid)` → 一张**普通表**（JSON 友好，不是 userdata；形状与事件表同一个取向，D55）：
+ *   · 字段 `pid`；
+ *   · 方法：`read` / `read_u8|u16|u32|u64` / `read_str` / `write` / `v` / `context` / `stack` / `mods`。
+ * 为什么要它：会话方法的语义是「**根进程**」（`d:read` = 根的内存），而进程树里子进程有**自己的**
+ *   句柄（`handle_for_pid`）与自己的模块表。形状照 `open_file` 的文件对象 / 会话对象的方法面，
+ *   但**不做 userdata** —— 它没有状态机，只是一组绑定了 `(会话, pid)` 的原语。
+ *
+ * 方法的两个 upvalue：① **会话 userdata**（强引用，不是裸 `SessionState*`：proc 表活着 ⇒ 会话
+ *   句柄不会被 `__gc` 回收 ⇒ C 侧状态不会被释放，见 D54 的「`__gc` 只解绑」）；② pid（整数）。
+ * 参数下标从 2 开始（`p:read(...)` ⇒ 栈 1 是表自己），所以每个方法都能直接复用 `d:` 的同一批
+ * 实现，只把 `pid` 换掉 —— 不写第二套数据面。 */
+
+struct ProcMethod
+{
+    const char  *name;
+    lua_CFunction fn;
+};
+
+static SessionState *proc_self(lua_State *L, DWORD *pid)
+{
+    SessionUserdata *ud = (SessionUserdata *)lua_touserdata(L, lua_upvalueindex(1));
+    *pid                = (DWORD)lua_tointeger(L, lua_upvalueindex(2));
+    return ud ? ud->state : nullptr;
+}
+
+/* 会话已收尾（detach/kill）或已解绑 ⇒ 与 `d:` 方法同一条口径（`kErrNoSess`）。
+ * `proc_data` 是「取 upvalue → 交给带 pid 的 `d:` 实现」这一个动作的唯一写法（参数从栈 2 起：
+ * `p:read(...)` 的栈 1 是表自己），所以下面每个方法都只有一行。 */
+typedef int (*data_fn_pid)(lua_State *, SessionState *, int, DWORD);
+
+static int proc_data(lua_State *L, data_fn_pid fn)
+{
+    DWORD         pid = 0;
+    SessionState *st  = proc_self(L, &pid);
+    if (!st) return fail(L, kErrNoSess);
+    if (!st->started) return fail(L, kErrNoSess);
+    return fn(L, st, 2, pid);
+}
+
+static int proc_read(lua_State *L)     { return proc_data(L, do_read); }
+static int proc_read_u8(lua_State *L)  { return proc_data(L, do_read_u8); }
+static int proc_read_u16(lua_State *L) { return proc_data(L, do_read_u16); }
+static int proc_read_u32(lua_State *L) { return proc_data(L, do_read_u32); }
+static int proc_read_u64(lua_State *L) { return proc_data(L, do_read_u64); }
+static int proc_read_str(lua_State *L) { return proc_data(L, do_read_str); }
+static int proc_write(lua_State *L)    { return proc_data(L, do_write); }
+
+/* `p:mods()` 只列**这个进程**的模块（`do_mods` 的 pid 过滤），所以它没有 base 形参 ⇒ 不走 `proc_data`。 */
+static int proc_mods(lua_State *L)
+{
+    DWORD         pid = 0;
+    SessionState *st  = proc_self(L, &pid);
+    if (!st) return fail(L, kErrNoSess);
+    if (!st->started) return fail(L, kErrNoSess);
+    return do_mods(L, st, pid);
+}
+
+/* `context` / `stack` 只按 **tid** 取（线程表是整棵树的：`ThreadInfo::ProcessId` 就是归属）⇒
+ * 不需要 pid，只借 `pid` 那一步的会话校验。 */
+static int proc_context(lua_State *L)
+{
+    DWORD         pid = 0;
+    SessionState *st  = proc_self(L, &pid);
+    if (!st) return fail(L, kErrNoSess);
+    if (!st->started) return fail(L, kErrNoSess);
+    return do_context(L, st, 2);
+}
+
+static int proc_stack(lua_State *L)
+{
+    DWORD         pid = 0;
+    SessionState *st  = proc_self(L, &pid);
+    if (!st) return fail(L, kErrNoSess);
+    if (!st->started) return fail(L, kErrNoSess);
+    return do_stack(L, st, 2);
+}
+
+/* `p:v(addr)`：绑定到 **(该会话, 该 pid)** 的 Var —— 解引用走 core 的 pid 重载。 */
+static int proc_v(lua_State *L)
+{
+    DWORD         pid = 0;
+    SessionState *st  = proc_self(L, &pid);
+    if (!st) return fail(L, kErrNoSess);
+    if (!st->started) return fail(L, kErrNoSess);
+
+    uint64_t a64 = 0;
+    if (!arg_num_or_lv(L, 2, &a64)) return fail(L, "d:proc:v: addr (number or LuaVariant) expected");
+    if (!a64) return fail(L, "d:proc:v: addr must be positive");
+
+    push_bound_var(L, (size_t)a64, st->sess, pid);
+    return 1;
+}
+
+static const ProcMethod kProcMethods[] = {
+    {"read", proc_read},     {"read_u8", proc_read_u8},   {"read_u16", proc_read_u16},
+    {"read_u32", proc_read_u32}, {"read_u64", proc_read_u64}, {"read_str", proc_read_str},
+    {"write", proc_write},   {"context", proc_context},   {"stack", proc_stack},
+    {"mods", proc_mods},     {"v", proc_v},
+};
+
+static void push_proc_table(lua_State *L, SessionState *st, DWORD pid)
+{
+    lua_createtable(L, 0, 2 + (int)(sizeof kProcMethods / sizeof kProcMethods[0]));
+    int tbl = lua_gettop(L);
+    lua_pushinteger(L, (lua_Integer)pid);
+    lua_setfield(L, tbl, "pid");
+
+    push_handle(L, st);   /* 强引用：proc 表活着 ⇒ 会话状态不会被 `__gc` 释放（D54） */
+    int ud = lua_gettop(L);
+    for (size_t i = 0; i < sizeof kProcMethods / sizeof kProcMethods[0]; i++)
+    {
+        lua_pushvalue(L, ud);
+        lua_pushinteger(L, (lua_Integer)pid);
+        lua_pushcclosure(L, kProcMethods[i].fn, 2);   /* upvalue: 会话句柄 + pid */
+        lua_setfield(L, tbl, kProcMethods[i].name);
+    }
+    lua_remove(L, ud);   /* 闭包各自持有引用，这个临时值不需要 */
+}
+
+/* `d:proc(pid)` → 进程对象 | nil, err。只接受**本会话树里**的 pid（`owns_pid`）——
+ * 进程树之外去 `OpenProcess` 别人的进程不是这条 API 的事。 */
+static int session_proc(lua_State *L)
+{
+    SessionState *st = self(L);
+    if (!st) return fail(L, kErrNoSess);
+    if (!st->started) return fail(L, kErrNoSess);
+    if (!lua_isnumber(L, 2)) return fail(L, "d:proc: pid (number) expected");
+
+    DWORD pid = (DWORD)lua_tointeger(L, 2);
+    if (!pid) return fail(L, "d:proc: pid expected");
+    if (!st->sess->owns_pid(pid)) return fail_pid(L, "d:proc: pid is not in this session's tree: ", pid);
+
+    push_proc_table(L, st, pid);
+    return 1;
+}
+
+/* `d:procs()` → `{ pid, ... }`：本会话的进程树，**根在第一个**（插入序 = CREATE_PROCESS 序）。 */
+static int session_procs(lua_State *L)
+{
+    SessionState *st = self(L);
+    if (!st) return fail(L, kErrNoSess);
+    if (!st->started) return fail(L, kErrNoSess);
+
+    int n = st->sess->pid_count();
+    lua_createtable(L, n, 0);
+    for (int i = 0; i < n; i++)
+    {
+        lua_pushinteger(L, (lua_Integer)st->sess->pid_at(i));
+        lua_rawseti(L, -2, i + 1);
+    }
+    return 1;
+}
+
+/* `d:current_pid()` → 当前事件的 pid；顶层 = `d.root_pid`。
+ * 回调里唯一正确的答案是 `CallbackScope` 那个事件 pid（进程树里它可能是子进程）——这就是
+ * 「`d:read` 该读谁」在回调里最自然的问法；顶层没有事件，答案只能是树根。 */
+static int session_current_pid(lua_State *L)
+{
+    SessionState *st = self(L);
+    if (!st) return fail(L, kErrNoSess);
+    if (cb_active() && cb_session() == st->sess)
+    {
+        lua_pushinteger(L, (lua_Integer)cb_pid());
+        return 1;
+    }
+    lua_pushinteger(L, (lua_Integer)st->root_pid);
     return 1;
 }
 
@@ -2295,7 +2514,7 @@ static int session_kill(lua_State *L)
 /* 每个执行建一份的方法表（`__index` 落到它上面；`detach` 按平台能力装） */
 static void push_methods(lua_State *L, bool has_detach)
 {
-    lua_createtable(L, 0, 25);
+    lua_createtable(L, 0, 32);
     lua_pushcfunction(L, session_pump);    lua_setfield(L, -2, "pump");
     lua_pushcfunction(L, session_cont);    lua_setfield(L, -2, "cont");
     lua_pushcfunction(L, session_step);    lua_setfield(L, -2, "step");
@@ -2321,6 +2540,10 @@ static void push_methods(lua_State *L, bool has_detach)
     lua_pushcfunction(L, session_mods);     lua_setfield(L, -2, "mods");
     lua_pushcfunction(L, session_threads);  lua_setfield(L, -2, "threads");
     lua_pushcfunction(L, session_v);        lua_setfield(L, -2, "v");   /* C1d：会话绑定的 Var */
+    /* 进程树（C2b）：会话方法 = **根进程**的视角；跨进程的用法是 `d:proc(pid)` 拿到的进程对象 */
+    lua_pushcfunction(L, session_proc);        lua_setfield(L, -2, "proc");
+    lua_pushcfunction(L, session_procs);       lua_setfield(L, -2, "procs");
+    lua_pushcfunction(L, session_current_pid); lua_setfield(L, -2, "current_pid");
     if (has_detach) { lua_pushcfunction(L, session_detach); lua_setfield(L, -2, "detach"); }
     lua_pushcfunction(L, session_kill);    lua_setfield(L, -2, "kill");
 }

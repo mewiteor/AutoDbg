@@ -555,7 +555,7 @@ type  pid  tid  ea  modname  rva  code  first_chance  cont_code
 顺序硬约束：**A 必须早于 C**（`detach`/`kill` 就是 Session 对象的方法）；**C 必须早于 D**（REPL 里
 人/AI 都按对象写）。29 个旧名在 C 期间转成对象 API 的薄转发（行为逐字节不变，`session.default-parity`
 守门），退役留给之后的 D 条目。
-### 11.8 切片 A / B / C1a / C1b / C1c / C1d / C2a / sugar / D1 / D2a / D2b / C-remote 落地状态（已提交）
+### 11.8 切片 A / B / C1a / C1b / C1c / C1d / C2a / C2b / sugar / D1 / D2a / D2b / C-remote 落地状态（已提交）
 
 - `src/common/platform.{hpp,cpp}`（新文件）：`is_win9x()` / `is_nt()`（`GetVersionExA` 的 `dwPlatformId`，与启动器 `detect_variant()` 同一判据）+ `arch_name` / `variant_name` / `flavor_name`（收拢一处，免得 caps / help / info 各写一份字符串）。❗为什么不用编译开关：`/DAUTODBG_WIN9X` 是「要能在 9x 上跑」的**构建约束**，legacy 产物在 Win11 上也跑；而 caps 报的是**这台机器**。
 - `src/scripting/lua/help_bindings.{hpp,cpp}`（新文件）：`help([topic])` 与 `dbg.help()` 共用 `kHelp[]` 一张表，`help('dbg')` 是**前缀匹配生成的成员列表**（不存在第二份）。输出走 `PrintS` ⇒ server 模式自动进 `out` 帧、本地进控制台/管道，本层不碰句柄。正文是**窄串字面量**（现代变体 UTF-8、legacy CP936，`PrintS` 各自转成 console 需要的形式）；**主题名与签名保持 ASCII**（门禁逐字匹配）。❗legacy 编译警告 **C4566** 的教训：`⇒` / `❗` 这类字符**不能出现在字符串字面量里**（CP936 表示不出），注释里可以 —— 帮助正文里一律用 `->` 与「注意：」。
@@ -674,6 +674,17 @@ U32(5) == U32(5)  -> true     U32(5) == 5  -> false   ← 真正的坑：跨类�
 - 门禁：`e2e_dbg` 29 → **32**（`var.callback-only`：回调里 `V(ev.ea):to('I')` 读到 `0x50474244`、顶层报固定文案；`var.d-v-bound`：建了第二个会话后**改 A 的内存不影响 B 的 `d:v` 读值** —— 实测两个 fixture 的 base 都是 `0xC70000`（ASLR 8 bit 熵），所以判据用「改 A 的值」而不是「base 不相等」，否则会 flake；`context.all-variant`）；`e2e_repl` 10 → **11**。
 - 实测：`e2e_dbg` 86 **32** / 86 legacy 32 / 64 8；`e2e_tcp` 59/59/51；`e2e_repl` 11/11/10；`e2e_json` 32；`e2e_gui` 21；`check_skill` 16；`nvim_smoke` 32；`--selftest` 73；导入表 13。
 - 残留：进程树（一个 session 多进程）下 `V`/`d:v` 的**按 pid** 句柄仍待 C2b；`d.current_pid()` 与进程对象（`d:proc(pid)`/`d:procs()`）同批；`dbg.remote` 的白名单不含 `v`（代理上调用是普通 Lua 错误，已在 `help('dbg.v')` 写明）；skill 文档的类型表与新规则待同步。
+**切片 C2b（进程树 + 按 pid 句柄 + 进程对象）**：
+
+- **pid 集合**：`DebuggerSession::m_pids[16]`（根 + 调试期间出现的全部 `CREATE_PROCESS`）；维护点两处 —— `begin()`（先清上一轮，再 `add_pid(proc().dwProcessId)`）与 `dispatch()` 的 `CREATE_PROCESS_DEBUG_EVENT` 分支。对外 `owns_pid()` / `pid_count()` / `pid_at()`。
+- **按 pid 的句柄**：`handle_for_pid(pid)`——根（或 `pid==0`）用 `proc().hProcess`；其它 `OpenProcess(VM_READ|VM_WRITE|VM_OPERATION|QUERY_INFORMATION)`，失败按 `util.cpp` 的 9x 口径去掉 `QUERY_INFORMATION` 重试，成功后缓存；关闭点三处（`EXIT_PROCESS`、`run_shutdown`、缓存满时立即关）。内存原语全部加 `(DWORD pid, …)` 重载，**旧签名转发给根** ⇒ 29 名与既有调用点零改动。
+- **断点补丁按模块的 pid**：`apply_breakpoints_for_module` / `update_breakpoints` 用 `peinfo->dwProcessId`；顺手补了 `LOAD_DLL` 从不填 `dwProcessId` 的旧缺陷（恒 0 ⇒ 全归根进程）。
+- **进程对象**：`d:procs()`（插入序、根在前）、`d:proc(pid)` → **普通表**（`pid` + `read/read_u8..u64/read_str/write/v/context/stack/mods`，方法是 upvalue 绑 `(会话, pid)` 的转发器，复用同一批数据面实现）、`d:current_pid()`（回调里 `cb_pid()`、顶层 `root_pid`）、`d:threads()` 每项加 `pid`。会话上的同名方法仍是 **root 进程**语义。
+- **`Var` 载荷** `{base, sess, pid}`：`V()`→`(nullptr,0)`（回调里按**事件 pid** 解析 —— 这正是用户要的「回调里只写 addr」）、`d:v`→`(sess, root_pid)`、`p:v`→`(sess, pid)`、派生继承。
+- **新 fixture** `tests/fixtures/bin/x86_spawn.c`（零 CRT、不 include 头、自己声明 7 个 kernel32 导出）：父起自己 `/child`，父子各写自己的 `g_tag`（同一 RVA：父 42 / 子 7），子再抛一次 `int 3`；父退 42 / 子退 7，父子各 10 s 有界互等。`make.bat` 的 `:buildfixture` 加 obj/ld/pever 三条边 + `DEFS`（ASCII-only，GBK 未被破坏）。导入表：`api_check <spawn> w95` 无输出、`scan_dir.py` **14 产物**全过。
+- 门禁 `e2e_dbg` 32 → **36**：`route.child-process`（`d:procs()` 长度 2、根在第一个、`ev.session` 仍是同一个）、`route.child-handle`（各自 `p:mods()` 的 base 读到各自的 `MZ`；子进程栈上的标记只有子进程句柄看得到，root 读同一个字节是 `0`）、`d:current-pid`（回调里 = 事件 pid，父与子两个 pid 都出现过；顶层 = `root_pid`）、`d:v-child`（`p:v(...)` 与 `p:read_*` 一致）。
+- **两个已知限制**（写进注释与文档）：① `d:arm` 在进程树里**只能打到第一个进程**（`BreakpointInfo.orignal_byte` 单字节 + 布局不可动）；② `DEBUG_EVENT` 不带 parent pid ⇒ 新树第一个 `CREATE_PROCESS` 归给「发起这次 pump 的会话」，多会话同时派生时是「谁在等就归谁」（残留风险）。
+- 实测：`e2e_dbg` 86 **36** / 86 legacy 36 / 64 8；`e2e_tcp` 59/59/51；`e2e_repl` 11；`e2e_json` 32；`e2e_gui` 21；`check_skill` 16；`nvim_smoke` 32；`--selftest` 73；导入表 **14** 产物。
 ### 11.9 多 session 的脚本面（D57 / D58，随切片 C / T7.6）
 
 #### 11.9.1 pump 的两层（D57）

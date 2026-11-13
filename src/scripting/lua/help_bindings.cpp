@@ -203,6 +203,34 @@ const HelpEntry kHelp[] = {
         "  · `dbg.remote` 的代理**暂不支持** d:v（Var 过不了线，代理的方法白名单里没有 v）；\n"
         "  · 会话收尾（detach/kill）之后再用同一个 Var ⇒ 报「session bound by d:v() is closed」。\n",
     },
+    {
+        "dbg.procs",
+        "本会话的进程树（根 pid 在第一个）",
+        "d:procs() -> { pid, ... }\n"
+        "会话的键是**一棵进程树**：根 pid + 调试期间出现的全部 CREATE_PROCESS 的 pid\n"
+        "（一棵树只有一个调试器 ⇒ 子进程自动归同一个会话）。树里没有进程退出后会自动摘掉 ——\n"
+        "它是「本次调试见过的 pid」，不是「现在还活着的 pid」。\n",
+    },
+    {
+        "dbg.proc",
+        "进程对象：把同一批数据面原语作用在**某个 pid** 上",
+        "local p = d:proc(pid)        -- pid 必须是 d:procs() 里的（不是本会话的树 -> nil, err）\n"
+        "p.pid                         -- 那个 pid\n"
+        "p:read(addr, n) / p:read_u8|u16|u32|u64 / p:read_str / p:write(addr, data)\n"
+        "p:v(addr)                     -- 绑定到 (本会话, 该 pid) 的 Var\n"
+        "p:context([tid]) / p:stack([tid[, depth]]) / p:mods()\n"
+        "\n"
+        "为什么需要它：会话上的同名方法（d:read / d:context / d:mods / d:v …）作用在**根进程**上；\n"
+        "进程树里子进程有自己的句柄与自己的模块表，读它必须走 p: 这一族（内部按 pid 取句柄）。\n"
+        "它是**普通表**（不是 userdata）：可以直接 inspect / jsonx.encode，只有方法与 pid 字段。\n",
+    },
+    {
+        "dbg.current_pid",
+        "当前事件的 pid（顶层 = d.root_pid）",
+        "d:current_pid() -> number\n"
+        "调试回调里它是**那个事件**的 pid（进程树里可能是子进程）；顶层没有事件，答案只能是树根。\n"
+        "回调里想知道「我现在该读谁」就问它，不要假设 root_pid。\n",
+    },
     {"dbg.help", "打印 dbg 这一节（等价于 help('dbg')）", nullptr},
     {
         "dbg.remote",

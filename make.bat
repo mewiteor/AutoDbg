@@ -541,6 +541,7 @@ set DEFS=%DEFS% %INSTALLROOT::=$:%\lua_%ARCH%.exe
 set DEFS=%DEFS% %INSTALLROOT::=$:%\luajit_%ARCH%.exe
 set DEFS=%DEFS% %INSTALLROOT::=$:%\AutoDbg_%ARCH%.exe
 if "x%ARCH%" == "x86" set DEFS=%DEFS% %INSTALLROOT::=$:%\fixtures\x86_loop.exe
+if "x%ARCH%" == "x86" set DEFS=%DEFS% %INSTALLROOT::=$:%\fixtures\x86_spawn.exe
 >>%BUILDDIR%\build.ninja echo default %DEFS%
 >>%BUILDDIR%\build.ninja echo.
 
@@ -779,8 +780,11 @@ exit /b 1
 :: buildfixture
 ::   usage: call :buildfixture   (only called for arch 86, T7.2)
 ::   defines: ARCH, ROOT, BUILDDIR, INSTALLROOT, LINK_DEPS
-::   x86 debug-target fixture from tests\fixtures\bin\x86_loop.c (plan_t7.md T7.2). Not a
-::     deliverable: it goes into DEFS only (10.8), so :usage text is not rewritten.
+::   x86 debug-target fixtures from tests\fixtures\bin (plan_t7.md T7.2 / T7 slice C2b).
+::     Not deliverables: they go into DEFS only (10.8), so :usage text is not rewritten.
+::       x86_loop.c  -> single process, fixed int3 site pattern (pump.* gate)
+::       x86_spawn.c -> process tree: spawns itself as a child, one tag value per
+::                      process (route.* / d:proc / p:v gate, C2b)
 ::     Import table must pass the w95 flavour (scan_dir.py picks w95 under .out/fixtures/)
 ::     => no NT-only call in the source. x86 product => patched to 4.0 by pever (D12).
 :buildfixture
@@ -792,6 +796,15 @@ if not "x%ARCH%" == "x86" exit /b 0
 >>%BUILDDIR%\build.ninja echo   syslib = kernel32.lib
 >>%BUILDDIR%\build.ninja echo.
 >>%BUILDDIR%\build.ninja echo build %INSTALLROOT::=$:%\fixtures\x86_loop.exe: pever %BUILDDIR::=$:%\pever\x86_loop.exe ^| %BUILDDIR::=$:%\tools\pever.exe
+>>%BUILDDIR%\build.ninja echo   pevertool = %BUILDDIR%\tools\pever.exe
+>>%BUILDDIR%\build.ninja echo.
+
+>>%BUILDDIR%\build.ninja echo build tests\fixtures\bin\x86_spawn.obj: cc %ROOT::=$:%tests\fixtures\bin\x86_spawn.c
+>>%BUILDDIR%\build.ninja echo.
+>>%BUILDDIR%\build.ninja echo build %BUILDDIR::=$:%\pever\x86_spawn.exe: ld tests\fixtures\bin\x86_spawn.obj src\sys\main.obj src\sys\msvcrt.lib %LINK_DEPS% ^| t
+>>%BUILDDIR%\build.ninja echo   syslib = kernel32.lib
+>>%BUILDDIR%\build.ninja echo.
+>>%BUILDDIR%\build.ninja echo build %INSTALLROOT::=$:%\fixtures\x86_spawn.exe: pever %BUILDDIR::=$:%\pever\x86_spawn.exe ^| %BUILDDIR::=$:%\tools\pever.exe
 >>%BUILDDIR%\build.ninja echo   pevertool = %BUILDDIR%\tools\pever.exe
 >>%BUILDDIR%\build.ninja echo.
 exit /b
