@@ -107,6 +107,7 @@
 #include "core/util.hpp"          /* TCHAR 宏、tchar 转换、ZeroMem */
 
 #include "bindings.hpp"           /* lua_stack_trace：`d:stack` 复用同一个栈回溯迭代器（不写第二套） */
+#include "client.hpp"             /* T7 C-remote：远端代理复用 `--remote` 的连接/发帧/收帧（不写第二套 TCP） */
 #include "exec_guard.hpp"         /* D32：pump 空闲片里的那一个 poll 点 */
 #include "help_bindings.hpp"      /* `dbg.help()` = `help('dbg')`（同一张文本表，不是第二真相源） */
 #include "stream.hpp"             /* T7 D2a：`event` 帧发给当前执行连接 */
@@ -2234,12 +2235,160 @@ int dbg_release_unclosed_sessions()
     return n;
 }
 
+/* =============================================================================
+ * 远端会话代理的传输原语（T7 切片 C-remote，plan_t7.md §10.1 / D56）
+ *
+ * 分工：**对象面与 JSON 编解码在 `lualib/dbglib.lua`**（hex、表遍历、`jsonx` 都是 Lua 的强项，
+ *   D28 也要求 C 侧**不解析** JSON）；**连接与帧必须复用 `--remote` 客户端的实现**
+ *   （`client.cpp` 的 `remote_connect` / `remote_run_script` / `remote_close`）—— 不写第二套 TCP。
+ *   于是 C 侧只有三个**内部管道**（脚本用的面是 `dbg.remote(addr[, opts])`）：
+ *     dbg.remote_open(host, port[, token[, read_timeout_ms[, max_frame]]]) -> conn | nil, err
+ *     dbg.remote_xfer(conn, src[, timeout_ms]) -> `result` 帧的 json 原文 | nil, err
+ *     dbg.remote_close(conn) -> true
+ *   `dbg.remote_xfer` 把 `result` 帧的 json **原文**交回 Lua（`jsonx.decode` 在那边）：
+ *   `dbg.remote_call` 的回复就是这个帧的 `json.value`（协议面唯一的增量，见 `tcp_server.cpp`）。
+ *
+ * `conn` 是 full userdata（metatable `AutoDbgRemoteConn`）+ `__gc` 关 socket：不显式 `close`
+ *   也不会漏。❗它是**纯本地资源**（不是调试会话）⇒ 不受「`__gc` 不做副作用」（D54）约束；
+ *   但显式 `close` 仍是推荐用法（远端会话可能还停着事件，先 detach/kill 再 close）。
+ * ========================================================================== */
+constexpr const char *kRemoteConnMeta = "AutoDbgRemoteConn";
+
+struct RemoteConnBox
+{
+    autodbg::host::remote_conn *c;
+};
+
+static RemoteConnBox *check_remote_conn(lua_State *L, int idx)
+{
+    return (RemoteConnBox *)luaL_checkudata(L, idx, kRemoteConnMeta);
+}
+
+static int remote_conn_gc(lua_State *L)
+{
+    RemoteConnBox *b = check_remote_conn(L, 1);
+    if (b->c != nullptr)
+    {
+        autodbg::host::remote_close(b->c);
+        b->c = nullptr;
+    }
+    return 0;
+}
+
+/* `dbg.remote_open(host, port[, token[, read_timeout_ms[, max_frame]]])` */
+static int dbg_remote_open(lua_State *L)
+{
+    if (!lua_isstring(L, 1)) return fail(L, "dbg.remote_open: host (string) expected");
+    if (!lua_isnumber(L, 2)) return fail(L, "dbg.remote_open: port (number) expected");
+
+    const char *host  = lua_tostring(L, 1);
+    unsigned    port  = (unsigned)lua_tointeger(L, 2);
+    const char *token = lua_isstring(L, 3) ? lua_tostring(L, 3) : nullptr;
+    unsigned    rtmo  = lua_isnumber(L, 4) ? (unsigned)lua_tointeger(L, 4) : 0;
+    unsigned    mfrm  = lua_isnumber(L, 5) ? (unsigned)lua_tointeger(L, 5) : 0;
+
+    char err[192];
+    err[0] = '\0';
+    autodbg::host::remote_conn *c = autodbg::host::remote_connect(host, port, token, rtmo, mfrm, err, sizeof err);
+    if (c == nullptr)
+    {
+        lua_pushnil(L);
+        lua_pushstring(L, (err[0] != '\0') ? err : "connect failed");
+        return 2;
+    }
+
+    RemoteConnBox *b = (RemoteConnBox *)lua_newuserdata(L, sizeof(RemoteConnBox));
+    b->c = c;
+    luaL_getmetatable(L, kRemoteConnMeta);
+    lua_setmetatable(L, -2);
+    return 1;
+}
+
+/* `dbg.remote_xfer(conn, src[, timeout_ms])` → `result` 帧的 json 原文
+ * ❗`src` 是一条 **Lua 语句**（通常是 `return dbglib.remote_call(...)`）——远端是 `--repl --server`，
+ *   一帧 = 一条命令 / 一个完整块；`timeout_ms` = 整次调用的上限（0 = 不设）。 */
+static int dbg_remote_xfer(lua_State *L)
+{
+    RemoteConnBox *b = check_remote_conn(L, 1);
+    if (b->c == nullptr) return fail(L, "dbg.remote_xfer: connection closed");
+    if (!lua_isstring(L, 2)) return fail(L, "dbg.remote_xfer: src (string) expected");
+
+    size_t      len = 0;
+    const char *src = lua_tolstring(L, 2, &len);
+    unsigned    tmo = lua_isnumber(L, 3) ? (unsigned)lua_tointeger(L, 3) : 0;
+
+    char        err[192];
+    const char *rj = autodbg::host::remote_run_script(b->c, src, len, "remote", tmo, err, sizeof err);
+    if (rj == nullptr)
+    {
+        lua_pushnil(L);
+        lua_pushstring(L, (err[0] != '\0') ? err : "remote call failed");
+        return 2;
+    }
+
+    lua_pushstring(L, rj);
+    autodbg::common::release((void *)rj);   /* `remote_run_script` 交回的是 alloc 缓冲 */
+    return 1;
+}
+
+/* `dbg.remote_close(conn)` */
+static int dbg_remote_close(lua_State *L)
+{
+    RemoteConnBox *b = check_remote_conn(L, 1);
+    if (b->c != nullptr)
+    {
+        autodbg::host::remote_close(b->c);
+        b->c = nullptr;
+    }
+    lua_pushboolean(L, 1);
+    return 1;
+}
+
+/* `dbg.remote(addr[, opts])` → RemoteHost / RemoteSession（实现全在 `lualib/dbglib.lua`）。
+ * 这里只是**转发**：`dbglib` 在**调用时**取（PITFALLS.md L4 —— 库按文件名烘焙，dbglib 先于 jsonx）。
+ * 这么做的理由：代理要做的事（参数序列化、`__hex`、表遍历、`jsonx.decode`）全是 Lua 的强项，
+ * 而 D28 明确要求 C 侧不碰 JSON。
+ * ❗失败一律**当值**返回 `nil, err`（不向调用方抛）—— `pcall` 包住；走到 error 分支就是
+ *   `dbglib.remote` 的 bug，照样当值报。 */
+static int dbg_remote(lua_State *L)
+{
+    int nargs = lua_gettop(L);
+
+    lua_getglobal(L, "dbglib");
+    if (!lua_istable(L, -1))
+    {
+        lua_pop(L, 1);
+        return fail(L, "dbg.remote: dbglib is not loaded");
+    }
+    lua_getfield(L, -1, "remote");
+    if (!lua_isfunction(L, -1))
+    {
+        lua_pop(L, 2);
+        return fail(L, "dbg.remote: dbglib.remote is not a function");
+    }
+    lua_remove(L, -2);    /* 去掉 dbglib 表，只留函数 */
+    lua_insert(L, 1);     /* 函数挪到参数之前 */
+    if (lua_pcall(L, nargs, LUA_MULTRET, 0) != 0)
+    {
+        lua_pushnil(L);   /* [err] -> [err, nil] -> [nil, err] */
+        lua_insert(L, -2);
+        return 2;
+    }
+    return lua_gettop(L);
+}
+
 void register_dbg_api(lua_State *L)
 {
     /* 一次执行一个 registry（D43/D54）：上一条执行留下的 C 侧状态在这里统一释放 */
     registry_clear();
     g_in_callback = false;
     g_has_detach  = (resolve_detach() != nullptr);   /* D51：平台能力，建表时定一次 */
+
+    /* 远端代理的连接对象（D56）：`__gc` 关 socket —— 它是**纯本地资源**（不是调试会话），
+     * 所以不受「`__gc` 不做副作用」那条（D54）的约束：不 close 就该漏，`__gc` 必须收尾。 */
+    luaL_newmetatable(L, kRemoteConnMeta);
+    lua_pushcfunction(L, remote_conn_gc); lua_setfield(L, -2, "__gc");
+    lua_pop(L, 1);
 
     push_methods(L, g_has_detach);
     lua_setfield(L, LUA_REGISTRYINDEX, kSessionMethods);
@@ -2253,7 +2402,7 @@ void register_dbg_api(lua_State *L)
     lua_pushcfunction(L, session_gc);    lua_setfield(L, -2, "__gc");
     lua_pop(L, 1);
 
-    lua_createtable(L, 0, 22);
+    lua_createtable(L, 0, 26);
     lua_pushcfunction(L, dbg_create);   lua_setfield(L, -2, "create");   /* = Run 的原语版（CreateProcess） */
     lua_pushcfunction(L, dbg_attach);   lua_setfield(L, -2, "attach");   /* = Attach 的原语版（DebugActiveProcess；Win95/98 没有） */
     lua_pushcfunction(L, dbg_pump);     lua_setfield(L, -2, "pump");
@@ -2278,6 +2427,12 @@ void register_dbg_api(lua_State *L)
     lua_pushcfunction(L, dbg_last);     lua_setfield(L, -2, "last");     /* 最近一次 create/attach 的那个 */
     lua_pushcfunction(L, dbg_stopped); lua_setfield(L, -2, "stopped");
     lua_pushcfunction(L, dbg_paused_method); lua_setfield(L, -2, "paused");
+    /* T7 切片 C-remote（D56）：代理的对外面只有 `dbg.remote`（实现在 `lualib/dbglib.lua`），
+     * 其余三个是它用的**传输原语**（不写第二套 TCP：都落到 `client.cpp`）。 */
+    lua_pushcfunction(L, dbg_remote);       lua_setfield(L, -2, "remote");
+    lua_pushcfunction(L, dbg_remote_open);  lua_setfield(L, -2, "remote_open");
+    lua_pushcfunction(L, dbg_remote_xfer);  lua_setfield(L, -2, "remote_xfer");
+    lua_pushcfunction(L, dbg_remote_close); lua_setfield(L, -2, "remote_close");
     lua_setglobal(L, "dbg");
 }
 

@@ -143,6 +143,7 @@
 | S20 | REPL 多行输入不续行，或者管道喂完 stdin 之后 REPL 卡在「读错误」 | 续行判据不是 plan 里写的 `end of input`（实测 Lua 5.5 = `unexpected symbol near <eof>`、LuaJIT = `… near '<eof>'`）；而管道写端关闭时 `ReadFile` 返回的是 **FALSE + `ERROR_BROKEN_PIPE`**（不是 `TRUE` + 0 字节） | 判据取共同出现的 **`<eof>` 标记**（`repl.cpp` 的 `error_is_incomplete`），不认完整句子；EOF 认 `TRUE+0` 与 `FALSE+ERROR_BROKEN_PIPE`/`ERROR_HANDLE_EOF` 两种表象，否则 `printf … \| AutoDbg_86.exe --repl` 的第二次读会被当成读错误 |
 | S21 | 拿 `ev.code` 去当 `ContinueDebugEvent` 的应答码，异常被「吃掉」或者本该吞的又交给程序 | 事件表有两个码：`code` = **异常码**（`EXCEPTION_*`，没有异常的事件是 0），`cont_code` = core 在 `pump` 末尾算好的**默认应答码**（`DBG_CONTINUE` = `0x00010002` = 65538 / `NOT_HANDLED` = `0x80010001` = 2147549185） | 应答一律 `d:cont()`（缺省 = `cont_code`）或 `ev.session:cont(ev.cont_code)`；`code` 只用来判「这是什么异常」。`cont_code` 之所以是**泵完**才回填的（`fill_cont_code`），是因为 core 在 `dispatch` 末尾才算得出它 |
 | S22 | 想「探一下」`pcall(dbg.detach)` 看平台支不支持，结果目标被真 detach（或被 kill）掉了 | `dbg.detach` 在**没有** `DebugActiveProcessStop` 的平台（Win95/98）上**根本不安装**（建表时 dynapi 探一次，`g_has_detach`）—— 但它在 NT 上是**真函数**，`pcall` 试探 = 真收尾 | 判据是**成员存在性**：`dbg.detach ~= nil`（或机器可读的 `dbg.caps().detach`）；`d.detach` 同理（方法表按能力装）。要兼容 9x 就 `if d.detach then d:detach() else d:kill() end` |
+| S23 | 把 x64 的指针/模块基址经 JSON 往返后低位变了（`0x7FF9067A5384` 变成 `0x7FF9067A5300` 之类），`read(base,4)` 摸到错地址 | `jsonx.encode` 的数字是 `%.14g`（14 位有效数字），而 x64 用户态地址的十进制有 **15 位** ⇒ 直接过线静默丢低位。影响面不止代理：`--json` 信封的 `result` 也是这份编码 | 跨边界传指针一律走十进制**字符串**：`dbg.remote` 对 `>= 1e14` 的整数自动编成 `{"__i":"…"}` 并在对端还原（`dbglib.lua`）；自己用 `jsonx.encode` 传地址时也要 `tostring(addr)` |
 
 ## W. Win9x 实机自动化（vmrun）与 GUI 自动化
 

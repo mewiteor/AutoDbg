@@ -33,7 +33,7 @@
 #include "dbg_bindings.hpp" /* D54 安全网：dbg_open_session_count / dbg_release_unclosed_sessions */
 #include "exec_guard.hpp"   /* guard_poll_control / guard_install_lua_hook（S13 / D32） */
 #include "output.hpp"       /* install_print_override（server 的 `print` 进 `out` 帧） */
-#include "state.hpp"        /* create_state_with_libs（与脚本路径同一个建状态入口） */
+#include "state.hpp"        /* create_state_with_libs / encode_returns（同一个建状态入口） */
 
 #include "core/core.hpp" /* DebuggerSession / set_current_session */
 #include "core/util.hpp" /* PrintS / ErrorS / ErrorN / ErrorF（输出分流：控制台 vs 管道） */
@@ -322,7 +322,8 @@ bool repl_chunk_feed(repl_chunk *c, const char *text, unsigned len)
            chunk_append(c->buf, &c->len, "\n", 1);
 }
 
-int repl_eval_chunk(lua_State *L, const char *chunk, size_t len, bool allow_continue, int *last_code)
+int repl_eval_chunk(lua_State *L, const char *chunk, size_t len, bool allow_continue, int *last_code,
+                    const char **value_json)
 {
     int status = luaL_loadbuffer(L, chunk, len, "=repl");
 
@@ -337,6 +338,10 @@ int repl_eval_chunk(lua_State *L, const char *chunk, size_t len, bool allow_cont
         }
         else
         {
+            /* T7 C-remote（D56）：返回值先取成 JSON（服务器 / 代理要它），再照旧 print 给
+             * 本地 REPL 看。❗必须在 `lua_settop(L, base)` 之前（栈上才有返回值）。 */
+            if (value_json != nullptr)
+                *value_json = encode_returns(L, base);
             print_results(L, base);
             *last_code = 0;
         }
@@ -454,6 +459,7 @@ exec_result repl_server_chunk(repl_server *r, const char *src, size_t len)
     out.oom        = false;
     out.elapsed_ms = 0;
     out.error[0]   = '\0';
+    out.value_json = nullptr;
 
     if (r == nullptr || r->L == nullptr)
     {
@@ -475,11 +481,15 @@ exec_result repl_server_chunk(repl_server *r, const char *src, size_t len)
 
     DWORD t0  = GetTickCount();
     int   last = 0;
-    (void)repl_eval_chunk(r->L, chunk.buf, chunk.len, false, &last);
+    const char *value_json = nullptr;
+    (void)repl_eval_chunk(r->L, chunk.buf, chunk.len, false, &last, &value_json);
     out.elapsed_ms = GetTickCount() - t0;
 
     out.code   = last;
     out.loaded = (last != LUA_ERRSYNTAX);
+    /* T7 C-remote（D56）：这一帧的返回值 → `result` 帧的 `json.value`（口径同 `--json` 的 `result`）。
+     * 没有返回值 / 失败路径 = nullptr（发帧那边写成 `null`，不另造一份字面量）。 */
+    out.value_json = value_json;
     return out;
 }
 

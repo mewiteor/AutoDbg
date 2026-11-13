@@ -34,6 +34,16 @@ int lua_reset_dir(lua_State *L);
  * 返回 nullptr = `luaL_newstate()` 失败。 */
 lua_State *create_state_with_libs(void);
 
+/* pcall 的返回值 → JSON 片段（T1/D50 的口径，`--json` 信封与协议 `result` 帧的 `value`
+ * **共用这一份**，不写第二套）：`base` = 函数 push 之前的栈顶。
+ *   ① 1 个返回值 → 那个值；0 个 → `null`；多个 → 数组（造一个顺序表让 jsonx 按数组编）；
+ *   ② 编不了（function / 无 `val` 的 userdata / 稀疏表 / NaN / 循环引用）→ `null`：`pcall`
+ *      包住，不把 Lua 错误抛出去；
+ *   ③ 返回的缓冲区由 `common::alloc` 分配、**调用方 `common::release`**（永不为 nullptr：
+ *      取不到内存也退化成 `null` 的字面量副本）。
+ * ❗必须在 `lua_close` **之前**调（要读那个 state 上的 `jsonx`）。 */
+const char *encode_returns(lua_State *L, int base);
+
 /* 建状态 → 注册 → 烘焙库 → 加载并运行 `g_wfilepath`（argv[2..] 作为脚本参数）。
  * 返回退出码（旧 `_tmain` 语义：0 = 成功，-1 = 加载/运行失败）。
  * T1（D50）的可选出参 `result_json`：只在 `--json` 模式用 —— 在 `lua_close` **之前**

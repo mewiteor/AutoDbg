@@ -46,7 +46,7 @@
 
 #include <windows.h>
 
-#include <string.h>
+#include <string.h>   /* strlen（`value` 片段的长度） */
 
 namespace autodbg::server
 {
@@ -498,7 +498,11 @@ void on_stream_control(void *ctx, unsigned cmd, unsigned flags)
  *   `result` 帧的 `id` **仍是退出码**（u16 二补数），与命令号无关。
  * ❗T7 D2b：`g_repl` 非空（`--repl --server`）时求值发生在**连接级**的 state 上，本段只是
  *   该 state 上的一条命令；`result.id` 因而 = **这一行的 Lua 错误码**（0 / 2 / 3），
- *   `exec_script`（建/毁 state）在这个分支里根本不跑。 */
+ *   `exec_script`（建/毁 state）在这个分支里根本不跑。
+ * ❗T7 C-remote（D56，协议**不** bump）：`result` 帧的 json 多一个键 `value` = 顶层 chunk 的返回值，
+ *   口径与 `--json` 信封的 `result` 完全一致（`state.hpp` 的 `encode_returns`，同一个实现）；
+ *   没有返回值 / 失败 ⇒ `null`。多一个键是加法，既有断言与 `--json` 信封不变；远端会话代理
+ *   （`dbglib.remote`）就靠它把方法返回值取回来（帧的 `id` 仍只装退出码，两套含义不混）。 */
 void run_one_script(const unsigned char *src, size_t src_len, const char *chunkname, unsigned cmd_id,
                     const server_config &cfg)
 {
@@ -587,11 +591,26 @@ void run_one_script(const unsigned char *src, size_t src_len, const char *chunkn
     w.boolean((flags & (unsigned)k_result_timed_out) != 0);
     w.key("error");
     w.string(r.error);
+    w.key("value");
+    if (r.value_json != nullptr)
+    {
+        /* `jsonx.encode` 的片段：原样嵌入，只把非 ASCII 转义（与 `--json` 信封的 `result` 同口径，
+         * 见 `main.cpp` 的 `w.raw_escaped(s_json_result, …)`）。 */
+        w.raw_escaped(r.value_json, strlen(r.value_json));
+    }
+    else
+    {
+        w.null_value();   /* 没有返回值 / 失败：字段不省（与 `--json` 的 `result` 一致） */
+    }
     w.end_object();
     if (w.data() != nullptr)
         stream_write_frame(stream_frame_result, (unsigned)(unsigned short)(int)r.code, flags, w.data(), w.size(), nullptr, 0);
     stream_write_frame(stream_frame_end, 0, 0, nullptr, 0, nullptr, 0);
     stream_set_command_id(0);   /* 本段命令结束：之后的输出 / 事件都是无归属的（id = 0） */
+
+    /* `value` 片段是本段自己 alloc 的（`encode_returns` 的约定），发完就释放 */
+    if (r.value_json != nullptr)
+        autodbg::common::release((void *)r.value_json);
 }
 
 /* worker 线程服务一条连接（即 plan_cli.md §2.2 的「执行连接」）：

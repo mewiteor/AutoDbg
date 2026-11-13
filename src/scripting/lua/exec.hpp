@@ -39,6 +39,13 @@ struct exec_result
     bool     oom;
     unsigned elapsed_ms;
     char     error[1024]; /* UTF-8；成功时为空串 */
+    /* T7 切片 C-remote（D56）：顶层 chunk 的返回值，口径与 `--json` 信封的 `result` 完全一致
+     * （`state.hpp` 的 `encode_returns`：1 个 → 那个值；0 个 → `null`；多个 → 数组；编不了 → `null`）。
+     * 它进协议 `result` 帧的 `json.value`（远端会话代理靠它把方法返回值取回来）。
+     * ❗所有权：`common::alloc` 的缓冲区，**调用方 `common::release`**；nullptr = 没有返回值
+     * （加载/语法/运行失败，或宿主失败）—— 发帧那边就写 `null`。`exec_result` 是按值拷的，
+     * 但只有一个持有者。 */
+    const char *value_json;
 };
 
 /* 在给定的状态与会话上执行（调用方负责状态/会话的生命周期）。

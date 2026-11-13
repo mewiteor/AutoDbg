@@ -224,17 +224,21 @@ int lua_reset_dir(lua_State *L)
  *   · 编不了（function / 无 `val` 的 userdata / 稀疏表 / NaN / 循环引用）→ `null`：
  *     `pcall` 包住，不把 Lua 错误抛出去（不打断脚本）——不改 `jsonx` 本身。
  * 返回的缓冲区由调用方 `common::release`。
+ * ❗T7 切片 C-remote（D56）把它导出到 `state.hpp`：协议 `result` 帧的 `value` 与 `--json` 信封的
+ *   `result` 是**同一个口径**，所以只许有这一份（`exec.cpp` 与 `repl.cpp` 都调它）。
  * ========================================================================== */
 static const char *copy_json_fragment(const char *s, size_t n)
 {
     char *buf = (char *)autodbg::common::alloc(n + 1);
+    if (buf == nullptr)
+        return nullptr;
     for (size_t i = 0; i < n; i++)
         buf[i] = s[i];
     buf[n] = '\0';
     return buf;
 }
 
-static const char *encode_returns(lua_State *L, int base)
+const char *encode_returns(lua_State *L, int base)
 {
     int n = lua_gettop(L) - base;
     if (n <= 0)

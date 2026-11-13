@@ -77,6 +77,7 @@ exec_result exec_on_state(lua_State *L, autodbg::core::DebuggerSession *dbg, con
     out.oom        = false;
     out.elapsed_ms = 0;
     out.error[0]   = '\0';
+    out.value_json = nullptr;
 
     if (L == nullptr)
     {
@@ -109,10 +110,14 @@ exec_result exec_on_state(lua_State *L, autodbg::core::DebuggerSession *dbg, con
     if (r == 0)
     {
         int argc = (req.args != nullptr) ? req.argc : 0;
+        int base = lua_gettop(L) - 1;   /* 函数 push 之前的栈顶（返回值从这里开始） */
         for (int i = 0; i < argc; i++)
             lua_pushstring(L, (req.args[i] != nullptr) ? req.args[i] : "");
         r = lua_pcall(L, argc, LUA_MULTRET, 0);
         out.code = r;
+        /* T7 C-remote（D56）：返回值进 `result` 帧的 `json.value`。❗必须在 `lua_settop(L, 0)`
+         * 之前算（它读的是栈上的返回值），且必须在 `lua_close` 之前（要读 `jsonx`）。 */
+        out.value_json = (r == 0) ? encode_returns(L, base) : nullptr;
     }
 
     if (r != 0)
@@ -147,6 +152,7 @@ exec_result exec_script(const exec_request &req)
     out.oom        = false;
     out.elapsed_ms = 0;
     out.error[0]   = '\0';
+    out.value_json = nullptr;
 
     /* ---- 会话（与 _tmain 同口径，§5.2） ---- */
     autodbg::core::DebuggerSession *session = new autodbg::core::DebuggerSession();

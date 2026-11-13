@@ -549,13 +549,13 @@ type  pid  tid  ea  modname  rva  code  first_chance  cont_code
 | **D1** ✅ 已落地 | REPL 本体（`--repl` + `boot.repl_mode` + ABI 4 → 5）：`ReadFile` 优先（管道可跑）/ `ReadConsoleW` 回退、≤250 ms 切片、`=` 简写、多行续行、退出码 = 最后一条命令、EOF → 0 | ~500 行（含门禁） | 新 `e2e_repl.ps1` 8 条（86 / 86 legacy / 64） |
 | **D2a** ✅ 已落地 | 协议 1 → **2**：`stream_frame_event = 16`（json = 命中记录，`id` = 命令号）+ `out` 帧 `id` = 命令号（`stream_set_command_id`）+ `result.id` 仍 = 退出码；客户端认并忽略 `event`；nvim 子模块同步 PROTO 2 | ~240 行 | `e2e_tcp` 56 → 58（`proto.out-id-attribution` / `proto.event-frame`），x64 50 |
 | **D2b** ✅ 已落地 | `--repl` + `--server`（同一连接内 `lua_State` 跨命令存活，每条 `script` 帧 = 一块；`result.id` = 该行错误码）+ `--repl --remote` 报错退 2 + REPL 退出时的会话报告（D54 安全网，stderr + 逐个 detach） | ~380 行 | `e2e_repl` 8 → 10（`repl.remote-exclusive` / `repl.exit-report`）、`e2e_tcp` 58 → 59（`repl.server-state`） |
-| **C-remote** | `dbg.remote(host:port, token)` 远端 session 代理（方法面与本地相同，复用 `--server` + `client.cpp`）—— 跨位数 / 强隔离的唯一形态（D56） | ~200 行 | `remote.proxy-parity`（需两个位数） |
+| **C-remote** ✅ 已落地 | `dbg.remote(addr[, opts])` 跨位数代理（方案 A：复用 `--repl --server` + `result` 帧新增 `value`；每次方法调用 = 一条 `script` 帧；`RemoteHost`/`RemoteSession`）—— 跨位数/强隔离的唯一形态（D56） | ~1100 行（含 `dbglib.remote_call`、`client.cpp` 导出与门禁） | `e2e_dbg` 23 → 27（`remote.create` / `remote.pump-context` / `remote.data-plane` / `remote.teardown`，仅 86 宿主） |
 | **sugar（T7.6）** ✅ 已落地 | `lualib/dbglib.lua`（烘焙成全局 `dbglib`）：`wait_all(goals[,opts])`（rendezvous）与 `run_all(params_list[,opts])`（batch/collect），纯 Lua、5.1 语法、只跑在 `dbg.pump`/`stopped()`/`paused()` 上（D58） | ~250 行 | `e2e_dbg` 21 → 23（`sugar.wait-all` / `sugar.run-all`） |
 
 顺序硬约束：**A 必须早于 C**（`detach`/`kill` 就是 Session 对象的方法）；**C 必须早于 D**（REPL 里
 人/AI 都按对象写）。29 个旧名在 C 期间转成对象 API 的薄转发（行为逐字节不变，`session.default-parity`
 守门），退役留给之后的 D 条目。
-### 11.8 切片 A / B / C1a / C1b / C2a / sugar / D1 / D2a / D2b 落地状态（已提交）
+### 11.8 切片 A / B / C1a / C1b / C2a / sugar / D1 / D2a / D2b / C-remote 落地状态（已提交）
 
 - `src/common/platform.{hpp,cpp}`（新文件）：`is_win9x()` / `is_nt()`（`GetVersionExA` 的 `dwPlatformId`，与启动器 `detect_variant()` 同一判据）+ `arch_name` / `variant_name` / `flavor_name`（收拢一处，免得 caps / help / info 各写一份字符串）。❗为什么不用编译开关：`/DAUTODBG_WIN9X` 是「要能在 9x 上跑」的**构建约束**，legacy 产物在 Win11 上也跑；而 caps 报的是**这台机器**。
 - `src/scripting/lua/help_bindings.{hpp,cpp}`（新文件）：`help([topic])` 与 `dbg.help()` 共用 `kHelp[]` 一张表，`help('dbg')` 是**前缀匹配生成的成员列表**（不存在第二份）。输出走 `PrintS` ⇒ server 模式自动进 `out` 帧、本地进控制台/管道，本层不碰句柄。正文是**窄串字面量**（现代变体 UTF-8、legacy CP936，`PrintS` 各自转成 console 需要的形式）；**主题名与签名保持 ASCII**（门禁逐字匹配）。❗legacy 编译警告 **C4566** 的教训：`⇒` / `❗` 这类字符**不能出现在字符串字面量里**（CP936 表示不出），注释里可以 —— 帮助正文里一律用 `->` 与「注意：」。
@@ -626,6 +626,16 @@ type  pid  tid  ea  modname  rva  code  first_chance  cont_code
 - **退出安全网（D54）**：`repl_unclosed_session_report()` 在 `lua_close` **之前**查 `dbg.sessions()`，非空就往 **stderr** 打 `repl: N unclosed session(s) - detaching` 并逐个按归属收尾（有 `DebugActiveProcessStop` 就 detach、没有就 kill；单个失败只再打一行）；**不改退出码**。`d:detach()`/`d:kill()` 与它共用同一对 C 助手（`end_session_by_detach` / `end_session_by_kill`），所以两条路径不会分叉。
 - 门禁：`e2e_repl` 8 → **10**（`repl.remote-exclusive`：`--repl --remote` 退 2；`repl.exit-report`：create 后 EOF ⇒ stderr 含 `unclosed session(s) - detaching`，x64 因 fixture 缺失 SKIP）；`e2e_tcp` 58 → **59**（`repl.server-state`：**新起一个 `--repl` server**，同一连接三帧 —— `x = 41 print(x)` ⇒ `out.id=1` 文本 `41`、`=x + 1` ⇒ `out.id=2` 文本 `42`（**跨命令状态存活**）、`local x =` ⇒ `result.id=3`）。既有 58 条仍跑原来的非 repl server。
 - 实测：`e2e_repl` 86 **10** / 86 legacy 10 / 64 9+1SKIP；`e2e_tcp` 86 **59** / 86 legacy 59 / x64 **51**；其余（dbg 23、json 32、gui 21、skill 14、nvim 32、selftest 73、导入表 13）全绿。手测：REPL 连接里 `while true do end` 的 cancel 仍生效（`ack.applied=true`、`result.flags=canceled`），下一帧仍在同一个 state 上求值。
+**切片 C-remote（跨位数会话代理，方案 A）**：
+
+- **协议面只加一个键**：`result` 帧的 json 增加 `value`（脚本返回值，编码规则与 `--json` 信封的 `result` **同一份** `encode_returns`；0 个 → `null`、多个 → 数组、编不了 → `null`），**proto 不 bump**。
+- 服务端分发器烘进 `dbglib`：`dbglib.remote_call(pid, method, args_json)`，返回**始终是 JSON 字符串**（`{"ok":true,"value":…}` / `{"ok":false,"err":"…"}`）。会话方法白名单 25 个（`pump/cont/step/eip/arm/hits/dropped/setcap/stopped/paused/caps/detach/kill/read*/read_str/write/context/stack/mods/threads`）；`create`/`attach`/`sessions` 走宿主级面。
+- **过线约定**（JSON 装不下的东西必须显式编码，否则静默错）：字节串与 `d:write` 的字节实参 → `{"__hex":"4D5A9000"}`；`≥1e14` 的整数 → `{"__i":"140707532264324"}`（`jsonx.encode` 的数字是 `%.14g`，x64 模块基址 `0x7FF9…` 有 15 位十进制 ⇒ 直接过线会丢低位，`d:read(m.base,4)` 会摸错地址）；显式 `nil` 实参 → `{"__nil":true}`。事件表里的 `session`（userdata）由服务端摘掉、客户端把 `ev.session` 填成**代理对象** ⇒ 本地/远端都写得成 `ev.session:cont(ev.cont_code)`。
+- 客户端：`dbg.remote(addr[, {token, pid, timeout_ms}])` → 无 `pid` 给 `RemoteHost`（`h:create{...}` / `h:attach(pid)` / `h:close()`），有 `pid` 直接给 `RemoteSession`；每次方法调用 = 一条 `script` 帧（`id` 递增，D2a 归因），复用 `client.cpp` 导出的 `remote_connect` / `remote_run_script` / `remote_close`（**不写第二套 TCP**）。连接是 C 侧 full userdata + `__gc` 关 socket（D54 的「`__gc` 无副作用」只管调试会话；socket 是本地资源）。
+- 门禁：`e2e_dbg` 23 → **27**（86 宿主 + 64 位 `--repl --server`）：`remote.create`（远端 `cmd.exe /c ping`，`root_pid > 0`）、`remote.pump-context`（**32 位调试器读 64 位目标的 `Cip`** —— 这条路径原本物理上不可能，实测 `cip=0x7FF9067A5384`）、`remote.data-plane`（`mods()` 的 base + `read`/`read_u16`）、`remote.teardown`（`kill` 后目标真的没了、`h:close()` 幂等）。
+- **能力边界（写进注释与 help）**：函数 / userdata / session 对象过不了线（回调必须留在本机，所以 `d:arm(mod,rva,cb)` 在代理上返回 `nil, err`）；单次请求体受 `--repl` 的 **4096 字节 chunk** 上限约束（`d:write` 一次约 >1.8 KB 会语法错）；服务端 REPL 会把返回值 print 进 `out` 帧（代理丢弃）；`open_file` 在代理路径不支持（`read_req` 等帧被显式丢弃）。
+- 本机实测：`e2e_dbg` 86 **27** / 86 legacy 27 / 64 8；`e2e_tcp` 59/59/51；`e2e_repl` 10/10/9；`e2e_json` 32；`e2e_gui` 21；`check_skill` 15；`nvim_smoke` 32；`--selftest` 73；导入表 13 产物。手测：LuaJIT 客户端/服务端（跨 flavor）、`h:attach(pid)`、错 token、函数实参、无监听端口四条错误路径都走通。
+- 残留：`h:attach` **没进**门禁（只手测过）；`dbg.remote` 还没写进 skill 包（只有 `help('dbg.remote')`）；C2b/C3/nvim `:AutoDbgRepl` 未动。
 ### 11.9 多 session 的脚本面（D57 / D58，随切片 C / T7.6）
 
 #### 11.9.1 pump 的两层（D57）

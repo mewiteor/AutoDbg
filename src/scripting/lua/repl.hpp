@@ -67,8 +67,13 @@ bool repl_chunk_feed(repl_chunk *c, const char *text, unsigned len);
 /* 求值一次累积的 chunk。返回 1 = 还没输完（`allow_continue` 为真且 Lua 报「在 <eof> 处」），
  * 0 = 已处理（成功或出错；出错时已经把消息打到 stderr，并把 Lua 的码写进 `*last_code`）。
  * `allow_continue = false`：调用方已经没有下一行（本地 EOF / 服务端一帧一命令）⇒「没输完」
- * 按语法错上报（3），而不是等一条永远不会来的输入。 */
-int repl_eval_chunk(lua_State *L, const char *chunk, size_t len, bool allow_continue, int *last_code);
+ * 按语法错上报（3），而不是等一条永远不会来的输入。
+ * `value_json`（可空）：非空且成功时写入该 chunk 返回值的 JSON 片段（`state.hpp` 的
+ * `encode_returns` 口径，`common::alloc` 的缓冲区、**调用方 release**）—— T7 C-remote（D56）
+ * 靠它把 `dbglib.remote_call` 的返回值送进 `result` 帧的 `json.value`；本地 REPL 传 nullptr，
+ * 于是它的行为一个字节不改（返回值仍然只是 `print` 出来）。 */
+int repl_eval_chunk(lua_State *L, const char *chunk, size_t len, bool allow_continue, int *last_code,
+                    const char **value_json = nullptr);
 
 /* 跑本地 REPL 主循环直到 stdin EOF；返回退出码（0 = 最后一条命令成功，语法错 3，运行错 2，
  * 读输入失败 -1）。`L` 由调用方持有并负责 `lua_close`。 */

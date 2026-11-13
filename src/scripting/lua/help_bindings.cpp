@@ -190,6 +190,23 @@ const HelpEntry kHelp[] = {
     },
     {"dbg.help", "打印 dbg 这一节（等价于 help('dbg')）", nullptr},
     {
+        "dbg.remote",
+        "跨位数 / 强隔离的远端会话代理（D56）：方法面与本地 session 相同",
+        "local h, err = dbg.remote('127.0.0.1:8642', { token = '...', timeout_ms = 8000 })\n"
+        "local d = h:create{ imagepath = 'C:/Windows/System32/cmd.exe' }   -- 或 h:attach(pid)\n"
+        "local ev = d:pump(3000)        -- 远端事件表（普通表；ev.session 填回代理对象）\n"
+        "local ctx = d:context()        -- 键名与本地一致（Cax ... Cip）\n"
+        "local s = d:read(m.base, 32)   -- 字节串（帧里走 __hex）\n"
+        "d:kill(); h:close()\n"
+        "\n"
+        "为什么需要它：位数是绕不过去的 —— 32 位调试器附不了 64 位目标（ERROR_NOT_SUPPORTED），\n"
+        "x64 模块也处理不了 32 位目标 -> 跨位数只能两个进程。这里连的必须是**另一个**跑着\n"
+        "`--repl --server` 的 AutoDbg（代理靠连接内 state 存活把多个调用串到同一个 lua_State）。\n"
+        "边界：函数 / userdata 过不了线（回调得留在本机）；单次请求体受 REPL 4096 字节限制；\n"
+        "`open_file` 在代理路径上不支持。dbg.remote_open / remote_xfer / remote_close 是它用的\n"
+        "内部传输原语（不写第二套 TCP，直接复用 --remote 的连接与帧），脚本不要直接调。\n"
+    },
+    {
         "gui",
         "GUI 自动化：键鼠 / 屏幕 / 窗口 / 控件 / 截图",
         "唯一入口是全局表 gui：gui.pick() / gui.screenshot() / gui.send(...) …\n"

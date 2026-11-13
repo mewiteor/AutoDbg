@@ -27,6 +27,19 @@
 
 namespace autodbg::host
 {
+/* 一次连接的读缓冲（帧头 8 字节 + json + data）。
+ * 定义在 `autodbg::host` 作用域（不是匿名命名空间）：`client.hpp` 只前向声明它，
+ * T7 C-remote（D56）的 `remote_connect` / `remote_run_script` / `remote_close` 要把它
+ * 交给 `dbg_bindings.cpp` 当句柄（T7 切片 C-remote 的「不写第二套 TCP」就靠这个）。 */
+struct remote_conn
+{
+    long long      sock;
+    unsigned       read_timeout_ms;
+    unsigned       max_frame;
+    unsigned char *buf;     /* 容量 = max_frame */
+    unsigned       next_id; /* `script` 帧的命令号（D2a 的归因）：每发一帧 +1（u16 回绕） */
+};
+
 namespace
 {
 constexpr unsigned k_default_read_timeout_ms = 5000;
@@ -41,16 +54,7 @@ enum
     k_result_flag_truncated = 0x08,
 };
 
-/* 一次连接的读缓冲（帧头 8 字节 + json + data） */
-struct conn
-{
-    long long sock;
-    unsigned  read_timeout_ms;
-    unsigned  max_frame;
-    unsigned char *buf;   /* 容量 = max_frame */
-};
-
-bool send_all(conn *c, const void *p, size_t n)
+bool send_all(remote_conn *c, const void *p, size_t n)
 {
     if (n == 0)
         return true;
@@ -58,7 +62,7 @@ bool send_all(conn *c, const void *p, size_t n)
 }
 
 /* 写一帧：u32 长度前缀 + 8 字节头 + json + data（raw 分帧，D42） */
-bool write_frame(conn *c, unsigned type, unsigned id, unsigned flags, const char *json, size_t json_len,
+bool write_frame(remote_conn *c, unsigned type, unsigned id, unsigned flags, const char *json, size_t json_len,
                  const void *data, size_t data_len)
 {
     autodbg::common::frame_header h;
@@ -80,8 +84,11 @@ bool write_frame(conn *c, unsigned type, unsigned id, unsigned flags, const char
            send_all(c, data, data_len);
 }
 
-/* 读满 n 字节：true = 成功；false = 对端关闭/出错/超时 */
-bool recv_exact(conn *c, void *buf, size_t n)
+/* 读满 n 字节：true = 成功；false = 对端关闭/出错/整体超时。
+ * `deadline`（`GetTickCount()` 的毫秒时间戳，0 = 不设上限）只影响 `-2`（这一片没数据）的处置：
+ *   · 0（`client_main` 用）：继续等 —— server 可能在跑长脚本，宁可等也不误判断线；
+ *   · 非 0（远端代理用）：过了 deadline 就失败（代理在别人的脚本里被调，不能无上限阻塞）。 */
+bool recv_exact(remote_conn *c, void *buf, size_t n, DWORD deadline)
 {
     unsigned char *p   = (unsigned char *)buf;
     size_t         got = 0;
@@ -94,25 +101,30 @@ bool recv_exact(conn *c, void *buf, size_t n)
             continue;
         }
         if (r == -2)
-            continue;   /* 超时：继续等（server 可能在跑长脚本；宁可等也不误判断线） */
+        {
+            if (deadline != 0 && GetTickCount() >= deadline)
+                return false;
+            continue;
+        }
         return false;
     }
     return true;
 }
 
 /* 读一帧：成功返回 true，`*type/_id/_flags` 与 `buf`（json 在前、data 在后）有效。
- * `*json_len` / `*data_len` 给出切分。 */
-bool read_frame(conn *c, unsigned *type, unsigned *id, unsigned *flags, size_t *json_len, size_t *data_len)
+ * `*json_len` / `*data_len` 给出切分（`deadline` 见 `recv_exact`）。 */
+bool read_frame(remote_conn *c, unsigned *type, unsigned *id, unsigned *flags, size_t *json_len, size_t *data_len,
+                DWORD deadline = 0)
 {
     unsigned char pfx[4];
-    if (!recv_exact(c, pfx, sizeof pfx))
+    if (!recv_exact(c, pfx, sizeof pfx, deadline))
         return false;
     size_t payload = 0;
     if (!autodbg::common::frame_prefix_decode(pfx, sizeof pfx, &payload) || payload > (size_t)c->max_frame)
         return false;
 
     unsigned char hdr[autodbg::common::k_frame_header_size];
-    if (!recv_exact(c, hdr, sizeof hdr))
+    if (!recv_exact(c, hdr, sizeof hdr, deadline))
         return false;
     autodbg::common::frame_header fh;
     if (!autodbg::common::frame_header_decode(hdr, sizeof hdr, &fh))
@@ -122,7 +134,7 @@ bool read_frame(conn *c, unsigned *type, unsigned *id, unsigned *flags, size_t *
     if (!autodbg::common::frame_json_len(payload, fh.data_len, &jl))
         return false;
     size_t body = jl + (size_t)fh.data_len;
-    if (body > 0 && !recv_exact(c, c->buf, body))
+    if (body > 0 && !recv_exact(c, c->buf, body, deadline))
         return false;
 
     *type     = fh.type;
@@ -186,15 +198,15 @@ void close_all_files()
 }
 
 /* `read_resp` 的两种形态：纯标志 / 带 8 字节位置 */
-bool reply_flags(conn *c, unsigned id, unsigned flags)
+bool reply_flags(remote_conn *c, unsigned id, unsigned flags)
 {
     return write_frame(c, stream_frame_read_resp, id, flags, nullptr, 0, nullptr, 0);
 }
-bool reply_data(conn *c, unsigned id, unsigned flags, const void *data, size_t n)
+bool reply_data(remote_conn *c, unsigned id, unsigned flags, const void *data, size_t n)
 {
     return write_frame(c, stream_frame_read_resp, id, flags, nullptr, 0, data, n);
 }
-bool reply_pos(conn *c, unsigned id, unsigned flags, long pos)
+bool reply_pos(remote_conn *c, unsigned id, unsigned flags, long pos)
 {
     unsigned char b[8];
     autodbg::common::frame_put_u32(b, (unsigned)pos);
@@ -203,7 +215,7 @@ bool reply_pos(conn *c, unsigned id, unsigned flags, long pos)
 }
 
 /* `open` 帧：flags = 0 读 / 1 写 / 2 追加；data = 路径（NUL 结尾） */
-void client_open(conn *c, unsigned id, unsigned flags, const char *path)
+void client_open(remote_conn *c, unsigned id, unsigned flags, const char *path)
 {
     const char *mode = (flags == 1u) ? "wb" : (flags == 2u) ? "ab" : "rb";
     FILE       *fp   = fopen(path, mode);
@@ -222,7 +234,7 @@ void client_open(conn *c, unsigned id, unsigned flags, const char *path)
 }
 
 /* `read_req`：flags = op | (whence << 4)；data = {u32 arg, u32 保留} */
-void client_read_req(conn *c, unsigned id, unsigned flags, const unsigned char *arg_data, size_t arg_len)
+void client_read_req(remote_conn *c, unsigned id, unsigned flags, const unsigned char *arg_data, size_t arg_len)
 {
     local_file *f = find_file(id);
     if (f == nullptr || f->fp == nullptr)
@@ -304,46 +316,69 @@ size_t token_bytes(const autodbg_boot *boot, char *out, size_t cap)
     return n;
 }
 
-bool connect_to(const autodbg_boot *boot, conn *c)
+/* 建 socket + 读缓冲（**不含**握手）：`client_main` 与远端代理共用这一段。
+ * 成功 true；失败 false 并填 `*why`（`net_unavailable` = 本系统没有 winsock）与 `*oom`。 */
+bool open_conn(const char *host, unsigned port, unsigned read_timeout_ms, unsigned max_frame, remote_conn *c,
+               autodbg::common::net_status *why, bool *oom)
 {
-    using autodbg::core::ErrorS;
-    using autodbg::core::PrintF;
-
-    autodbg::common::net_status why = autodbg::common::net_ok;
-    if (autodbg::common::net_startup() != autodbg::common::net_ok)
-    {
-        ErrorS("client: 本系统没有可用的 winsock（ws2_32.dll / wsock32.dll 都载不进）\n");
+    *oom           = false;
+    *why           = autodbg::common::net_startup();
+    c->buf         = nullptr;
+    c->next_id     = 0;
+    c->sock        = -1;
+    if (*why != autodbg::common::net_ok)
         return false;
-    }
 
-    long long s = autodbg::common::net_connect(boot->remote_host, boot->remote_port, &why);
+    long long s = autodbg::common::net_connect(host, port, why);
     if (s < 0)
-    {
-        ErrorS("client: 连不上 ");
-        ErrorS(boot->remote_host);
-        ErrorS(":");
-        PrintF("%u", boot->remote_port);
-        ErrorS("（");
-        ErrorS(autodbg::common::net_status_name(why));
-        ErrorS("）\n");
         return false;
-    }
 
     c->sock            = s;
-    c->read_timeout_ms = (boot->read_timeout_ms != 0) ? boot->read_timeout_ms : k_default_read_timeout_ms;
-    c->max_frame       = (boot->max_frame != 0) ? boot->max_frame : k_default_max_frame;
+    c->read_timeout_ms = (read_timeout_ms != 0) ? read_timeout_ms : k_default_read_timeout_ms;
+    c->max_frame       = (max_frame != 0) ? max_frame : k_default_max_frame;
     c->buf             = (unsigned char *)autodbg::common::alloc(c->max_frame);
     if (c->buf == nullptr)
     {
         autodbg::common::net_close(s);
         c->sock = -1;
-        ErrorS("client: out of memory\n");
+        *oom    = true;
         return false;
     }
     return true;
 }
 
-void close_conn(conn *c)
+bool connect_to(const autodbg_boot *boot, remote_conn *c)
+{
+    using autodbg::core::ErrorS;
+    using autodbg::core::PrintF;
+
+    autodbg::common::net_status why = autodbg::common::net_ok;
+    bool                        oom = false;
+    if (open_conn(boot->remote_host, boot->remote_port, boot->read_timeout_ms, boot->max_frame, c, &why, &oom))
+        return true;
+    if (why == autodbg::common::net_unavailable)
+    {
+        ErrorS("client: 本系统没有可用的 winsock（ws2_32.dll / wsock32.dll 都载不进）\n");
+        return false;
+    }
+    if (oom)
+    {
+        ErrorS("client: out of memory\n");
+        return false;
+    }
+
+    ErrorS("client: 连不上 ");
+    ErrorS(boot->remote_host);
+    ErrorS(":");
+    PrintF("%u", boot->remote_port);
+    ErrorS("（");
+    ErrorS(autodbg::common::net_status_name(why));
+    ErrorS("）\n");
+    return false;
+}
+
+/* 关连接并释放读缓冲（不释放 `c` 本身 —— 那归 `remote_close` / `client_main` 的栈对象） */
+void close_conn(remote_conn *c)
 {
     if (c->sock >= 0)
         autodbg::common::net_close(c->sock);
@@ -354,6 +389,34 @@ void close_conn(conn *c)
         c->buf = nullptr;
     }
 }
+
+/* ---------------------------------------------------------------- 可复用的远端传输（T7 C-remote）
+ * 错误串的拷贝：`err` 是调用方给的定长缓冲（ASCII；传不了中文 —— 它要端到 Lua 的 string）。 */
+void set_err(char *err, size_t cap, const char *msg)
+{
+    if (err == nullptr || cap == 0)
+        return;
+    size_t n = 0;
+    while (msg[n] != '\0' && n + 1 < cap)
+    {
+        err[n] = msg[n];
+        n++;
+    }
+    err[n] = '\0';
+}
+
+/* 把 `c->buf` 的前 `n` 字节拷成 alloc 缓冲（给错误文案与 result 帧的 json 用） */
+char *copy_buf(const remote_conn *c, size_t n)
+{
+    char *p = (char *)autodbg::common::alloc(n + 1);
+    if (p == nullptr)
+        return nullptr;
+    for (size_t i = 0; i < n; i++)
+        p[i] = (char)c->buf[i];
+    p[n] = '\0';
+    return p;
+}
+
 
 /* 读本地脚本文件（客户端侧；路径由启动器给，CP936 字节） */
 char *read_script_file(const autodbg_boot *boot, size_t *out_len)
@@ -437,6 +500,159 @@ int print_control_reply(const unsigned *type, const char *json, size_t json_len,
 }
 } /* namespace */
 
+remote_conn *remote_connect(const char *host, unsigned port, const char *token, unsigned read_timeout_ms,
+                            unsigned max_frame, char *err, size_t errcap)
+{
+    if (err != nullptr && errcap > 0)
+        err[0] = '\0';
+
+    remote_conn *c = new remote_conn;
+    if (c == nullptr)
+    {
+        set_err(err, errcap, "out of memory");
+        return nullptr;
+    }
+    c->sock            = -1;
+    c->buf             = nullptr;
+    c->read_timeout_ms = 0;
+    c->max_frame       = 0;
+    c->next_id         = 0;
+
+    autodbg::common::net_status why = autodbg::common::net_ok;
+    bool                        oom = false;
+    if (!open_conn(host, port, read_timeout_ms, max_frame, c, &why, &oom))
+    {
+        if (oom)
+            set_err(err, errcap, "out of memory");
+        else if (why == autodbg::common::net_unavailable)
+            set_err(err, errcap, "no winsock (ws2_32.dll / wsock32.dll)");
+        else
+        {
+            char msg[96];
+            char *p = msg;
+            const char *a = "connect failed: ";
+            while (*a != '\0' && p + 1 < msg + sizeof msg) *p++ = *a++;
+            const char *b = autodbg::common::net_status_name(why);
+            while (*b != '\0' && p + 1 < msg + sizeof msg) *p++ = *b++;
+            *p = '\0';
+            set_err(err, errcap, msg);
+        }
+        delete c;
+        return nullptr;
+    }
+
+    /* 握手：`id` = 协议版本、`data` = token（与 `client_main` 逐字节同一口径） */
+    size_t tok_len = (token != nullptr) ? strlen(token) : 0;
+    if (!write_frame(c, stream_frame_handshake, k_stream_proto_version, 0, nullptr, 0, token, tok_len))
+    {
+        set_err(err, errcap, "handshake failed");
+        close_conn(c);
+        delete c;
+        return nullptr;
+    }
+
+    unsigned type = 0, id = 0, flags = 0;
+    size_t   json_len = 0, data_len = 0;
+    /* 握手有独立的 10 s 上限：连上了但对面不讲话时不把脚本卡死 */
+    DWORD deadline = GetTickCount() + 10000;
+    if (!read_frame(c, &type, &id, &flags, &json_len, &data_len, deadline))
+    {
+        set_err(err, errcap, "no handshake response");
+        close_conn(c);
+        delete c;
+        return nullptr;
+    }
+    if (type == stream_frame_error)
+    {
+        /* 版本 / token 不符：把服务端的 json 原文带回去（调用方决定怎么显示） */
+        char *msg = copy_buf(c, json_len);
+        set_err(err, errcap, (msg != nullptr) ? msg : "rejected");
+        autodbg::common::release(msg);
+        close_conn(c);
+        delete c;
+        return nullptr;
+    }
+    if (type != stream_frame_info)
+    {
+        set_err(err, errcap, "unexpected handshake reply");
+        close_conn(c);
+        delete c;
+        return nullptr;
+    }
+    return c;
+}
+
+const char *remote_run_script(remote_conn *c, const void *src, size_t len, const char *chunk, unsigned timeout_ms,
+                              char *err, size_t errcap)
+{
+    if (err != nullptr && errcap > 0)
+        err[0] = '\0';
+    if (c == nullptr || c->sock < 0 || c->buf == nullptr)
+    {
+        set_err(err, errcap, "not connected");
+        return nullptr;
+    }
+
+    const char *cn = (chunk != nullptr && chunk[0] != '\0') ? chunk : "remote";
+    unsigned    id = c->next_id++ & 0xFFFFu;
+    if (!write_frame(c, stream_frame_script, id, 0, cn, strlen(cn), src, len))
+    {
+        set_err(err, errcap, "send failed");
+        return nullptr;
+    }
+
+    DWORD deadline = (timeout_ms != 0) ? (GetTickCount() + (DWORD)timeout_ms) : 0;
+    char *result   = nullptr;
+
+    for (;;)
+    {
+        unsigned type = 0, fid = 0, flags = 0;
+        size_t   json_len = 0, data_len = 0;
+        if (!read_frame(c, &type, &fid, &flags, &json_len, &data_len, deadline))
+        {
+            set_err(err, errcap, (deadline != 0 && GetTickCount() >= deadline) ? "timeout" : "connection closed");
+            break;
+        }
+        if (type == stream_frame_result)
+        {
+            if (result != nullptr)
+                autodbg::common::release(result);
+            result = copy_buf(c, json_len);
+            if (result == nullptr)
+                set_err(err, errcap, "out of memory");
+            continue;
+        }
+        if (type == stream_frame_end)
+            break;
+        if (type == stream_frame_error)
+        {
+            char *msg = copy_buf(c, json_len);
+            set_err(err, errcap, (msg != nullptr) ? msg : "server error");
+            autodbg::common::release(msg);
+            break;
+        }
+        /* `out`(4) / `event`(16) / `open` / `data` / `read_req` / `close` / `info`：
+         * 代理路径一律丢弃 —— 返回值的 payload 走 `result.value`，不走 `out`；
+         * `open_file` 的帧在代理路径上**不支持**（见 `client.hpp` 的说明）。 */
+    }
+
+    if (result == nullptr)
+    {
+        if (err == nullptr || err[0] == '\0')
+            set_err(err, errcap, "no result frame");
+        return nullptr;
+    }
+    return result;
+}
+
+void remote_close(remote_conn *c)
+{
+    if (c == nullptr)
+        return;
+    close_conn(c);
+    delete c;
+}
+
 int client_main(const autodbg_boot *boot)
 {
     using autodbg::core::ErrorS;
@@ -444,7 +660,7 @@ int client_main(const autodbg_boot *boot)
     using autodbg::core::PrintS;
     using namespace autodbg::common;
 
-    conn c;
+    remote_conn c;
     c.sock            = -1;
     c.buf             = nullptr;
     c.read_timeout_ms = k_default_read_timeout_ms;

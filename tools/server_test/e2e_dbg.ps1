@@ -38,7 +38,17 @@
 #                                 每张 ok == true / exit == 0x4000001F / hits >= 1，返回后 sessions() == 0
 #                                 ❗exit 是**实测值**：不武装断点时 fixture 的第二个 int3 走 NOT_HANDLED，
 #                                 进程被系统以 WOW64 断点状态终止（不是 fixture 契约的 42）；见下面的说明
-# ❗session.* / kill.* / C2a 的 4 条 / sugar.* 的 2 条都需要 x86 的 fixture ⇒ x64 上这几段整段 SKIP（8 条）。
+#   T7 C-remote（跨位数会话代理，plan_t7.md §10.1 / D56）—— **只在 86 宿主上跑**（需两个位数）：
+#     本机跑 32 位 `AutoDbg_86.exe <script>`，脚本里用 `dbg.remote` 连一个 64 位的
+#     `--repl --server`（PowerShell 起，`finally` 里 `Kill`），在那边 create 一个 64 位 cmd.exe：
+#     remote.create          `h:create{...}` 返回代理对象，`d.root_pid > 0`（pid 在远端）
+#     remote.pump-context    `d:pump` 拿到事件表（type 1/3，`ev.session` 填回代理对象），
+#                            `d:context().Cip > 0`（远端是 64 位，键仍是 `Cip`）⇒「32 位调试器 + 64 位目标」
+#     remote.data-plane      `d:read(m.base, 4)` = 四字节 PE 头 / `d:read_u16` 是 number
+#                            （字节走 `__hex`、≥1e14 的地址走 `__i`，见 dbglib.lua 的文件头）
+#     remote.teardown        `d:kill()` 真终止那个 64 位目标（PowerShell 用 Get-Process 复查）
+# ❗session.* / kill.* / C2a 的 4 条 / sugar.* 的 2 条 / remote.* 的 4 条都需要 x86 宿主（前四段还要
+#   x86 fixture）⇒ x64 上这几段整段 SKIP（8 条）。
 # =============================================================================
 [CmdletBinding()]
 param(
@@ -460,6 +470,132 @@ print('left=' .. #dbg.sessions() .. ' cb_hits=' .. tostring(hits > 0))
         $r.out -match "r1 $rwant" -and $r.out -match "r2 $rwant" -and `
         $r.out -match 'left=0 cb_hits=true') `
         "run_all 返回两张结果表（ok/exit/hits/root_pid），跑完不留下会话；out=[$($r.out)]"
+}
+
+# ---------------------------------------------------------------- ⑧ T7 C-remote：跨位数会话代理
+# 这一段的**宿主**是 32 位的 `AutoDbg_86.exe`（跑本地脚本），它用 `dbg.remote` 连一个 64 位的
+# `--repl --server`，在那边 create 一个 **64 位** 目标。这条路本地根本做不到：32 位调试器附
+# 64 位目标拿的是 ERROR_NOT_SUPPORTED（D56 的硬理由）⇒ 跨位数只能两个进程。
+# 代理的每条方法调用 = 一条 `script` 帧（`return dbglib.remote_call(...)`），返回值走协议
+# `result` 帧的 `json.value`（C-remote 唯一增量，proto 不 bump）。
+if ($Render -eq '86')
+{
+    $Exe64 = Join-Path $Root '.out/AutoDbg_64.exe'
+    if (-not (Test-Path $Exe64))
+    {
+        Write-Output 'SKIP: remote.* 需要 64 位产物（.out/AutoDbg_64.exe）'
+    }
+    else
+    {
+        $rport = Get-Random -Minimum 18900 -Maximum 19100   # 随机端口：并行跑门禁时不容易撞
+        $rtok  = 'c0ffee1234abcd02'
+        $rout  = Join-Path $TmpDir 'remote_srv.out'
+        $rerr  = Join-Path $TmpDir 'remote_srv.err'
+        $srv   = $null
+        try
+        {
+            $srv = Start-Process -FilePath $Exe64 `
+                -ArgumentList @('--server=tcp', '--repl', "--server-port=$rport", "--server-token=$rtok", '--server-no-echo') `
+                -RedirectStandardOutput $rout -RedirectStandardError $rerr -PassThru -NoNewWindow
+
+            # 等监听就绪（连一下再关；最多 ~5 s）
+            $up = $false
+            for ($i = 0; $i -lt 50 -and -not $up; $i++)
+            {
+                Start-Sleep -Milliseconds 100
+                try
+                {
+                    $tc = New-Object System.Net.Sockets.TcpClient
+                    $tc.Connect('127.0.0.1', $rport)
+                    $tc.Close()
+                    $up = $true
+                }
+                catch { }
+            }
+            if (-not $up)
+            {
+                Bad 'remote.create' "64 位 server 没起来（port=$rport）：$(Get-Content $rerr -Raw -ErrorAction SilentlyContinue)"
+            }
+            else
+            {
+            # 端口/令牌直接烘进脚本：Run-Local 只传一个脚本路径，插值比脚本参数稳
+            $s_remote = Write-Lua 'remote.lua' @"
+local TOKEN = '$rtok'
+local PORT  = $rport
+
+local h, herr = dbg.remote('127.0.0.1:' .. PORT, { token = TOKEN, timeout_ms = 20000 })
+print('host=' .. tostring(h ~= nil) .. ' err=' .. tostring(herr))
+if not h then return end
+
+-- ① 远端 create：返回的是本机代理对象，root_pid 在**远端**那个进程里
+local d, cerr = h:create{ imagepath = 'C:/Windows/System32/cmd.exe', cmdline = '/c ping -n 20 127.0.0.1' }
+print('create=' .. tostring(d ~= nil) .. ' root_pos=' .. tostring(d ~= nil and d.root_pid > 0) ..
+      ' err=' .. tostring(cerr))
+if not d then print('kill=n/a close=' .. tostring(h:close())) return end
+print('root=' .. tostring(d.root_pid))
+
+-- ② pump + context：远端是**64 位**目标，寄存器表键名仍是 Cip（与本地口径同一份 context_fields）
+local ev, perr = d:pump(4000)
+local tries = 1
+while ev == nil and tries < 3 do ev = d:pump(4000) tries = tries + 1 end
+print('ev_type=' .. tostring(ev and ev.type) .. ' ev_session=' .. tostring(ev ~= nil and ev.session == d) ..
+      ' err=' .. tostring(perr))
+if ev then d:cont(ev.cont_code) end
+local ev2 = d:pump(4000)
+if ev2 then d:cont(ev2.cont_code) end
+local ctx = d:context()
+print('cip=' .. tostring(ctx and ctx.Cip) .. ' cip_pos=' .. tostring(ctx ~= nil and ctx.Cip > 0))
+
+-- ③ 数据面：地址走 `__i`（≥1e14 的整数不能走 jsonx 的 %.14g）、字节走 `__hex`
+local mods, merr = d:mods()
+local m = mods and mods[1]
+print('mods=' .. tostring(mods ~= nil and #mods > 0) .. ' m1=' .. tostring(m and m.name) ..
+      ' base_pos=' .. tostring(m ~= nil and m.base > 0) .. ' err=' .. tostring(merr))
+local s = m and d:read(m.base, 4)
+local u16 = m and d:read_u16(m.base)
+print('read_len=' .. tostring(s and #s) ..
+      ' mz=' .. tostring(s ~= nil and #s == 4 and string.byte(s, 1) == 0x4D and string.byte(s, 2) == 0x5A) ..
+      ' u16=' .. tostring(u16) .. ' u16_num=' .. tostring(type(u16) == 'number'))
+
+-- ④ teardown：代理只转发动作，收尾动词仍是 detach / kill（D51）；这里用 kill
+print('kill=' .. tostring(d:kill()))
+print('close=' .. tostring(h:close()))
+"@
+            $r = Run-Local $s_remote 90000
+
+            $mroot = [regex]::Match($r.out, 'root=(\d+)')
+            $tpid  = if ($mroot.Success) { [int]$mroot.Groups[1].Value } else { 0 }
+            $mq    = [regex]::Match($r.out, 'cip=(-?\d+)')
+            $cip   = if ($mq.Success) { $mq.Groups[1].Value } else { 'none' }
+
+            Check 'remote.create' ($r.out -match 'host=true' -and $r.out -match 'create=true root_pos=true' -and `
+                $tpid -gt 0) "root_pid=$tpid out=[$($r.out)]"
+            Check 'remote.pump-context' ($r.out -match 'ev_type=(1|3)\b' -and $r.out -match 'ev_session=true' -and `
+                $r.out -match 'cip_pos=true') `
+                "远端 64 位目标的第一个事件 + context().Cip>0（键仍是 Cip）；cip=$cip out=[$($r.out)]"
+            Check 'remote.data-plane' ($r.out -match 'mods=true' -and $r.out -match 'base_pos=true' -and `
+                $r.out -match 'read_len=4' -and $r.out -match 'mz=true' -and $r.out -match 'u16_num=true') `
+                "d:read(m.base,4) 四字节 PE 头、d:read_u16 是 number（__hex / __i 过线）；out=[$($r.out)]"
+
+            Start-Sleep -Milliseconds 400
+            $alive = $false
+            if ($tpid -gt 0) { $alive = $null -ne (Get-Process -Id $tpid -ErrorAction SilentlyContinue) }
+            Check 'remote.teardown' ($r.out -match 'kill=true' -and $r.out -match 'close=true' -and `
+                $tpid -gt 0 -and -not $alive) "pid=$tpid alive=$alive out=[$($r.out)]"
+
+            if ($alive) { Stop-Process -Id $tpid -Force -ErrorAction SilentlyContinue }
+            }
+        }
+        finally
+        {
+            # 任何一步失败都要把 64 位 server 收掉（它可能还抱着被调试的进程）
+            if ($srv -and -not $srv.HasExited)
+            {
+                $srv.Kill()
+                $srv.WaitForExit(2000) | Out-Null
+            }
+        }
+    }
 }
 
 Write-Output ''
