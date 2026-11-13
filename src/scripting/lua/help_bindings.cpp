@@ -54,15 +54,18 @@ const HelpEntry kHelp[] = {
     },
     {
         "dbg",
-        "调试会话原语（create/attach → pump → cont → detach/kill）",
-        "dbg 是**状态机**，不是 Run 那样「一口气跑到结束」：\n"
+        "调试会话（create/attach 拿会话对象 → d:pump → d:cont → d:detach/d:kill）",
+        "dbg 是**状态机**，不是 Run 那样「一口气跑到结束」。create/attach 返回**会话对象**：\n"
         "\n"
-        "  dbg.create{ imagepath = 'target.exe' }   -- 或 dbg.attach(pid)\n"
-        "  local ev = dbg.pump(100)                 -- 等一个事件；默认**不放行**\n"
-        "  if ev then print(ev.type, ev.ea) end     -- 事件停在未应答状态\n"
-        "  dbg.cont()                               -- 显式放行（用 core 算好的默认 code）\n"
-        "  dbg.detach() / dbg.kill()                -- 收尾\n"
+        "  local d = dbg.create{ imagepath = 'target.exe' }   -- 或 dbg.attach(pid)\n"
+        "  local ev = d:pump(100)                 -- 等一个事件；默认**不放行**\n"
+        "  if ev then print(ev.type, ev.ea) end   -- 事件停在 d.stop（= 这一张表）\n"
+        "  d:cont()                               -- 显式放行（缺省 = ev.cont_code）\n"
+        "  d:detach() / d:kill()                  -- 收尾\n"
         "\n"
+        "事件是**普通表**：type pid tid ea modname rva code first_chance cont_code。\n"
+        "一次执行只能有一个会话；dbg.sessions() / dbg.session(pid) / dbg.last() 用来取回它。\n"
+        "dbg.* 上的同名函数仍然可用，作用在默认会话（最近一次 create/attach 的那个）上。\n"
         "与 Run/Attach 的关系：它们是同一套引擎原语的便捷糖；两条路径在同一个会话上\n"
         "不可混用（dbg 停着未应答事件时调 Run/Attach 会报错）。\n",
     },
@@ -75,28 +78,30 @@ const HelpEntry kHelp[] = {
         "            callback = ..., exception_callback = ...,\n"
         "            on_exception = ..., on_breakpoint = ...,\n"
         "            on_single_step = ..., on_exit_process = ... }\n"
-        "返回 true；失败 nil, err。不循环 —— 用 dbg.pump 推进。\n",
+        "返回**会话对象**；失败 nil, err。不循环 —— 用 d:pump 推进。\n",
     },
     {
         "dbg.attach",
         "附加到已运行的进程（= Attach 的原语版；Win95/98 不支持）",
-        "dbg.attach(pid [, { use_scylla_hide = ..., <同样的回调> }])\n"
+        "dbg.attach(pid [, { use_scylla_hide = ..., <同样的回调> }]) -> 会话对象 | nil, err\n"
         "只认**显式** pid（「沿用上次 pid / 鼠标选进程」是 Attach 的策略，不在原语层）。\n"
         "位数必须配对：32 位调试器附 64 位目标会拿到 ERROR_NOT_SUPPORTED。\n",
     },
     {
         "dbg.pump",
         "等一个调试事件；默认不 continue（事件停在未应答状态）",
-        "dbg.pump([timeout_ms [, autocont]]) -> code | nil [, err]\n"
+        "dbg.pump([timeout_ms [, autocont]]) -> 事件表 | nil [, err]\n"
         "  nil = 没等到事件（不是错误；目标还停着时下一次 pump 也是空转）\n"
         "  autocont = true -> 引擎自己 ContinueDebugEvent（record-and-continue 档）\n"
+        "d:pump(...) 是**缓存优先**：d.stop 非空就立即返回它（不阻塞）。\n"
+        "事件表字段：type pid tid ea modname rva code first_chance cont_code。\n"
         "timeout 按 <=250 ms 切片，每片问一次取消守卫 -> --cancel 能在空闲时插话。\n",
     },
     {
         "dbg.cont",
         "应答当前未应答的事件（显式 code 可以吞异常 / 交给程序）",
-        "dbg.cont([pid [, tid [, code]]]) -> true | false\n"
-        "不带 code 时用 core 算好的默认应答（dbg.code()）；\n"
+        "d:cont([code]) -> true | false          -- 缺省 = d.stop.cont_code\n"
+        "dbg.cont([pid [, tid [, code]]]) -> true | false   -- 旧形态，作用在默认会话上\n"
         "吞掉断点/异常用 0x00010002（DBG_CONTINUE），交给程序用 0x80010001。\n",
     },
     {
@@ -112,16 +117,18 @@ const HelpEntry kHelp[] = {
     {
         "dbg.arm",
         "在 (modname, rva) 处武装软件断点并给回调",
-        "dbg.arm(modname, rva, callback) -> true | nil, err\n"
+        "d:arm(modname, rva, callback) -> true | nil, err\n"
         "rva 是**普通数字**（别用 GetModBase 做算术：LuaVariant 会算错）。\n"
-        "模块必须已加载（先 pump 到它的 load 事件）；命中后引擎负责压回 EIP 与 re-arm。\n"
+        "允许**延迟武装**：模块还没加载时只登记，CREATE_PROCESS/LOAD_DLL 时补 0xCC。\n"
+        "命中后引擎负责压回 EIP 与 re-arm。\n"
         "注意：不要打在本来就写着 int3 的地址上（会反复命中）。\n",
     },
     {
         "dbg.hits",
         "取命中记录（有界窗口，最旧先丢）",
-        "dbg.hits() -> { {seq, type, pid, tid, ea, modname, rva, code, first_chance}, ... }\n"
-        "type: 1 = 断点 / 2 = 异常 / 3 = 单步。只收这三个通道，不含 LOAD_DLL 之类。\n",
+        "d:hits() -> { {seq, type, pid, tid, ea, modname, rva, code, cont_code, first_chance}, ... }\n"
+        "type: 1 = 断点 / 2 = 异常 / 3 = 单步。只收这三个通道，不含 LOAD_DLL 之类。\n"
+        "是历史窗口的**副本**；要「当前那个」就读 d.stop。\n",
     },
     {
         "dbg.dropped",
@@ -134,9 +141,20 @@ const HelpEntry kHelp[] = {
         "dbg.setcap([1..64]) -> 实际生效的值\n不带参数 = 查当前值。收窄时丢的是最旧那几条（计入 dropped）。\n",
     },
     {
-        "dbg.code",
-        "上一次事件的默认应答码（0x00010002 / 0x80010001）",
-        "dbg.code() -> integer\n切片 C 会把它换成事件表里的 ev.cont_code（逐事件，而不是「上一次」）。\n",
+        "dbg.sessions",
+        "列出这次执行里的会话（跨 d = nil 存活）",
+        "dbg.sessions() -> { {root_pid, kind, state, lua_bound}, ... }\n"
+        "kind: 'create' / 'attach'；state: 'running' / 'stopped' / 'exited'。\n",
+    },
+    {
+        "dbg.session",
+        "按 root_pid 取回同一个会话对象",
+        "dbg.session(root_pid) -> 会话对象 | nil\n句柄还在时返回**同一个** userdata（表身份可以判等）。\n",
+    },
+    {
+        "dbg.last",
+        "最近一次 create/attach 的会话（= 默认会话）",
+        "dbg.last() -> 会话对象 | nil\n收尾（detach/kill）之后为 nil。\n",
     },
     {
         "dbg.stopped",

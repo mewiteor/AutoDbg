@@ -541,7 +541,10 @@ type  pid  tid  ea  modname  rva  code  first_chance  cont_code
 | --- | --- | --- | --- |
 | **A** ✅ 已落地 | `close` → `detach`/`kill`（9x 无 `detach`）；`dbg.caps()`；`help()` 纯文本表 | ~700 行（含新文件与门禁） | `e2e_dbg.ps1` 十条：`caps.*` / `detach.capability` / `help.*` / `kill.*` |
 | **B** ✅ 已落地 | help 上色（`core::print_styled` + `console_style_enabled` 纯判定 + `NO_COLOR`; sink / 非控制台 / `--json` 天然纯文本） | ~230 行（含自测与注释） | 自测 `console.style-*` 三条（70 → 73）+ 既有 `help.plain-when-piped` |
-| **C** | Session 对象（事件是**普通表**，无 Stop 对象）+ registry + `dbg.sessions/session/last/detach(pid)/kill(pid)`；29 名转薄转发；`Var` 退出新面 | ~550 行 | `session.*`（含 §10 那组 `route.*`）、`session.default-parity` |
+| **C1a** ✅ 已落地 | Session 对象（full userdata + 弱值句柄表）+ C 侧 registry + `dbg.sessions/session/last` + **事件表**（`d.stop`/`cont_code`，删 `dbg.code`）+ `d:pump` 缓存优先 + 延迟武装；**仍限单会话** | ~1350 行（含门禁与注释） | `e2e_dbg` 10 → 13（`session.identity` / `session.pump-cache-first` / `session.event-table`）；`e2e_tcp` ⑯ 六个脚本迁移，条数不变（56） |
+| **C1b** | 数据面接上对象：`d:read*/write/context/stack/trace/mods/threads`、`d:bp/bp_hw/bps`（§2.2 的 1/2/3/12） | ~350 行 | `pump.partial-read-length`、`repl.snapshot-restore`（部分）、`session.data-plane` |
+| **C2** | 多会话：事件归属分派 + 每 session 深度 1 的待应答槽 + 进程树 pid-set + 按 pid 的句柄（§10，D57） | ~400 行 | `route.*` + `pump.dispatch-attribution` / `pump.one-pending-per-session` |
+| **C3** | 29 名转薄转发 + `Var` 退出新面（D52） | ~200 行 | `session.default-parity` |
 | **D** | REPL 本体（T7.5：`event` 帧 / `out.id` 归因 / proto 2 / ABI 5 / `=` 简写 / 多行 / 退出收尾报告） | 按 §8 | `repl.*` |
 | **C-remote** | `dbg.remote(host:port, token)` 远端 session 代理（方法面与本地相同，复用 `--server` + `client.cpp`）—— 跨位数 / 强隔离的唯一形态（D56） | ~200 行 | `remote.proxy-parity`（需两个位数） |
 | **sugar（T7.6）** | `dbglib.run_all`（batch/collect）与 `dbglib.wait_all(pred, timeout)`（rendezvous），只跑在 `dbg.pump` 与 `paused()` 上（D58） | ~120 行 | `sugar.run-all`、`sugar.wait-all` |
@@ -549,7 +552,7 @@ type  pid  tid  ea  modname  rva  code  first_chance  cont_code
 顺序硬约束：**A 必须早于 C**（`detach`/`kill` 就是 Session 对象的方法）；**C 必须早于 D**（REPL 里
 人/AI 都按对象写）。29 个旧名在 C 期间转成对象 API 的薄转发（行为逐字节不变，`session.default-parity`
 守门），退役留给之后的 D 条目。
-### 11.8 切片 A / B 落地状态（已提交）
+### 11.8 切片 A / B / C1a 落地状态（已提交）
 
 - `src/common/platform.{hpp,cpp}`（新文件）：`is_win9x()` / `is_nt()`（`GetVersionExA` 的 `dwPlatformId`，与启动器 `detect_variant()` 同一判据）+ `arch_name` / `variant_name` / `flavor_name`（收拢一处，免得 caps / help / info 各写一份字符串）。❗为什么不用编译开关：`/DAUTODBG_WIN9X` 是「要能在 9x 上跑」的**构建约束**，legacy 产物在 Win11 上也跑；而 caps 报的是**这台机器**。
 - `src/scripting/lua/help_bindings.{hpp,cpp}`（新文件）：`help([topic])` 与 `dbg.help()` 共用 `kHelp[]` 一张表，`help('dbg')` 是**前缀匹配生成的成员列表**（不存在第二份）。输出走 `PrintS` ⇒ server 模式自动进 `out` 帧、本地进控制台/管道，本层不碰句柄。正文是**窄串字面量**（现代变体 UTF-8、legacy CP936，`PrintS` 各自转成 console 需要的形式）；**主题名与签名保持 ASCII**（门禁逐字匹配）。❗legacy 编译警告 **C4566** 的教训：`⇒` / `❗` 这类字符**不能出现在字符串字面量里**（CP936 表示不出），注释里可以 —— 帮助正文里一律用 `->` 与「注意：」。
@@ -559,6 +562,16 @@ type  pid  tid  ea  modname  rva  code  first_chance  cont_code
 
 **切片 B（help 上色）**：src/common/console_style.{hpp,cpp} 的纯函数 `console_style_enabled(is_console, no_color_env)` + `no_color_requested()`（NO_COLOR，no-color.org 口径：存在且非空）；core::print_styled(attr, utf8) 的降级链是 **sink 优先 → ttr == 0 → GetConsoleMode 失败（管道/重定向）→ 控制台**，所以「管道里零属性字节」是结构性的（非控制台根本走不到 `SetConsoleTextAttribute`）。控制台上只换前景、保留背景（`(old & 0xFFF0) | (attr & 0x000F)`），写完恢复旧属性；help_bindings 只给每行配一个属性，**文本字节一个不改**（切片 A 的输出逐字保留）。自测 +3（console.style-console / -no-color / -not-console，70 → 73）；`NO_COLOR` 的环境探测故意不进自测（依赖跑测机器的环境）。导入表：`SetConsoleTextAttribute` / `GetConsoleScreenBufferInfo` / `GetEnvironmentVariableA` 都在 w95 段（scan_dir.py 13 产物全过可证）。实测同上（2e_dbg 10/10/8、2e_tcp 56/56/48、--selftest 73）。
 
+**切片 C1a（会话对象化，仍单会话）**：
+
+- `dbg.create` / `dbg.attach` 返回 **session userdata**（metatable `AutoDbgSession`）：`__index` 先在 C 里认 `stop` / `root_pid` / `kind` / `state`，其余落到方法表 `AutoDbgSession.methods`；`__gc` **只解绑**（D54）。句柄放**弱值表** `AutoDbgSession.handles`（键 = `SessionState*`）⇒ `dbg.last() == dbg.session(pid)` 是同一个 userdata，而 `d = nil` 之后 `__gc` 真能跑、会话本体仍在 registry 里可再取回（§11.5 的「GC 只放手」）。
+- `SessionState`（原 `DbgState g`）+ 侵入式单链表 registry（裸指针 + 首成员 `next`，**不**用静态对象 ⇒ 没有动态初始化）；`g_default` = 最近一次 `create`/`attach` 的会话，模块级 `dbg.*` 全转发到它（29 个契约名与 `lua_run`/`lua_attach` 行为不变）。`g_in_callback` 抬成全局事实（单线程串行）。
+- `current_session()` 一致性：`SessionScope`（**栈上** RAII，不是 TLS）在调 core 前后把 `st->sess` 挂上/还原；回调上下文 `cb.context = SessionState*`（不是 `lua_State`），所以 C2 的路由可以直接复用。
+- **事件表**：`{type, pid, tid, ea, modname, rva, code, first_chance, cont_code}`，与 `stop_ref` 缓存的是**同一张表**（表身份，无代次，D55）；**删 `dbg.code()`**（`cont_code` 同时写进 `hits()` 记录）。`d:pump` **缓存优先**；模块级 `dbg.pump` 刻意**不**缓存 —— 它是唯一的「等」，`pump.no-auto-continue` 的「空转」语义就靠这条。
+- `d:arm` 允许**延迟武装**（D57）：删掉「模块未加载就失败」的检查，由 core 的 `apply_breakpoints_for_module` 在 `CREATE_PROCESS`/`LOAD_DLL` 时补 `0xCC`。
+- 门禁：`e2e_dbg` 10 → **13**（`session.identity` / `session.pump-cache-first` / `session.event-table`）；`e2e_tcp` ⑯ 段六个脚本迁到事件表 + `d.stop`，断言名与总数不变（**56**）。
+- 本机实测：`e2e_dbg` 86 modern 13 / 86 legacy 13 / 64 modern 8（`session.*` 需 x86 fixture）、`e2e_tcp` 56 / 56 / 48、`--selftest` 73（两架构）、导入表 13 产物、`e2e_json` 32、`e2e_gui` 21、`check_skill` 14、`nvim_smoke` 32 全绿。
+- 本轮确认的取舍（**下一切片别推翻**）：① 模块级 `dbg.cont` 保留 `cont([pid[,tid[,code]]])` 旧形态（对象方法才是 `d:cont([code])`，两者作用同一份状态、成功都清 `d.stop`）；② `hits()` 保留 `seq`（D55 的「同形」只落在**事件表**，历史窗口仍是有序副本）；③ 无会话时 `hits/dropped/setcap` 返回 `nil, kErrNoSess`（不再读上一次的残留窗口）；④ `SessionState::sess` 暂时指向宿主的**同一个** `DebuggerSession`（C2 才有「每会话一个引擎会话」）。
 ### 11.9 多 session 的脚本面（D57 / D58，随切片 C / T7.6）
 
 #### 11.9.1 pump 的两层（D57）

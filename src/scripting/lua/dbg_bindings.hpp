@@ -1,18 +1,21 @@
 ﻿#ifndef AUTODBG_SCRIPTING_LUA_DBG_BINDINGS_HPP
 #define AUTODBG_SCRIPTING_LUA_DBG_BINDINGS_HPP
 /* =============================================================================
- * src/scripting/lua/dbg_bindings.hpp —— `dbg` 表（T7.3 / plan_t7.md §2.1）
+ * src/scripting/lua/dbg_bindings.hpp —— `dbg` 表 + 会话对象（T7.3 / 切片 C1a）
  *
- * 来源：新写。形态照 `gui`：注册**一个全局表**（AGENTS.md §5 第 6 条），29 个契约名一个都不动。
- *   表内容：create / attach / pump / cont / detach / kill / step / eip / arm / hits / dropped /
- *   setcap / code / stopped / paused / caps / help（共 17 个）。
- *     · `create` = `Run` 的原语版（`CreateProcess` + `DEBUG_PROCESS`，选项表与 `Run` 同名）；
- *     · `attach` = `Attach` 的原语版（`DebugActiveProcess`，`dbg.attach(pid [, opts])`；Win95/98 没有附加能力）；
- *     · `detach` / `kill` = 两种收尾（D51）。**9x 上 `detach` 这个 key 根本不存在**
- *       （建表时 dynapi 探 `DebugActiveProcessStop`）—— 能力缺席，不是静默降级；旧 `close` 已删。
- *     · `caps` = 这台机器 / 这个 build 实际有什么（固定形状，机器可读，D53）；
- *     · `help` = `help('dbg')`（文本表只有一份，在 help_bindings.cpp）。
- *   便捷层（until / on_hit / 条件断点）是 Lua sugar，归 T7.6（新文件 + 新全局名），不在这里。
+ * 来源：新写。形态照 `gui` / `open_file`：注册**一个全局表** `dbg`（AGENTS.md §5 第 6 条），
+ *   29 个契约名一个都不动。
+ *
+ * 形状（切片 C1a：D55 / D57，仍限**单会话**）：
+ *   · `dbg.create{...}` / `dbg.attach(pid)` → **会话对象**（full userdata + metatable `AutoDbgSession`）；
+ *   · 对象方法：pump / cont / step / eip / arm / hits / dropped / setcap / stopped / paused / caps /
+ *     help / detach / kill（`detach` 只在平台有 `DebugActiveProcessStop` 时装，D51）；
+ *   · 对象字段：`stop`（当前未应答的事件表，与 `pump` 返回的是**同一张表**）/ `root_pid` / `kind` /
+ *     `state`（`running` / `stopped` / `exited`）；
+ *   · 模块级保留 create / attach / pump / cont / step / eip / arm / hits / dropped / setcap / stopped /
+ *     paused / detach / kill / caps / help —— 作用对象是**默认会话**（最近一次 create/attach 的那个）；
+ *   · registry 查询：`dbg.sessions()` / `dbg.session(pid)` / `dbg.last()`（D54）；
+ *   · `dbg.code()` 已删：事件表带 `code`（异常码）与 `cont_code`（core 算好的默认应答码）。
  *
  * 回调参数形状（新接口一律普通数字/字符串，不再用 LuaVariant）：`{ pid, tid, ea, code, modname, rva }`，
  *   与 `dbg.hits()` 的记录同名同义。回调键在**两个入口共用**：
@@ -30,6 +33,7 @@ namespace autodbg::host
 {
 void register_dbg_api(lua_State *L);
 
+/* `dbg_paused()` 查**默认会话**的 `d.stop`（`Run`/`Attach` 的门禁；没有会话 = 没停着事件）。 */
 bool        dbg_paused() noexcept;
 const char *dbg_error_reentry() noexcept;
 const char *dbg_error_paused()  noexcept;

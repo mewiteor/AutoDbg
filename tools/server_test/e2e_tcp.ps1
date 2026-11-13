@@ -617,9 +617,12 @@ Write-Output ''
 # _WIN64 判位数（§5 第 5 条的架构边界）⇒ x64 产物看 32 位节点会被跳过；64 口径下这段整段 SKIP。
 # 口径（本轮实测后钉死，见 plan_t7.md §9 第 8-11 条）：
 #   · 断点地址 = 模式命中地址 + 5（= 每条 int 3 被执行的那一条的地址）；模式在产物里必须只出现一次；
-#   · `pump` 的默认 code（`dbg.code()`）：首泵（首个 EXCEPTION_BREAKPOINT，m_first_bp）= DBG_CONTINUE
+#   · `pump` 的默认 code（事件表的 `ev.cont_code`）：首泵（首个 EXCEPTION_BREAKPOINT，m_first_bp）= DBG_CONTINUE
 #     = 65538；之后未武装的 int3 = DBG_EXCEPTION_NOT_HANDLED = 2147549185（这两条就是「与旧 run
 #     用的码一致」的可断形式）；
+#   · 切片 C1a（D55）：`pump` 返回**普通事件表**，`dbg.code()` 已删 —— code 分两个字段：
+#     `ev.code`（异常码，没有异常的事件 = 0）与 `ev.cont_code`（core 算好的默认应答码）；
+#     `d.stop` 就是那一张表（`d:pump` 缓存优先），`d:cont()` 成功后才清。
 #   · `hits()` 的 type：1=断点、2=异常、3=单步；记录只在 `on_breakpoint` 通道产生（arm 的回调不另记）。
 #   ❗fixture 的 int3 是**写死的指令**，不是 core 管的软件断点 ⇒ core 算出来的是 NOT_HANDLED，
 #     所以脚本想让它继续跑就必须显式 `dbg.cont(nil, nil, 0x00010002)`（= DBG_CONTINUE）。
@@ -681,85 +684,85 @@ else
         [IO.File]::WriteAllText($s1, @"
 local EXE = '$fxLua'
 local SITE = $($site.rva) + 5
-local ok, err = dbg.create{ imagepath = EXE }
-if not ok then print('create ' .. tostring(err)) return end
+local d, err = dbg.create{ imagepath = EXE }
+if not d then print('create ' .. tostring(err)) return end
 for i = 1, 24 do
-    local code = dbg.pump(3000, false)
-    if code == nil or code == 0 then break end
+    local ev = dbg.pump(3000, false)
+    if ev == nil then break end
     local h = dbg.hits()
     local last = h[#h]
     if last and last.type == 1 and last.rva == SITE then
         -- 目标停在 int3 之后那一条上：再泵一次是空转（进程被系统挂起），EIP 必须不动
-        local e1 = dbg.eip()
+        local e1 = d:eip()
         local idle = dbg.pump(300, false)
-        local e2 = dbg.eip()
+        local e2 = d:eip()
         print(string.format('paused=%s eip_after_int3=%s idle=%s eip_still=%s',
-            tostring(dbg.paused()), tostring(e1 == last.ea + 1), tostring(idle), tostring(e1 == e2)))
+            tostring(d:paused()), tostring(e1 == last.ea + 1), tostring(idle == nil), tostring(e1 == e2)))
         break
     end
     dbg.cont(nil, nil, 0x00010002)   -- DBG_CONTINUE：fixture 的 int3 是写死的，不显式放行就会终止
 end
-dbg.kill()
+d:kill()
 "@, (New-Object System.Text.UTF8Encoding($false)))
 
         $s2 = Join-Path $TmpDir 'pump_code.lua'
         [IO.File]::WriteAllText($s2, @"
-local ok, err = dbg.create{ imagepath = '$fxLua' }
-if not ok then print('create ' .. tostring(err)) return end
+local d, err = dbg.create{ imagepath = '$fxLua' }
+if not d then print('create ' .. tostring(err)) return end
 local codes, seen = {}, 0
 for i = 1, 24 do
-    local code = dbg.pump(3000, false)
-    if code == nil or code == 0 then break end
+    local ev = dbg.pump(3000, false)
+    if ev == nil then break end
     local h = dbg.hits()
-    if #h > seen then seen = #h; codes[#codes + 1] = dbg.code() end
+    if #h > seen then seen = #h; codes[#codes + 1] = ev.cont_code end
     if #codes >= 2 then break end
     dbg.cont(nil, nil, 0x00010002)
 end
-print('code1=' .. tostring(codes[1]) .. ' code2=' .. tostring(codes[2]))
-dbg.kill()
+print('cont1=' .. tostring(codes[1]) .. ' cont2=' .. tostring(codes[2]))
+d:kill()
 "@, (New-Object System.Text.UTF8Encoding($false)))
 
         $s3 = Join-Path $TmpDir 'pump_step.lua'
         [IO.File]::WriteAllText($s3, @"
-local ok, err = dbg.create{ imagepath = '$fxLua' }
-if not ok then print('create ' .. tostring(err)) return end
+local d, err = dbg.create{ imagepath = '$fxLua' }
+if not d then print('create ' .. tostring(err)) return end
 for i = 1, 14 do
-    local code = dbg.pump(3000, false)
-    if code == nil or code == 0 then break end
-    local h = dbg.hits()
+    local ev = d:pump(3000)
+    if ev == nil then break end
+    local h = d:hits()
     if #h == 1 then
-        print('step=' .. tostring(dbg.step()))
-        dbg.cont()
+        print('step=' .. tostring(d:step()))
+        d:cont()
         for j = 1, 6 do
-            local c2 = dbg.pump(3000, false)
-            if c2 == nil or c2 == 0 then break end
-            local h2 = dbg.hits()
+            local ev2 = d:pump(3000)
+            if ev2 == nil then break end
+            local h2 = d:hits()
             for k = 1, #h2 do if h2[k].type == 3 then print('steprec=' .. h2[k].type) end end
-            dbg.cont()
+            d:cont()
         end
         break
     end
-    dbg.cont(nil, nil, 0x00010002)
+    d:cont(0x00010002)
 end
-dbg.kill()
+d:kill()
 "@, (New-Object System.Text.UTF8Encoding($false)))
 
         $s4 = Join-Path $TmpDir 'pump_reentry.lua'
         [IO.File]::WriteAllText($s4, @"
 local EXE = '$fxLua'
-local ok, err = dbg.create{ imagepath = EXE, on_breakpoint = function(info)
+local d, err = dbg.create{ imagepath = EXE, on_breakpoint = function(info)
     local r, e = dbg.pump()
     print('reentry=' .. tostring(r) .. ' ' .. tostring(e))
 end }
-if not ok then print('create ' .. tostring(err)) return end
+if not d then print('create ' .. tostring(err)) return end
 for i = 1, 24 do
-    local code = dbg.pump(3000, false)
-    if code == nil or code == 0 then break end
+    local ev = dbg.pump(3000, false)
+    if ev == nil then break end
     if #dbg.hits() >= 1 then break end
     dbg.cont(nil, nil, 0x00010002)
 end
 print('runwhile=' .. tostring(select(2, pcall(Run, { imagepath = EXE }))))
-dbg.kill()
+d:kill()
 "@, (New-Object System.Text.UTF8Encoding($false)))
 
         # record-and-continue 分两段：
@@ -770,39 +773,41 @@ dbg.kill()
         $s5 = Join-Path $TmpDir 'pump_record.lua'
         [IO.File]::WriteAllText($s5, @"
 local EXE = '$fxLua'
-local ok, err = dbg.create{ imagepath = EXE }
-if not ok then print('create ' .. tostring(err)) return end
+local d, err = dbg.create{ imagepath = EXE }
+if not d then print('create ' .. tostring(err)) return end
 for i = 1, 40 do
-    local code = dbg.pump(3000, true)
-    if code == nil or code == 0 then break end
+    local ev = dbg.pump(3000, true)
+    if ev == nil then break end
     if dbg.stopped() then break end
 end
 print('autocont_hits=' .. #dbg.hits() .. ' autocont_paused=' .. tostring(dbg.paused()))
-dbg.kill()
+d:kill()
 
 local exited = nil
-ok, err = dbg.create{ imagepath = EXE, on_exit_process = function(info) exited = info.code end }
-if not ok then print('create2 ' .. tostring(err)) return end
+local d2
+d2, err = dbg.create{ imagepath = EXE, on_exit_process = function(info) exited = info.code end }
+if not d2 then print('create2 ' .. tostring(err)) return end
 print('cap=' .. tostring(dbg.setcap()) .. ' cap2=' .. tostring(dbg.setcap(2)) .. ' capbig=' .. tostring(dbg.setcap(200)))
 dbg.setcap(2)
 for i = 1, 60 do
-    local code = dbg.pump(3000, false)
-    if code == nil or code == 0 then break end
+    local ev = dbg.pump(3000, false)
+    if ev == nil then break end
     dbg.cont(nil, nil, 0x00010002)   -- 记录 + 显式放行
     if dbg.stopped() then break end
 end
 print(string.format('hits=%d dropped=%d exit=%s', #dbg.hits(), dbg.dropped(), tostring(exited)))
-dbg.kill()
+d2:kill()
 "@, (New-Object System.Text.UTF8Encoding($false)))
 
         $s6 = Join-Path $TmpDir 'pump_cancel.lua'
         [IO.File]::WriteAllText($s6, @"
-local ok, err = dbg.create{ imagepath = '$fxLua' }
-if not ok then print('create ' .. tostring(err)) return end
-print('event1=' .. tostring(dbg.pump(30000, false)))
-local code, e = dbg.pump(30000, false)             -- 目标停在未应答的事件上 ⇒ 这一泵是空转
-print('idle=' .. tostring(code) .. ' err=' .. tostring(e))
-dbg.kill()
+local d, err = dbg.create{ imagepath = '$fxLua' }
+if not d then print('create ' .. tostring(err)) return end
+local ev1 = dbg.pump(30000, false)
+print('event1=' .. tostring(ev1 and ev1.type))
+local ev2, e2 = dbg.pump(30000, false)             -- 目标停在未应答的事件上 ⇒ 这一泵是空转
+print('idle=' .. tostring(ev2) .. ' err=' .. tostring(e2))
+d:kill()
 "@, (New-Object System.Text.UTF8Encoding($false)))
 
         # `dbg.attach`：附到一个**已在跑**的 32 位目标（自己起的 64 位进程附不了：32 位调试器对 64 位目标会拿到
@@ -819,12 +824,12 @@ dbg.kill()
         [IO.File]::WriteAllText($s7, @"
 print('caps_detach=' .. tostring(dbg.caps().detach) .. ' detach_key=' .. tostring(dbg.detach ~= nil) ..
       ' close_key=' .. tostring(dbg.close))
-local ok, err = dbg.attach($($tgt.Id))
-print('attach=' .. tostring(ok) .. ' err=' .. tostring(err))
-if not ok then return end
-local ev = dbg.pump(2000, false)          -- CREATE_PROCESS：故意**不放行**
-print('create_process=' .. tostring(ev) .. ' paused=' .. tostring(dbg.paused()))
-print('detach=' .. tostring(dbg.detach()))
+local d, err = dbg.attach($($tgt.Id))
+print('attach=' .. tostring(d ~= nil) .. ' err=' .. tostring(err))
+if not d then return end
+local ev = d:pump(2000)                   -- CREATE_PROCESS：故意**不放行**
+print('create_process=' .. tostring(ev and ev.type) .. ' paused=' .. tostring(d:paused()))
+print('detach=' .. tostring(d:detach()))
 print('nopid=' .. tostring(select(2, dbg.attach(0))))
 print('badpid=' .. tostring(select(2, dbg.attach('x'))))
 print('after_detach=' .. tostring(select(2, dbg.pump(10, false))))
@@ -836,12 +841,12 @@ print('after_detach=' .. tostring(select(2, dbg.pump(10, false))))
 
             $r1 = Run-Client @("--remote=127.0.0.1:$Port", $s1)
             Check 'pump.no-auto-continue' ($site.count -eq 1 -and $r1.out -match 'paused=true' -and `
-                $r1.out -match 'eip_after_int3=true' -and $r1.out -match 'eip_still=true' -and $r1.out -match 'idle=0') `
+                $r1.out -match 'eip_after_int3=true' -and $r1.out -match 'eip_still=true' -and $r1.out -match 'idle=true') `
                 ("pattern=" + $site.count + " site=" + $siteHex + " out=[" + $r1.out + "]")
 
             $r2 = Run-Client @("--remote=127.0.0.1:$Port", $s2)
-            Check 'pump.default-code-parity' ($r2.out -match 'code1=65538' -and $r2.out -match 'code2=2147549185') `
-                "DBG_CONTINUE=65538 NOT_HANDLED=2147549185 out=[$($r2.out)]"
+            Check 'pump.default-code-parity' ($r2.out -match 'cont1=65538' -and $r2.out -match 'cont2=2147549185') `
+                "ev.cont_code: DBG_CONTINUE=65538 NOT_HANDLED=2147549185 out=[$($r2.out)]"
 
             $r3 = Run-Client @("--remote=127.0.0.1:$Port", $s3)
             Check 'pump.step' ($r3.out -match 'step=true' -and $r3.out -match 'steprec=3') "out=[$($r3.out)]"
@@ -879,7 +884,7 @@ print('after_detach=' .. tostring(select(2, dbg.pump(10, false))))
             try { $c2.Close() } catch { }
             }
 
-            # ⑦ attach + detach 的归属口径：`dbg.detach` 只分离（目标仍活着），`dbg.close` 已删
+            # ⑦ attach + detach 的归属口径：`d:detach` 只分离（目标仍活着），`dbg.close` 已删
             $r7 = Run-Client @("--remote=127.0.0.1:$Port", $s7)
             Start-Sleep -Milliseconds 400
             $tgt.Refresh()

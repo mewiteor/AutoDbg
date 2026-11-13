@@ -817,7 +817,7 @@ bool DebuggerSession::cont(DWORD pid, DWORD tid, DWORD code)
 
 /* end：收尾（原 `run` 的尾部）。
  * ❗T7.3：`to_detach()` 为真时先做**真 detach**（D47）—— 恢复断点原字节 + `DebugActiveProcessStop`，
- *   目标**继续活着**且 pid 不变（下次可再 `Attach`）。这是 `dbg.close()` 对「附加来的目标」的口径；
+ *   目标**继续活着**且 pid 不变（下次可再 `Attach`）。这是 `dbg.detach()` 对「附加来的目标」的口径；
  *   `Run`/`Attach` 的旧路径（`to_detach` 为假）行为一字不变。
  * 返回值：0 = 正常收尾（该终止就终止）；**1 = 要求 detach 但系统没有 `DebugActiveProcessStop`
  *   （Win95/98）⇒ 已降级成 terminate**（D47 的「能力上报」）；-1 保留给以后的错误。 */

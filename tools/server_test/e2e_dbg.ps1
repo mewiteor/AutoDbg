@@ -8,11 +8,16 @@
 # 用法：pwsh -File tools/server_test/e2e_dbg.ps1 [-Render 64|86] [-Variant ''|modern|legacy]
 # 退出码：0 = 全过；1 = 有失败；2 = 前置缺失（产物不存在 / x64+legacy 组合）
 #
-# 覆盖（切片 A）：
+# 覆盖（切片 A + C1a）：
 #   caps.*            这台机器/build 的事实：arch / variant / flavor / win9x / attach / detach / hits_cap
 #   detach.capability `dbg.detach` 存在且 `dbg.close` **已删**（D51：无隐式回退，能力缺席就是 nil）
 #   help.*            help() / help('dbg') / help('dbg.pump') / 未知主题 / 管道下纯文本（无 ESC）
-#   kill.*            dbg.kill 真的终止目标；之后状态复位（pump -> nil + "no session"）
+#   kill.*            d:kill 真的终止目标；之后状态复位（pump -> nil + "no session"）
+#   session.*         （切片 C1a / D54 / D55 / D57）
+#     identity          dbg.last() == dbg.session(root_pid)（**同一个 userdata**）
+#     pump-cache-first  d.stop 非空时 d:pump(0) 立即返回同一张表；code == 0 的事件也不清 d.stop
+#     event-table       事件表的八个字段齐全，type 是 DEBUG_EVENT 码（CREATE_PROCESS = 3）
+# ❗session.* / kill.* 需要 x86 的 fixture ⇒ x64 上这两段整段 SKIP（8 条）。
 # =============================================================================
 [CmdletBinding()]
 param(
@@ -121,25 +126,25 @@ Check 'help.plain-when-piped' ((-not $hasEsc) -and ($r.out -match 'dbg_help=true
 $fx = Join-Path $Root '.out/fixtures/x86_loop.exe'
 if ($Render -ne '86' -or -not (Test-Path $fx))
 {
-    Write-Output "SKIP: kill.* 需要 x86 的 fixture（.out/fixtures/x86_loop.exe）"
+    Write-Output "SKIP: kill.* / session.* 需要 x86 的 fixture（.out/fixtures/x86_loop.exe）"
 }
 else
 {
     $fxLua = $fx.Replace('\', '/')
     $s_kill = Write-Lua 'kill.lua' @"
-local ok, err = dbg.create{ imagepath = '$fxLua' }
-print('create=' .. tostring(ok) .. ' err=' .. tostring(err))
-if not ok then return end
+local d, err = dbg.create{ imagepath = '$fxLua' }
+print('create=' .. tostring(d ~= nil) .. ' err=' .. tostring(err))
+if not d then return end
 local tpid
 for i = 1, 12 do
-    local code = dbg.pump(2000, false)
-    if code == nil or code == 0 then break end
-    local h = dbg.hits()
+    local ev = d:pump(2000)
+    if ev == nil then break end
+    local h = d:hits()
     if #h >= 1 then tpid = h[1].pid break end
-    dbg.cont(nil, nil, 0x00010002)
+    d:cont(0x00010002)   -- DBG_CONTINUE：fixture 的 int3 是写死的，不显式放行就会终止
 end
 print('pid=' .. tostring(tpid))
-print('kill=' .. tostring(dbg.kill()))
+print('kill=' .. tostring(d:kill()))
 print('after=' .. tostring(select(2, dbg.pump(10, false))))
 "@
     $r = Run-Local $s_kill
@@ -150,8 +155,44 @@ print('after=' .. tostring(select(2, dbg.pump(10, false))))
     if ($tpid -gt 0) { $alive = $null -ne (Get-Process -Id $tpid -ErrorAction SilentlyContinue) }
     Check 'kill.terminates' ($r.out -match 'create=true' -and $r.out -match 'kill=true' -and $tpid -gt 0 -and -not $alive) `
         "pid=$tpid alive=$alive out=[$($r.out)]"
-    Check 'kill.state-reset' ($r.out -match 'after=dbg: no session \(call dbg.create or dbg.attach first\)') "out=[$($r.out)]"
+    Check 'kill.state-reset' ($r.out -match 'after=dbg: no session \(call dbg\.create or dbg\.attach first\)') "out=[$($r.out)]"
     if ($alive) { Stop-Process -Id $tpid -Force -ErrorAction SilentlyContinue }
+
+    # ------------------------------------------------------------ ④ session 对象（C1a）
+    $s_sess = Write-Lua 'session.lua' @"
+local EXE = '$fxLua'
+local d, err = dbg.create{ imagepath = EXE }
+print('obj=' .. tostring(d ~= nil) .. ' type=' .. type(d) .. ' err=' .. tostring(err))
+if not d then return end
+local pid = d.root_pid
+print('statics=' .. tostring(pid > 0) .. ' kind=' .. tostring(d.kind) .. ' state=' .. tostring(d.state))
+local ev = d:pump(3000)
+local fields = ev ~= nil and ev.type ~= nil and ev.pid ~= nil and ev.tid ~= nil and
+    ev.ea ~= nil and ev.modname ~= nil and ev.rva ~= nil and ev.code ~= nil and ev.cont_code ~= nil
+print('ev_type=' .. tostring(ev and ev.type) .. ' ev_fields=' .. tostring(fields) ..
+      ' ev_same=' .. tostring(ev ~= nil and ev == d.stop))
+print('ev_code=' .. tostring(ev and ev.code) .. ' ev_cont=' .. tostring(ev and ev.cont_code))
+local ev2 = d:pump(0)
+print('cache_first=' .. tostring(ev2 == ev) .. ' still=' .. tostring(d.stop ~= nil) ..
+      ' paused=' .. tostring(d:paused()))
+print('identity=' .. tostring(dbg.last() == dbg.session(pid)) ..
+      ' last_is_d=' .. tostring(dbg.last() == d))
+local ss = dbg.sessions()
+print('sessions=' .. #ss .. ' kind=' .. tostring(ss[1] and ss[1].kind) ..
+      ' bound=' .. tostring(ss[1] and ss[1].lua_bound))
+print('cont=' .. tostring(d:cont()) .. ' cleared=' .. tostring(d.stop == nil))
+print('kill=' .. tostring(d:kill()))
+"@
+    $r = Run-Local $s_sess
+    Check 'session.identity' ($r.out -match 'obj=true type=userdata' -and `
+        $r.out -match 'identity=true last_is_d=true' -and $r.out -match 'cont=true cleared=true') `
+        "dbg.last() 必须是 dbg.session(root_pid) 的**同一个** userdata；out=[$($r.out)]"
+    Check 'session.pump-cache-first' ($r.out -match 'cache_first=true still=true paused=true' -and `
+        $r.out -match 'ev_code=0' -and $r.out -match 'ev_same=true') `
+        "d.stop 非空 ⇒ d:pump(0) 立即返回同一张表；code == 0 的事件也不清 d.stop；out=[$($r.out)]"
+    Check 'session.event-table' ($r.out -match 'ev_type=3' -and $r.out -match 'ev_fields=true' -and `
+        $r.out -match 'ev_cont=65538' -and $r.out -match 'sessions=1 kind=create bound=true') `
+        "事件表八个字段齐全、type = CREATE_PROCESS_DEBUG_EVENT(3)；out=[$($r.out)]"
 }
 
 Write-Output ''
