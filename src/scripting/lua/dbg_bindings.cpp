@@ -15,9 +15,16 @@
  *
  * 切片 C1b（数据面接上对象）加了一组 `d:` 方法：`read` / `read_u8|u16|u32|u64` / `read_str` /
  *   `write` / `context` / `stack` / `mods` / `threads`。形状与对应的契约名同形（`ReadMemory` 的字节、
- *   `GetContext` 的键、`StackTrace` 的帧字段），差别只有 D52 要求的「LuaVariant → 普通整数」；
- *   「真实读取长度」靠 core 新增的 `read_some`（§2.2 第 12 条）。❗断点面（`bp` / `bp_hw` /
- *   `bps`）、`snapshot`/`restore`、`mem_regions` 不在本切片；代理在 C-remote。
+ *   `GetContext` 的键、`StackTrace` 的帧字段）；「真实读取长度」靠 core 新增的 `read_some`（§2.2 第 12 条）。
+ *   ❗断点面（`bp` / `bp_hw` / `bps`）、`snapshot`/`restore`、`mem_regions` 不在本切片；代理在 C-remote。
+ *
+ * 切片 C1c（类型统一）：新面里**地址类的值一律 LuaVariant**（`LV_UZ`）、小整数仍是 number。
+ *   反转了 C1b/T7.3 的「§2.1 第 3 条：新接口不用 LuaVariant」—— 完整口径、三条动机与比较陷阱
+ *   写在下面「类型统一（T7 切片 C1c）」那个注释块里（它是唯一真相源）。落点概览：
+ *   输出侧 `ev.ea` / `hits()[i].ea` / 用户回调的 `ea` / `mods()[i].base` / `stack()[i].ea` /
+ *   `d:context()` 的 `UPTR` 字段 / `d:eip()` / `d:read_u64()`；输入侧 `d:read*` / `read_str` /
+ *   `write` 的 `addr` 与 `d:context(tid, t)` 的字段值都**同时收** number 与 LuaVariant。
+ *   `d:arm` 的 rva 与 `ev.rva` **仍是普通 number**（D57：门禁大量依赖 `ev.rva == 0x1028`）。
  *
  * 切片 C2a（多会话 + **进程级事件路由**，plan_t7.md §10 / §11.9.1 / D57）：
  *   ① **每个会话自带引擎会话**（`new core::DebuggerSession`；`release_state` 释放）—— 之前所有会话共用
@@ -430,6 +437,64 @@ static void copy_name(char *out, size_t cap, LPCTSTR name)
 #endif
 }
 
+/* ---------------- 类型统一（T7 切片 C1c）：地址类值 = LuaVariant，小整数 = number ----------------
+ *
+ * 口径（写一次，下面各处的注释引用这里）：
+ *   地址 / 指针 / 指针宽的寄存器值 ⇒ **LuaVariant**（`LV_UZ` = x86 的 U32 / x64 的 U64）：
+ *     `ev.ea`、`hits()[i].ea`、`mods()[i].base`、`stack()[i].ea`、`d:context()` 里
+ *     `ctx_kind::UPTR` 的字段（`Cax…Cip` / `Dr0-Dr7` / x64 的 `R8-R15` 与 home 槽）、`d:eip()`；
+ *   **小整数 ⇒ 普通 number**：`pid/tid/type/code/cont_code/first_chance/rva/hits/dropped/size/index`、
+ *     `d:read_u8|u16|u32`、`ctx_kind::U32` 的字段（`EFlags/ContextFlags/Seg*`）与 `U64` 的字段
+ *     （`VectorControl`/`DebugControl`）、`dbg.sessions()` 的 `root_pid`、`dbg.caps()`、`d:arm` 的 rva；
+ *   `d:read_u64()` 是 **`LV_U64`**（宽度由函数名给出；x86 上 `LV_UZ` 是 4 字节，装不下 64 位读值）。
+ *
+ * 为什么不是「一律普通整数」（§2.1 第 3 条的旧口径就此反转，三条理由）：
+ *   ① 与 29 个契约名天然互通：`ReadMemory(ev.ea, 4)` / `Ea2ModnameRva(ev.ea)` 本来就吃 LuaVariant，
+ *      新面与 `GetModBase` 同型就省掉一层转换；
+ *   ② `jsonx.encode` 的 userdata 分支直接吐 `.val`（**十进制串、精确**）⇒ `--json` 的 `result`
+ *      与 `dbglib` 的远端过线对 x64 地址不再「静默丢低位」（`jsonx` 的 number 分支是 `%.14g`）；
+ *   ③ 远端代理的 `{"__i":…}` 兜底不再是地址类值的唯一出路（编码侧改走 `__u64`，解码兼容旧对端）。
+ *
+ * ❗比较的陷阱（门禁与脚本都要知道）：`__eq` 只在**两边 variant 类型相同**时才比（`variant.cpp`
+ *   的 `lua_variant_eq`）；`__lt`/`__le` 会跨类型。x86 上 `ev.ea` 是 `LV_U32` 而 `d:read_u64`
+ *   是 `LV_U64`，`ev.ea + 1` 经 `lv_simple` 还可能被**窄化**成 U16 之类 ⇒ 凡可能跨宽度/窄化的比较
+ *   一律用 `.val`（十进制串）或 `tostring`（hex），不要赌 `==`。
+ * ------------------------------------------------------------------------------------------- */
+
+/* userdata 是不是 LuaVariant：比较元表，**不**用 `luaL_checkudata`（它会 `lua_error` 长跳，
+ * 而这里要的是「判假后由调用方当值报错」；会话句柄 / 连接句柄也是 userdata）。 */
+static bool is_lua_variant(lua_State *L, int idx)
+{
+    if (!lua_getmetatable(L, idx)) return false;
+    luaL_getmetatable(L, "LuaVariant");
+    bool same = lua_rawequal(L, -1, -2) != 0;
+    lua_pop(L, 2);
+    return same;
+}
+
+/* 地址类的值怎么推给 Lua：`LV_UZ` = 指针宽（x86 = U32 / x64 = U64）。`size_t` 与 `val.uz`
+ * 在两种架构上宽度一致 ⇒ 直接赋值，不需要按 `_WIN64` 分叉。 */
+static void push_ea(lua_State *L, size_t v)
+{
+    lv_push(L, LV_UZ)->val.uz = v;
+}
+
+/* 地址类实参：number 与 LuaVariant **都收**（C1c）。
+ * ❗`lv_check` 本身不动 —— 29 个契约名依赖它的严格语义（`ReadMemory` 只吃 UZ）。
+ * number 一侧仍用 `lua_isnumber`（与改前一致：数字串也照旧收）。 */
+static bool arg_num_or_lv(lua_State *L, int idx, uint64_t *out)
+{
+    if (lua_type(L, idx) == LUA_TUSERDATA)
+    {
+        if (!is_lua_variant(L, idx)) return false;
+        *out = (uint64_t)lv_check(L, idx, LV_ANY)->val.uz;   /* `uz` 随架构展开成 u32/u64 */
+        return true;
+    }
+    if (!lua_isnumber(L, idx)) return false;
+    *out = (uint64_t)lua_tointeger(L, idx);
+    return true;
+}
+
 /* ---------------- 命中窗口 ---------------- */
 
 /* T7 切片 D2a：把一条命中记录作为 `event` 帧（16）发给**当前执行连接**。
@@ -538,7 +603,7 @@ static void push_hit_table(lua_State *L, SessionState *st)
         lua_pushinteger(L, (lua_Integer)r.type);         lua_setfield(L, -2, "type");
         lua_pushinteger(L, (lua_Integer)r.pid);          lua_setfield(L, -2, "pid");
         lua_pushinteger(L, (lua_Integer)r.tid);          lua_setfield(L, -2, "tid");
-        lua_pushinteger(L, (lua_Integer)r.ea);           lua_setfield(L, -2, "ea");
+        push_ea(L, r.ea);                                lua_setfield(L, -2, "ea");
         lua_pushstring(L, r.modname);                    lua_setfield(L, -2, "modname");
         lua_pushinteger(L, (lua_Integer)r.rva);          lua_setfield(L, -2, "rva");
         lua_pushinteger(L, (lua_Integer)r.code);         lua_setfield(L, -2, "code");
@@ -561,7 +626,7 @@ static void push_event_table(lua_State *L, SessionState *st, int type, int from_
     lua_pushinteger(L, (lua_Integer)type);                            lua_setfield(L, -2, "type");
     lua_pushinteger(L, (lua_Integer)st->last_pid);                    lua_setfield(L, -2, "pid");
     lua_pushinteger(L, (lua_Integer)st->last_tid);                    lua_setfield(L, -2, "tid");
-    lua_pushinteger(L, (lua_Integer)(hit ? hit->ea : 0));             lua_setfield(L, -2, "ea");
+    push_ea(L, hit ? hit->ea : 0);                                    lua_setfield(L, -2, "ea");
     lua_pushstring(L, hit ? hit->modname : "");                       lua_setfield(L, -2, "modname");
     lua_pushinteger(L, (lua_Integer)(hit ? hit->rva : 0));            lua_setfield(L, -2, "rva");
     lua_pushinteger(L, (lua_Integer)(hit ? hit->code : 0));           lua_setfield(L, -2, "code");
@@ -572,8 +637,9 @@ static void push_event_table(lua_State *L, SessionState *st, int type, int from_
     push_handle(L, st);                                               lua_setfield(L, -2, "session");
 }
 
-/* 用户回调的参数形状（§2.1 第 3 条：新接口一律普通数字/字符串，不再用 LuaVariant）：
- *   { pid, tid, ea, code, modname, rva } —— 与 `hits()` 的记录同名同义（AI 侧只学一套字段）。
+/* 用户回调的参数形状：`{ pid, tid, ea, code, modname, rva }` —— 与 `hits()` 的记录同名同义
+ * （AI 侧只学一套字段）⇒ 同一个字段名在两个通道里**必须同型**，所以 `ea` 也是 LuaVariant
+ * （C1c 的类型口径见上面的注释块；`rva`/`code`/`pid`/`tid` 仍是小整数）。
  * `ref == LUA_NOREF` ⇒ 没有回调：**仍然记录**（记录与回调是两条独立通道）。 */
 static void call_user(SessionState *st, int ref, DWORD pid, DWORD tid, size_t ea, DWORD code,
                       LPCTSTR modname, DWORD rva)
@@ -589,7 +655,7 @@ static void call_user(SessionState *st, int ref, DWORD pid, DWORD tid, size_t ea
     lua_createtable(L, 0, 6);
     lua_pushinteger(L, (lua_Integer)pid);  lua_setfield(L, -2, "pid");
     lua_pushinteger(L, (lua_Integer)tid);  lua_setfield(L, -2, "tid");
-    lua_pushinteger(L, (lua_Integer)ea);   lua_setfield(L, -2, "ea");
+    push_ea(L, ea);                        lua_setfield(L, -2, "ea");
     lua_pushinteger(L, (lua_Integer)code); lua_setfield(L, -2, "code");
     lua_pushstring(L, modbuf);             lua_setfield(L, -2, "modname");
     lua_pushinteger(L, (lua_Integer)rva);  lua_setfield(L, -2, "rva");
@@ -881,10 +947,12 @@ static int fail_two(lua_State *L, const char *a, const char *b)
 static int do_read(lua_State *L, SessionState *st, int base)
 {
     if (!st->started) return fail(L, kErrNoSess);
-    if (!lua_isnumber(L, base)) return fail(L, "d:read: addr (number) expected");
+
+    uint64_t a64;
+    if (!arg_num_or_lv(L, base, &a64)) return fail(L, "d:read: addr (number or LuaVariant) expected");
     if (!lua_isnumber(L, base + 1)) return fail(L, "d:read: size (number) expected");
 
-    size_t addr = (size_t)lua_tointeger(L, base);
+    size_t addr = (size_t)a64;
     size_t size = (size_t)lua_tointeger(L, base + 1);
     if (!addr || !size) return fail(L, "d:read: addr and size must be positive");
 
@@ -904,13 +972,17 @@ static int do_read(lua_State *L, SessionState *st, int base)
     return 1;
 }
 
-/* `d:read_u8/u16/u32/u64(addr)` → 整数（小端，宽度由函数名给出，D52）。读不到 ⇒ `nil, err`。 */
-static int read_int(lua_State *L, SessionState *st, int base, size_t nbytes)
+/* `d:read_u8/u16/u32(addr)` → 普通 number；`d:read_u64(addr)` → `LV_U64` variant
+ * （宽度由函数名给出，D52；x86 上 `LV_UZ` 是 4 字节，装不下 64 位读值 ⇒ u64 必须走 LV_U64）。
+ * 读不到 ⇒ `nil, err`。 */
+static int read_int(lua_State *L, SessionState *st, int base, size_t nbytes, bool as_variant)
 {
     if (!st->started) return fail(L, kErrNoSess);
-    if (!lua_isnumber(L, base)) return fail(L, "d:read_*: addr (number) expected");
 
-    size_t addr = (size_t)lua_tointeger(L, base);
+    uint64_t a64;
+    if (!arg_num_or_lv(L, base, &a64)) return fail(L, "d:read_*: addr (number or LuaVariant) expected");
+
+    size_t addr = (size_t)a64;
     BYTE   buf[8];
     if (!addr) return fail(L, "d:read_*: addr must be positive");
 
@@ -923,14 +995,15 @@ static int read_int(lua_State *L, SessionState *st, int base, size_t nbytes)
 
     uint64_t v = 0; /* 显式按字节拼：目标地址可能不对齐，不能直接解引用成 uint32_t/uint64_t */
     for (size_t i = 0; i < nbytes; i++) v |= (uint64_t)buf[i] << (8 * i);
-    push_u64(L, v);
+    if (as_variant) lv_push(L, LV_U64)->val.u64 = v;
+    else            push_u64(L, v);
     return 1;
 }
 
-static int do_read_u8(lua_State *L, SessionState *st, int base)  { return read_int(L, st, base, 1); }
-static int do_read_u16(lua_State *L, SessionState *st, int base) { return read_int(L, st, base, 2); }
-static int do_read_u32(lua_State *L, SessionState *st, int base) { return read_int(L, st, base, 4); }
-static int do_read_u64(lua_State *L, SessionState *st, int base) { return read_int(L, st, base, 8); }
+static int do_read_u8(lua_State *L, SessionState *st, int base)  { return read_int(L, st, base, 1, false); }
+static int do_read_u16(lua_State *L, SessionState *st, int base) { return read_int(L, st, base, 2, false); }
+static int do_read_u32(lua_State *L, SessionState *st, int base) { return read_int(L, st, base, 4, false); }
+static int do_read_u64(lua_State *L, SessionState *st, int base) { return read_int(L, st, base, 8, true); }
 
 /* `d:read_str(addr)` → 以 NUL 结尾的字节串。复用 core 的 `loadstr`（`LoadStr` 用的同一个函数），
  * 所以语义逐字一致：每 16 字节一块、不含结尾 NUL、**字节原样**（不转码 —— UNICODE 变体也不转，
@@ -938,9 +1011,11 @@ static int do_read_u64(lua_State *L, SessionState *st, int base) { return read_i
 static int do_read_str(lua_State *L, SessionState *st, int base)
 {
     if (!st->started) return fail(L, kErrNoSess);
-    if (!lua_isnumber(L, base)) return fail(L, "d:read_str: addr (number) expected");
 
-    size_t addr = (size_t)lua_tointeger(L, base);
+    uint64_t a64;
+    if (!arg_num_or_lv(L, base, &a64)) return fail(L, "d:read_str: addr (number or LuaVariant) expected");
+
+    size_t addr = (size_t)a64;
     if (!addr) return fail(L, "d:read_str: addr must be positive");
 
     char  *s   = nullptr;
@@ -969,9 +1044,11 @@ static int do_read_str(lua_State *L, SessionState *st, int base)
 static int do_write(lua_State *L, SessionState *st, int base)
 {
     if (!st->started) return fail(L, kErrNoSess);
-    if (!lua_isnumber(L, base)) return fail(L, "d:write: addr (number) expected");
 
-    size_t addr = (size_t)lua_tointeger(L, base);
+    uint64_t a64;
+    if (!arg_num_or_lv(L, base, &a64)) return fail(L, "d:write: addr (number or LuaVariant) expected");
+
+    size_t addr = (size_t)a64;
     if (!addr) return fail(L, "d:write: addr must be positive");
 
     const void *data = nullptr;
@@ -1041,7 +1118,7 @@ static int do_context(lua_State *L, SessionState *st, int base)
             {
             case core::ctx_kind::U32 : lua_pushinteger(L, (lua_Integer)(*(const uint32_t *)p)); break;
             case core::ctx_kind::U64 : push_u64(L, *(const uint64_t *)p); break;
-            case core::ctx_kind::UPTR: push_u64(L, (uint64_t)(*(const size_t *)p)); break;
+            case core::ctx_kind::UPTR: push_ea(L, *(const size_t *)p); break;   /* C1c：指针宽 ⇒ LuaVariant */
             case core::ctx_kind::M128:
             {
                 /* M128A = { Low, High }（与 `GetContext` 暴露的两个 64 位半部同名） */
@@ -1058,7 +1135,8 @@ static int do_context(lua_State *L, SessionState *st, int base)
     }
 
     /* setter：只写表里出现的键（`nil` = 不改；**未知键按 `SetContext` 的既有口径忽略**）；
-     * 值不是数字（M128 不是 {Low, High}）⇒ 指名报错，**一个字节都不写**（不写半套）。 */
+     * 值不是数字/地址（M128 不是 {Low, High}）⇒ 指名报错，**一个字节都不写**（不写半套）。
+     * ❗读与写用**同一套**列：UPTR 收 number 也收 LuaVariant（`arg_num_or_lv`），其余只收数字。 */
     for (size_t i = 0; i < count; i++)
     {
         lua_getfield(L, base + 1, fields[i].name);
@@ -1071,20 +1149,22 @@ static int do_context(lua_State *L, SessionState *st, int base)
                 if (t != LUA_TTABLE) { lua_pop(L, 1); return fail_two(L, "d:context: bad value for ", fields[i].name); }
                 lua_getfield(L, -1, "Low");
                 lua_getfield(L, -2, "High");
-                if (!lua_isnumber(L, -2) || !lua_isnumber(L, -1))
+                uint64_t lo = 0;
+                uint64_t hi = 0;
+                if (!arg_num_or_lv(L, -2, &lo) || !arg_num_or_lv(L, -1, &hi))
                 {
                     lua_pop(L, 3);
                     return fail_two(L, "d:context: bad value for ", fields[i].name);
                 }
                 uint64_t *q = (uint64_t *)p;
-                q[0]        = (uint64_t)lua_tointeger(L, -2);
-                q[1]        = (uint64_t)lua_tointeger(L, -1);
+                q[0]        = lo;
+                q[1]        = hi;
                 lua_pop(L, 2);
             }
             else
             {
-                if (t != LUA_TNUMBER) { lua_pop(L, 1); return fail_two(L, "d:context: bad value for ", fields[i].name); }
-                uint64_t v = (uint64_t)lua_tointeger(L, -1);
+                uint64_t v = 0;
+                if (!arg_num_or_lv(L, -1, &v)) { lua_pop(L, 1); return fail_two(L, "d:context: bad value for ", fields[i].name); }
                 switch (fields[i].kind)
                 {
                 case core::ctx_kind::U32 : *(uint32_t *)p = (uint32_t)v; break;
@@ -1189,7 +1269,7 @@ static int do_stack(lua_State *L, SessionState *st, int base)
         lua_createtable(L, 0, 4);         /* 帧表：字段名与迭代器的返回值一一对应 */
         lua_pushinteger(L, frame_value(L, iter + 2));
         lua_setfield(L, -2, "index");
-        lua_pushinteger(L, frame_value(L, iter + 3));
+        push_ea(L, (size_t)frame_value(L, iter + 3));   /* C1c：帧地址是地址类值 ⇒ LuaVariant */
         lua_setfield(L, -2, "ea");
         if (lua_type(L, iter + 4) == LUA_TSTRING) lua_pushvalue(L, iter + 4);
         else                                     lua_pushliteral(L, "");
@@ -1224,7 +1304,7 @@ static int do_mods(lua_State *L, SessionState *st)
 
         lua_createtable(L, 0, 4);
         lua_pushstring(L, namebuf);                          lua_setfield(L, -2, "name");
-        lua_pushinteger(L, (lua_Integer)pe->base);           lua_setfield(L, -2, "base");
+        push_ea(L, (size_t)pe->base);                        lua_setfield(L, -2, "base");   /* C1c：地址 ⇒ LuaVariant（`size` 仍是 number） */
         lua_pushinteger(L, (lua_Integer)pe->size);           lua_setfield(L, -2, "size");
         /* 完整路径转 UTF-8（UNICODE 变体下 `utf16_to_utf8` 是分配来的，用完释放） */
 #ifdef _UNICODE
@@ -1632,9 +1712,9 @@ static int do_eip(lua_State *L, SessionState *st, int base)
     ctx.ContextFlags = CONTEXT_CONTROL;
     if (!st->sess->get_context(h, CONTEXT_CONTROL, &ctx)) return fail(L, "dbg.eip: GetThreadContext failed");
 #ifdef _WIN64
-    lua_pushinteger(L, (lua_Integer)ctx.Rip);
+    push_ea(L, (size_t)ctx.Rip);
 #else
-    lua_pushinteger(L, (lua_Integer)ctx.Eip);
+    push_ea(L, (size_t)ctx.Eip);
 #endif
     return 1;
 }

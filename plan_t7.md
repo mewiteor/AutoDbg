@@ -555,7 +555,7 @@ type  pid  tid  ea  modname  rva  code  first_chance  cont_code
 顺序硬约束：**A 必须早于 C**（`detach`/`kill` 就是 Session 对象的方法）；**C 必须早于 D**（REPL 里
 人/AI 都按对象写）。29 个旧名在 C 期间转成对象 API 的薄转发（行为逐字节不变，`session.default-parity`
 守门），退役留给之后的 D 条目。
-### 11.8 切片 A / B / C1a / C1b / C2a / sugar / D1 / D2a / D2b / C-remote 落地状态（已提交）
+### 11.8 切片 A / B / C1a / C1b / C1c / C2a / sugar / D1 / D2a / D2b / C-remote 落地状态（已提交）
 
 - `src/common/platform.{hpp,cpp}`（新文件）：`is_win9x()` / `is_nt()`（`GetVersionExA` 的 `dwPlatformId`，与启动器 `detect_variant()` 同一判据）+ `arch_name` / `variant_name` / `flavor_name`（收拢一处，免得 caps / help / info 各写一份字符串）。❗为什么不用编译开关：`/DAUTODBG_WIN9X` 是「要能在 9x 上跑」的**构建约束**，legacy 产物在 Win11 上也跑；而 caps 报的是**这台机器**。
 - `src/scripting/lua/help_bindings.{hpp,cpp}`（新文件）：`help([topic])` 与 `dbg.help()` 共用 `kHelp[]` 一张表，`help('dbg')` 是**前缀匹配生成的成员列表**（不存在第二份）。输出走 `PrintS` ⇒ server 模式自动进 `out` 帧、本地进控制台/管道，本层不碰句柄。正文是**窄串字面量**（现代变体 UTF-8、legacy CP936，`PrintS` 各自转成 console 需要的形式）；**主题名与签名保持 ASCII**（门禁逐字匹配）。❗legacy 编译警告 **C4566** 的教训：`⇒` / `❗` 这类字符**不能出现在字符串字面量里**（CP936 表示不出），注释里可以 —— 帮助正文里一律用 `->` 与「注意：」。
@@ -652,6 +652,19 @@ U32(5) == U32(5)  -> true     U32(5) == 5  -> false   ← 真正的坑：跨类�
 ```
 
 元表里 `__add/__sub/__mul/__div/__mod/__pow/__unm/__eq/__lt/__le/__idiv/__shl/__shr/__band/__bor/__bxor/__bnot` 都在。所以「`GetModBase(...) + 0x1028` 变成 `0x28`」**在本机复现不出来**；更可能的真身是**宽度不匹配**：`SetBreakpoint` 里是 `lv_check(L, -1, LV_U32)->val.u32`，而 `GetModBase` 在 x64 返回 `LV_U64`（`LV_UZ` 在 x64 = `LV_U64`），`lv_check` 的 U64→U32 转换表里没有这一项；x86 上 `LV_UZ` 恰好吃好是 `LV_U32`，所以「同一脚本在 32 位对、64 位上错」。今后引用这条时按「跨类型比较 + 宽度不匹配」写，不要写成「算术 bug」。
+**切片 C1c（类型统一：地址类 = LuaVariant）**：
+
+- **口径**（D59）：地址/指针/指针宽的寄存器值 ⇒ **LuaVariant**；小整数 ⇒ number。具体：
+
+  | LuaVariant（`LV_UZ`） | number |
+  | --- | --- |
+  | `ev.ea`、`hits()[i].ea`、`d:mods()[i].base`、`d:stack()[i].ea`、`d:eip()`、`d:read_u64()`（这条用 `LV_U64`） | `pid/tid/type/code/cont_code/rva/first_chance/hits/dropped/size/index`、`d:read_u8` / `d:read_u16` / `d:read_u32`、`d:context()` 的 `U32/U64/M128` 字段 |
+
+  用户回调载荷的 `ea` 也一起改（与 `hits()` 记录同名同义，两个通道不能一个 variant 一个 number）。入参地址 **number 与 LuaVariant 都收**（`arg_num_or_lv`），`lv_check` 一个字节没动。
+- **`context_fields()` 的 kind 表就是语义真相**（不按名字特判）：`R8-R15` / `P1Home-P6Home` / `LastBranch*Rip` / `LastException*Rip` 的 kind 从 `U64` 改成 **`UPTR`**（`R8/R9` 是 Win64 的第 3/4 个传参寄存器、home 槽指针/整数两用、Last* 是指令指针）；`VectorControl`/`DebugControl` 保持 `U64`（控制/标志 ⇒ number），`MxCsr` 已是 `U32`，`Xmm*` 是 `M128`。❗对 29 名零影响：x64 上 `UPTR` 与 `U64` 同宽同内存，x86 上这些字段不存在 —— `e2e_json`/`e2e_gui` 复核过。
+- `dbglib`：`encode_value` 把 LuaVariant 编成 `{"__u64":"<十进制>"}`（取 `x.val`），`decode_value` 用 `U64(串)` 还原（走 `strtoull`，不经 Lua double）；`__i` 的**解码**保留兼容，编码侧不再用它。
+- 门禁：`e2e_dbg` 28 → **29**（`session.lv-types`：`type(ev.ea)=userdata`、`type(ev.rva)=number`、`type(mods().base)=userdata`、`type(read_u32)=number`、`type(read_u64)=userdata`、`type(context().Cip)=userdata`、`type(context().EFlags)=number`、`jsonx.encode(U64(...))` 里无 `e+`，以及 `ReadMemory(ev.ea, …)` 直接可用）。既有断言里凡跨类型/跨宽度的比较改走 `.val`/`tostring`（`__eq` 只在同型才成立）。
+- 实测：`e2e_dbg` 86 **29** / 86 legacy 29 / 64 8；`e2e_tcp` 59/59/51；`e2e_repl` 10；`e2e_json` 32；`e2e_gui` 21（86 与 64）；`check_skill` 16；`nvim_smoke` 32；`--selftest` 73；导入表 13。手工：`tostring(U32(0x401000))`=`0x00401000`、`.hex`=`401000`、`jsonx.encode(U64("140699000000000"))`=`140699000000000` vs `jsonx.encode(140699000000000)`=`1.40699e+014`。
 ### 11.9 多 session 的脚本面（D57 / D58，随切片 C / T7.6）
 
 #### 11.9.1 pump 的两层（D57）

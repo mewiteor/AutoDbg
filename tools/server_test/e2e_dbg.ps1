@@ -23,14 +23,21 @@
 #     context           d:context() 的 `Cip` = 停住那条 int3 的**下一条**；d:context(nil, {Cax=…})
 #                       部分更新返回 true 且读回生效（键名与 `GetContext` 逐字一致：x86 是 `Cax…Cip`）
 #     mods-threads      d:mods() 有 name 含 x86_loop.exe 且 base > 0；d:threads() 含事件的 tid
+#   session.lv-types（C1c 类型统一）—— 新面里地址类值一律 LuaVariant、小整数仍是 number：
+#                        type(ev.ea)=='userdata' 且 tostring 以 0x 开头、type(ev.rva)=='number'、
+#                        type(d:mods()[1].base)=='userdata'、type(d:read_u32(base))=='number'、
+#                        type(d:read_u64(base))=='userdata'、type(d:context().Cip)=='userdata'、
+#                        type(d:context().EFlags)=='number'；jsonx.encode(变体) 走 `.val`（无 `e+`）
+#                        ⇒ 精确；同一现场再验证「29 名直接吃 variant」：ReadMemory(ev.ea, U32(4))
 #   session.default-parity（C2a 回归门禁，plan_t7.md §11.9.1）—— 同一脚本里用**契约名**与**会话方法**
 #                       读同一个事实并逐字节比对：dbg 会话活着时，29 个契约名必须作用在**同一个**引擎上
 #                       （而不是宿主那个空会话）：
 #     GetModBase('x86_loop.exe')   == d:mods() 里那一项的 base（归一后比）
-#     ReadMemory(U32(ea), U32(4))  == d:read(ea, 4) 的四个字节
-#     Ea2ModnameRva(U32(ea))       == 由 d:mods() 推出的 (modname, rva)
+#     ReadMemory(ea, U32(4))       == d:read(ea, 4) 的四个字节（`ea` 直接交变体：29 名就吃这个型）
+#     Ea2ModnameRva(ea)            == 由 d:mods() 推出的 (modname, rva)
 #                       ❗归一：LuaVariant 取 `.val`（十进制字符串）、number 取 `tostring`，两边
-#                         都成十进制串再比 —— 所以 `d:mods().base` 将来变成 LuaVariant 也照样过。
+#                         都成十进制串再比 —— C1c 之后 `d:mods().base` 也是 LuaVariant，所以两边
+#                         都走 `.val`（跨宽度与窄化都不赌 `__eq`，见 dbg_bindings.cpp 的口径块）。
 #   C2a（多会话 + 进程级事件路由，plan_t7.md §10 / §11.9.1 / D57）—— 起**两个**同名 fixture 实例：
 #     session.multi-two-stopped   两个会话各自 arm 到自己的 site → 循环 dbg.pump(300) 直到两边都 paused
 #                                 （有界轮数 + stopped() 双判）；两者 stop.rva == site、sessions() == 2
@@ -53,10 +60,10 @@
 #     remote.pump-context    `d:pump` 拿到事件表（type 1/3，`ev.session` 填回代理对象），
 #                            `d:context().Cip > 0`（远端是 64 位，键仍是 `Cip`）⇒「32 位调试器 + 64 位目标」
 #     remote.data-plane      `d:read(m.base, 4)` = 四字节 PE 头 / `d:read_u16` 是 number
-#                            （字节走 `__hex`、≥1e14 的地址走 `__i`，见 dbglib.lua 的文件头）
+#                            （字节走 `__hex`、LuaVariant 走 `__u64` 十进制串，见 dbglib.lua 的文件头）
 #     remote.teardown        `d:kill()` 真终止那个 64 位目标（PowerShell 用 Get-Process 复查）
 # ❗session.* / kill.* / C2a 的 4 条 / sugar.* 的 2 条 / remote.* 的 4 条都需要 x86 宿主（前四段还要
-#   x86 fixture）⇒ x64 上这几段整段 SKIP（8 条）。
+#   x86 fixture）⇒ x64 上这几段整段 SKIP（8 条）。x86（含 legacy）是 **29** 条（C1c 加了 session.lv-types）。
 # =============================================================================
 [CmdletBinding()]
 param(
@@ -275,6 +282,10 @@ print('kill=' .. tostring(d:kill()))
     $s_data = Write-Lua 'data.lua' @"
 local EXE = '$fxLua'
 local SITE = $($site.rva) + 5
+-- 新面的地址类值是 LuaVariant（`.val` = 十进制串、`tostring`/`.hex` = hex）。
+-- ❗跨宽度与可能被窄化的比较不赌 `__eq`，统一走十进制串（dbg_bindings.cpp 的 C1c 口径块）。
+local function dec(v) return type(v) == 'userdata' and v.val or tostring(v) end
+local function same_addr(a, b) return dec(a) == dec(b) end
 local d, err = dbg.create{ imagepath = EXE }
 print('data_obj=' .. tostring(d ~= nil) .. ' err=' .. tostring(err))
 if not d then return end
@@ -288,7 +299,7 @@ local hit = false
 for i = 1, 24 do
     ev = d:pump(3000)
     if ev == nil then break end
-    if base and ev.ea == base + SITE then hit = true break end
+    if base and same_addr(ev.ea, base + SITE) then hit = true break end
     d:cont(0x00010002)
 end
 print('hit=' .. tostring(hit) .. ' base_pos=' .. tostring(base ~= nil and base > 0))
@@ -310,11 +321,12 @@ local bad, berr = d:read(0x7FFF0000, 16)
 print('bad=' .. tostring(bad) .. ' err=' .. tostring(berr))
 
 -- session.context
+-- `Cip` 是 UPTR ⇒ LuaVariant（`.hex` 是不补零的大写 hex，等价于原来的 `%X`）；`Cax` 同理。
 local ctx = d:context()
-print('cip=0x' .. string.format('%X', ctx.Cip) .. ' want=0x' .. string.format('%X', base + SITE + 1))
-print('set=' .. tostring(d:context(nil, { Cax = 0x1234 })) .. ' cax=0x' .. string.format('%X', d:context().Cax))
+print('cip=0x' .. ctx.Cip.hex .. ' want=0x' .. (base + SITE + 1).hex)
+print('set=' .. tostring(d:context(nil, { Cax = 0x1234 })) .. ' cax=0x' .. d:context().Cax.hex)
 d:context(nil, { Cax = ctx.Cax })
-print('restored=' .. tostring(d:context().Cax == ctx.Cax))
+print('restored=' .. tostring(dec(d:context().Cax) == dec(ctx.Cax)))
 
 -- session.mods-threads
 local modok = false
@@ -350,6 +362,79 @@ print('kill=' .. tostring(d:kill()))
     Check 'session.mods-threads' ($r.out -match 'mod_ok=true' -and $r.out -match 'nthreads=[1-9]\d* tid_ok=true') `
         "d:mods() 有 x86_loop.exe 且 base > 0；d:threads() 含事件 tid；out=[$($r.out)]"
 
+    # ------------------------------------------ ⑤c 类型统一（C1c）：地址 = LuaVariant，小整数 = number
+    # 一条断言把「新面两种类型」钉在同一个现场上：命中一次（事件的 ea 非 0）就停住，然后逐个看类型。
+    # ❗`d:read_u64` 是 LV_U64 而 `ev.ea` 在 x86 上是 LV_U32 ⇒ 这里只断言 `type()`，不做跨宽度 `==`。
+    $s_lv = Write-Lua 'lvtypes.lua' @"
+local EXE = '$fxLua'
+local d, err = dbg.create{ imagepath = EXE }
+print('lv_obj=' .. tostring(d ~= nil) .. ' err=' .. tostring(err))
+if not d then return end
+local ev = d:pump(3000)      -- 先吃掉 CREATE_PROCESS，否则模块表还是空的（`d:mods()` 拿不到 base）
+local base
+for _, m in ipairs(d:mods()) do
+    if m.name and string.lower(m.name):find('x86_loop.exe', 1, true) then base = m.base end
+end
+if ev then d:cont(0x00010002) end
+-- 泵到「这一泵里有命中记录且 ea 非 0」为止（CREATE_PROCESS 那一泵的 ea 是 0）
+for i = 1, 24 do
+    ev = d:pump(3000)
+    if ev == nil then break end
+    if ev.ea ~= nil and ev.ea.val ~= '0' then break end
+    d:cont(0x00010002)
+end
+if ev == nil or ev.ea == nil or ev.ea.val == '0' then
+    print('lv_hit=false')
+    d:kill()
+    return
+end
+if base == nil then
+    print('lv_base=false')
+    d:kill()
+    return
+end
+
+local ctx  = d:context()
+local mods = d:mods()
+local ea_obj   = type(ev.ea) == 'userdata'
+local ea_hex   = string.sub(tostring(ev.ea), 1, 2) == '0x'
+local rva_num  = type(ev.rva) == 'number'
+local base_obj = type(mods[1] and mods[1].base) == 'userdata'
+local size_num = type(mods[1] and mods[1].size) == 'number'
+local u8_num   = type(d:read_u8(base)) == 'number'
+local u32_num  = type(d:read_u32(base)) == 'number'
+local u64_obj  = type(d:read_u64(base)) == 'userdata'
+local cip_obj  = type(ctx.Cip) == 'userdata'
+local efl_num  = type(ctx.EFlags) == 'number'
+
+-- jsonx：userdata 分支直接吐 `.val`（十进制、精确）⇒ 15 位的值不会变成 `1.40699e+14`；
+-- 对照的**普通 number** 走 `%.14g`，必然带 `e+` —— 这就是 C1c 的第 ② 条动机。
+local jv = jsonx.encode(d:read_u64(base))
+local ju = jsonx.encode(U64('140699000000000'))
+local jn = jsonx.encode(140699000000000)
+local precise = string.find(jv, 'e+', 1, true) == nil and
+                string.find(ju, 'e+', 1, true) == nil and
+                string.find(jn, 'e+', 1, true) ~= nil
+
+-- 29 名直接吃 variant：ReadMemory 的 addr 走 lv_check(..., LV_UZ) ⇒ ev.ea 原样能进
+local mem29 = ReadMemory(ev.ea, U32(4)) ~= nil
+
+print('lv_ea=' .. tostring(ea_obj) .. ' ea_hex=' .. tostring(ea_hex) ..
+      ' rva_num=' .. tostring(rva_num) .. ' base_obj=' .. tostring(base_obj) ..
+      ' size_num=' .. tostring(size_num))
+print('lv_regs=' .. tostring(u8_num) .. '/' .. tostring(u32_num) .. '/' .. tostring(u64_obj) ..
+      ' cip_obj=' .. tostring(cip_obj) .. ' eflags_num=' .. tostring(efl_num))
+print('lv_json=u64:' .. jv .. ' u64big:' .. ju .. ' num:' .. jn .. ' precise=' .. tostring(precise))
+print('lv_29=' .. tostring(mem29))
+print('kill=' .. tostring(d:kill()))
+"@
+    $r = Run-Local $s_lv
+    Check 'session.lv-types' ($r.out -match 'lv_obj=true' -and `
+        $r.out -match 'lv_ea=true ea_hex=true rva_num=true base_obj=true size_num=true' -and `
+        $r.out -match 'lv_regs=true/true/true cip_obj=true eflags_num=true' -and `
+        $r.out -match 'precise=true' -and $r.out -match 'lv_29=true' -and $r.out -match 'kill=true') `
+        "新面的地址类值 = LuaVariant（ev.ea / mods().base / read_u64 / context().Cip）、小整数 = number（ev.rva / mods().size / read_u8|u32 / EFlags）；jsonx.encode(变体) 精确（无 e+）且 ReadMemory(ev.ea, U32(4)) 能通；out=[$($r.out)]"
+
     # ------------------------------------------ ⑤b 契约名 vs 会话方法（C2a 回归：default-parity）
     # 现场：dbg 会话活着（`g_default == st`）且**停住**在 fixture 的 int3 上。此时 29 个契约名走的
     # `current_session()` 必须就是本会话的引擎：三组值逐字节相同才算通过。
@@ -377,8 +462,8 @@ for _, m in ipairs(d:mods()) do
     if m.name and string.lower(m.name):find('x86_loop.exe', 1, true) then base = m.base end
 end
 
--- 归一：LuaVariant（userdata，`.val` 是十进制字符串）取 `.val`；number 用 tostring
--- （下一切片把 d:mods().base 也变成 LuaVariant 时，这条断言照样过）
+-- 归一：LuaVariant（userdata，`.val` 是十进制字符串）取 `.val`；number 用 tostring。
+-- C1c 之后会话方法给的地址类值也是 LuaVariant，所以两边都走 `.val`（不赌 `__eq`）。
 local function dec(v)
     if type(v) == 'userdata' or type(v) == 'table' then return tostring(v.val) end
     return tostring(v)
@@ -389,24 +474,25 @@ local function hexbytes(t, is_table)
     return table.concat(h, ' ')
 end
 
--- ① GetModBase（契约名，LuaVariant）vs d:mods().base（会话方法，现在是 number）
+-- ① GetModBase（契约名，LuaVariant）vs d:mods().base（会话方法，C1c 起也是 LuaVariant）
 local cbase = GetModBase('x86_loop.exe')
 print('p_base_contract=' .. (cbase ~= nil and dec(cbase) or 'nil') ..
       ' session=' .. dec(base) ..
       ' same=' .. tostring(cbase ~= nil and base ~= nil and dec(cbase) == dec(base)))
 
--- ② ReadMemory(LuaVariant 参数) vs d:read(number 参数)：四个字节相同
-local cmem = ReadMemory(U32(base + SITE - 5), U32(4))
+-- ② ReadMemory(LuaVariant 参数) vs d:read(同族的地址值)：四个字节相同
+-- （`base + SITE - 5` 已经是 LuaVariant，直接交给契约名 —— 这就是 C1c 要的「天然互通」）
+local cmem = ReadMemory(base + SITE - 5, U32(4))
 local smem = d:read(base + SITE - 5, 4)
 print('p_read_contract=' .. hexbytes(cmem, true) .. ' session=' .. hexbytes(smem, false) ..
       ' same=' .. tostring(hexbytes(cmem, true) == hexbytes(smem, false)))
 
 -- ③ Ea2ModnameRva(LuaVariant) vs 由 d:mods() 推出的 (modname, rva)
-local cmod, crva = Ea2ModnameRva(U32(base + SITE))
+local cmod, crva = Ea2ModnameRva(base + SITE)
 local want_rva = (base + SITE) - base
 print('p_ea_contract=' .. tostring(cmod) .. '/' .. (crva ~= nil and dec(crva) or 'nil') ..
-      ' session=x86_loop.exe/' .. tostring(want_rva) ..
-      ' same=' .. tostring(tostring(cmod) == 'x86_loop.exe' and crva ~= nil and dec(crva) == tostring(want_rva)))
+      ' session=x86_loop.exe/' .. dec(want_rva) ..
+      ' same=' .. tostring(tostring(cmod) == 'x86_loop.exe' and crva ~= nil and dec(crva) == dec(want_rva)))
 
 -- 收尾之后契约名必须回到宿主会话（空引擎 ⇒ nil），不能悬在已删除的会话上
 print('kill=' .. tostring(d:kill()))

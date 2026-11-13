@@ -268,13 +268,19 @@ end
 --   传输原语在 C（`dbg.remote_open` / `remote_xfer` / `remote_close`，复用了 `client.cpp` 的
 --     `--remote` 连接/发帧/收帧 —— 不写第二套 TCP）；**JSON 编解码留在 Lua**（D28：C 侧不写 parser）。
 --
--- 过线的两种标记（两端共用 `encode_value` / `decode_value`）：
+-- 过线的三种标记（两端共用 `encode_value` / `decode_value`）：
 --   `{ __hex = "B8444250…" }`  字节串。`read` / `read_str` 的**返回值**、`write` 的**第二个参数**。
 --                             JSON 承载不了任意字节（既不是 UTF-8，也可能含 NUL）。
---   `{ __i = "140699000000000" }` ≥1e14 的整数。`jsonx.encode` 的数字是 `%.14g`（**14 位有效数字**），
---                             x64 的模块基址（`0x7FF6xxxxxxxx` ≈ 1.4e14，15 位）会在那里丢掉低位，
---                             于是 `d:read(m.base, 4)` 就摸到错地址。十进制串过线再 `tonumber`
---                             还原（Lua 的 number 到 2^53 精确，这也是 Lua 5.1/LuaJIT 本来的边界）。
+--   `{ __u64 = "140699000000000" }` **LuaVariant**（地址类值：`ev.ea` / `mods().base` /
+--                             `read_u64` / `context()` 的 UPTR 字段…，见 dbg_bindings.cpp 的类型口径）。
+--                             取 `x.val`（**十进制串**）过线，解码侧用 `U64(那个串)` 还原 —— `U64(str)`
+--                             走 strtoull，**不经过 Lua 的 double**，所以 x64 的 15 位地址一位都不丢。
+--                             （`tostring` 对大值给 hex、小值反而给十进制，两种形态混在一起，
+--                             不能当载荷格式；`x.val` 则一律十进制。）
+--   `{ __i = "140699000000000" }`  ≥1e14 的**普通 number**。`jsonx.encode` 的数字是 `%.14g`（14 位
+--                             有效数字），number 过线会在那里丢掉低位 ⇒ 十进制串过线再 `tonumber`。
+--                             C1c 起地址类值不再走这条路（它们本来就是 LuaVariant，走 `__u64`）；
+--                             这一支只给真的传了 number 的场景用，**解码**保留为兼容旧对端。
 --
 -- **能力边界**（写进注释就是契约，不是待办项）：
 --   · 函数 / userdata / session 对象**不能过线**（回调、`d:bp(..., cb)` 之类的参数得留在本机）
@@ -330,9 +336,19 @@ local function hex_decode(s)
     return table.concat(out)
 end
 
+-- LuaVariant 的识别：比**元表**（拿一份 `U64(0)` 当探针），不猜字段 —— `d:read` 的返回是 string、
+-- session / conn 也是 userdata，只有 LuaVariant 的元表带 `__add`/`__eq`/`val` 那套。
+-- `U64` 是 C 侧 `lv_init` 注册的全局（state 建起来就有），与「`dbg` 要调用时取」不是同一回事。
+local lv_meta = nil
+local function variant_decimal(v)
+    if lv_meta == nil then lv_meta = getmetatable(U64(0)) end
+    if getmetatable(v) ~= lv_meta then return nil end
+    return v.val          -- `.val` 是**十进制**串（`tostring` 是 hex，且小值会变十进制）
+end
+
 -- 值 → 可 JSON 化的值（`bytes` = 这一层的字符串是字节载荷）。
--- ❗编不了的对象（function / userdata / thread / NaN / inf）一律 `error('unserializable')` ——
---   调用方 pcall 接住并转成 `{"ok":false,...}`，不把 Lua 错误抛回去。
+-- ❗编不了的对象（function / 非 LuaVariant 的 userdata / thread / NaN / inf）一律
+--   `error('unserializable')` —— 调用方 pcall 接住并转成 `{"ok":false,...}`，不把 Lua 错误抛回去。
 local function encode_value(v, bytes)
     local t = type(v)
     if t == 'nil' or t == 'boolean' then return v end
@@ -348,6 +364,11 @@ local function encode_value(v, bytes)
         if bytes then return { __hex = hex_encode(v) } end
         return v
     end
+    if t == 'userdata' then
+        local d = variant_decimal(v)
+        if d == nil then error('unserializable', 0) end
+        return { __u64 = d }
+    end
     if t == 'table' then
         local r = {}
         for k, x in pairs(v) do r[k] = encode_value(x, false) end
@@ -356,13 +377,17 @@ local function encode_value(v, bytes)
     error('unserializable', 0)
 end
 
--- 反序列化：把 `__hex` / `__i` / `__nil` 标记还原（两端共用；`__nil` = 显式占位的 nil 参数）。
+-- 反序列化：把 `__hex` / `__u64` / `__i` / `__nil` 标记还原（两端共用；`__nil` = 显式占位的 nil 参数）。
 local function decode_value(v)
     if type(v) ~= 'table' then return v end
     if type(v.__hex) == 'string' then
         local s = hex_decode(v.__hex)
         if s == nil then error('bad __hex marker', 0) end
         return s
+    end
+    if type(v.__u64) == 'string' then
+        -- ❗拿**串**造变体（`U64("140699…")` 走 strtoull）：不经过 Lua 的 double，> 2^53 也精确
+        return U64(v.__u64)
     end
     if type(v.__i) == 'string' then
         local n = tonumber(v.__i)

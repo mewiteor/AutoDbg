@@ -711,6 +711,10 @@ else
         [IO.File]::WriteAllText($s1, @"
 local EXE = '$fxLua'
 local SITE = $($site.rva) + 5
+-- 新面的地址类值是 LuaVariant（`.val` = 十进制串、`tostring` = hex）。
+-- ❗不赌 `__eq`：`d:eip()` 是 LV_UZ，而 `last.ea + 1` 经 lv_simple 可能被窄化成 U16 之类
+--   （跨宽度不同型），统一走十进制串（dbg_bindings.cpp 的 C1c 口径块）。
+local function dec(v) return type(v) == 'userdata' and v.val or tostring(v) end
 local d, err = dbg.create{ imagepath = EXE }
 if not d then print('create ' .. tostring(err)) return end
 for i = 1, 24 do
@@ -724,7 +728,8 @@ for i = 1, 24 do
         local idle = dbg.pump(300, false)
         local e2 = d:eip()
         print(string.format('paused=%s eip_after_int3=%s idle=%s eip_still=%s',
-            tostring(d:paused()), tostring(e1 == last.ea + 1), tostring(idle == nil), tostring(e1 == e2)))
+            tostring(d:paused()), tostring(dec(e1) == dec(last.ea + 1)), tostring(idle == nil),
+            tostring(dec(e1) == dec(e2))))
         break
     end
     dbg.cont(nil, nil, 0x00010002)   -- DBG_CONTINUE：fixture 的 int3 是写死的，不显式放行就会终止

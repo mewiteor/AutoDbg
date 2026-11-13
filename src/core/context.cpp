@@ -6,6 +6,16 @@
  *   SET_FIELD_32  -> ctx_kind::U32      SET_FIELD_64 -> ctx_kind::U64
  *   SET_FIELD_Z   -> ctx_kind::UPTR       SET_FIELD_ZT -> uz（键名加 C 前缀；寄存器 R 或 E 前缀）
  *   SET_FIELD_128 -> ctx_kind::M128     #ifdef _WIN64 区 → 原样保留为 x64 专属区
+ *
+ * T7 切片 C1c（类型统一）改了 x64 专属区的几条 `kind`（**不是**加字段、也不是改顺序）：
+ *   `R8-R15` / `P1Home-P6Home` / `LastBranch*Rip` / `LastException*Rip` 从 U64 → UPTR。
+ *   它们装的是指针（`R8`/`R9` 是 Win64 的第 3/4 个传参寄存器；home 槽按整数/指针两用；
+ *   `LastBranch*` 是指令指针），而 `UPTR` 是这张表里「指针宽」的唯一真相 ⇒ 新面（`dbg` 会话）
+ *   可以只按 kind 分流就把它们推成 LuaVariant，不需要第二份名字名单。
+ *   `VectorControl` / `DebugControl` 保持 U64（控制寄存器/标志，不是地址）；`Dr0-Dr7` 本来就是
+ *   UPTR（`Dr6`/`Dr7` 其实是标志位，但为「按 kind 单一真相源」接受这个代价）。
+ *   ❗对 29 个契约名（`GetContext`/`SetContext`）零影响：x64 上 UPTR 与 U64 都是 8 字节、
+ *     读写用同一块内存（`*(size_t*)` vs `*(uint64_t*)`），x86 上这些字段根本不存在。
  * ========================================================================== */
 #include "context.hpp"
 #include "core.hpp" /* P6.4：引擎函数是会话成员（本 TU 多数定义即成员，直接用自身状态） */
@@ -59,21 +69,21 @@ static const ctx_field k_context_fields[] = {
     { "Cip", offsetof(CONTEXT, Eip), ctx_kind::UPTR },
 #endif
 #ifdef _WIN64   /* x64 专属字段（37 项） */
-    { "P1Home", offsetof(CONTEXT, P1Home), ctx_kind::U64 },
-    { "P2Home", offsetof(CONTEXT, P2Home), ctx_kind::U64 },
-    { "P3Home", offsetof(CONTEXT, P3Home), ctx_kind::U64 },
-    { "P4Home", offsetof(CONTEXT, P4Home), ctx_kind::U64 },
-    { "P5Home", offsetof(CONTEXT, P5Home), ctx_kind::U64 },
-    { "P6Home", offsetof(CONTEXT, P6Home), ctx_kind::U64 },
+    { "P1Home", offsetof(CONTEXT, P1Home), ctx_kind::UPTR },
+    { "P2Home", offsetof(CONTEXT, P2Home), ctx_kind::UPTR },
+    { "P3Home", offsetof(CONTEXT, P3Home), ctx_kind::UPTR },
+    { "P4Home", offsetof(CONTEXT, P4Home), ctx_kind::UPTR },
+    { "P5Home", offsetof(CONTEXT, P5Home), ctx_kind::UPTR },
+    { "P6Home", offsetof(CONTEXT, P6Home), ctx_kind::UPTR },
     { "MxCsr", offsetof(CONTEXT, MxCsr), ctx_kind::U32 },
-    { "R8", offsetof(CONTEXT, R8), ctx_kind::U64 },
-    { "R9", offsetof(CONTEXT, R9), ctx_kind::U64 },
-    { "R10", offsetof(CONTEXT, R10), ctx_kind::U64 },
-    { "R11", offsetof(CONTEXT, R11), ctx_kind::U64 },
-    { "R12", offsetof(CONTEXT, R12), ctx_kind::U64 },
-    { "R13", offsetof(CONTEXT, R13), ctx_kind::U64 },
-    { "R14", offsetof(CONTEXT, R14), ctx_kind::U64 },
-    { "R15", offsetof(CONTEXT, R15), ctx_kind::U64 },
+    { "R8", offsetof(CONTEXT, R8), ctx_kind::UPTR },
+    { "R9", offsetof(CONTEXT, R9), ctx_kind::UPTR },
+    { "R10", offsetof(CONTEXT, R10), ctx_kind::UPTR },
+    { "R11", offsetof(CONTEXT, R11), ctx_kind::UPTR },
+    { "R12", offsetof(CONTEXT, R12), ctx_kind::UPTR },
+    { "R13", offsetof(CONTEXT, R13), ctx_kind::UPTR },
+    { "R14", offsetof(CONTEXT, R14), ctx_kind::UPTR },
+    { "R15", offsetof(CONTEXT, R15), ctx_kind::UPTR },
     { "Xmm0", offsetof(CONTEXT, Xmm0), ctx_kind::M128 },
     { "Xmm1", offsetof(CONTEXT, Xmm1), ctx_kind::M128 },
     { "Xmm2", offsetof(CONTEXT, Xmm2), ctx_kind::M128 },
@@ -92,10 +102,10 @@ static const ctx_field k_context_fields[] = {
     { "Xmm15", offsetof(CONTEXT, Xmm15), ctx_kind::M128 },
     { "VectorControl", offsetof(CONTEXT, VectorControl), ctx_kind::U64 },
     { "DebugControl", offsetof(CONTEXT, DebugControl), ctx_kind::U64 },
-    { "LastBranchToRip", offsetof(CONTEXT, LastBranchToRip), ctx_kind::U64 },
-    { "LastBranchFromRip", offsetof(CONTEXT, LastBranchFromRip), ctx_kind::U64 },
-    { "LastExceptionToRip", offsetof(CONTEXT, LastExceptionToRip), ctx_kind::U64 },
-    { "LastExceptionFromRip", offsetof(CONTEXT, LastExceptionFromRip), ctx_kind::U64 },
+    { "LastBranchToRip", offsetof(CONTEXT, LastBranchToRip), ctx_kind::UPTR },
+    { "LastBranchFromRip", offsetof(CONTEXT, LastBranchFromRip), ctx_kind::UPTR },
+    { "LastExceptionToRip", offsetof(CONTEXT, LastExceptionToRip), ctx_kind::UPTR },
+    { "LastExceptionFromRip", offsetof(CONTEXT, LastExceptionFromRip), ctx_kind::UPTR },
 #endif
 };
 
