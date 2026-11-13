@@ -35,6 +35,9 @@ print(arg, raw)
 ```
 
 - `V(x)` 的 `x` 可以是数字、`U32()`，也可以是**寄存器（LuaVariant）**——它的值会被当地址。
+- ❗`V(...)` 只在**调试回调**里可用：顶层 / REPL 里它返回 `nil, msg`（REPL 里 `V` 干脆是 `nil`）。
+  顶层读指针链用会话绑定的 **`d:v(addr)`**（`d:v(base)[0x10]:to('I')`），详见
+  `references/lua-api.md` 的「V 与 d:v：指针链走查」；代理（`dbg.remote`）上两者都没有。
 - 目标位数决定寄存器宽度：x64 目标上 `Ccx` 就是 64 位的 `RCX`（`Csp` = `RSP`）；
   AutoDbg server 自己是 x64，**不影响** `GetContext` 返回的是目标的上下文。
 - 别把 64 位地址塞进 `U32`（会被截断）。
@@ -44,7 +47,7 @@ print(arg, raw)
 ```lua
 local buf, err = ReadMemory(V(addr), U32(16))  -- ❗返回 byte table（1..n）；不可读 → nil, err
                                                -- ❗两个参数都必填（少一个会直接抛错）
-local v32 = V(addr):to("I")                 -- 读 uint32（Var:to 用**单字母**）
+local v32 = V(addr):to("I")                 -- 读 uint32（Var:to 用**单字母**；回调里，顶层换 d:v）
 WriteMemory(V(addr), { 0x90, 0x90 })        -- byte table
 ```
 

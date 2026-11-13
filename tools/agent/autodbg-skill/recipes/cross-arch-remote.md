@@ -109,6 +109,9 @@ print('close', h:close())
 - **回调过不了线**：`d:arm(mod, rva, cb)` 在代理上必失败
   （`nil, 'dbg.remote: argument cannot cross the wire (function/userdata/Nan)'`）。断点只能在
   **远端**那个 state 里武装；代理这侧负责 `pump` / `cont` / 数据面 / 收尾。
+- **`d:v` 在代理上不存在**：`SESSION_METHODS` 白名单里没有 `v` ⇒ `d:v(addr)` 是普通 Lua 错误
+  `unknown method 'v'`（`Var` 的载荷带本机引擎指针，本来也过不了线）。指针链用 `d:read_u64` /
+  `d:read_u32` 逐跳读；`V()` 同理也不行（它只在**本机**的调试回调里有意义）。
 - **单条命令 4096 字节上限**（`--repl` 的 chunk 上限）⇒ `d:write` 一次别超过约 **1.8 KB**
   （字节过线是十六进制，一个字节两个字符 + 命令本身的开销）。超了按语法错（`3`）失败。
 - **`open_file` 在代理路径上不支持**：代理连接把 `open` / `data` / `read_req` / `close` 帧一律丢弃，

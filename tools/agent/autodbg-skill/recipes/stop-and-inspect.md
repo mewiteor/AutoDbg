@@ -119,14 +119,18 @@ a:kill(); b:kill()
   `d:cont(0x00010002)`。
 - **别把 `arm` 打在本来就写着 `CC` 的地址上**（会反复命中）；靶子自带的 `int 3` 只能显式
   `d:cont(0x00010002)` 放行。
-- **地址类是 LuaVariant，小整数是 number**：`ev.ea` / `m.base` / `stack()[i].ea` / `context()` 的
-  `Cax…Cip`（以及 `Dr*` / x64 的 `R8-R15`）`d:eip()` / `read_u64` 都是 **LuaVariant**；
+- **地址类是 LuaVariant，小整数是 number**：`ev.ea` / `m.base` / `stack()[i].ea` / `d:eip()` /
+  `read_u64` 都是 **LuaVariant**；`d:context()` 更彻底 —— **所有字段都是 LuaVariant**（C1d 起，与
+  `GetContext` 逐字段同型：`Cax…Cip` / `Dr*` / x64 的 `R8-R15` 是 `LV_UZ`，`EFlags` / `Seg*` /
+  `MxCsr` 是 `LV_U32`，`VectorControl` / `DebugControl` 是 `LV_U64`，`Xmm*` 是 `{ Low, High }` 两个 variant）；
   `pid` / `tid` / `type` / `code` / `cont_code` / `rva` / `size` / `index` / `read_u8|u16|u32` 是
   **普通 number**。比较一律比 `.val`（十进制串）或 `.hex`（大写 hex、无前缀），**不要** `ev.ea == 0x…`
   （`__eq` 只在两边同型时成立，`U32(5) == 5` 都是 false）；要算术先 `tonumber(x.val)` 落地成数字。
   完整口径见 `references/lua-api.md` 的「字段类型」/「地址类值的比较与算术」与仓库 `PITFALLS.md` 的 **S25**。
 - **`context()` 的键是 `Cax Cbx Ccx Cdx Csi Cdi Csp Cbp Cip`**（不是 `Eax`/`Eip`），另加
-  `EFlags` / `SegGs…` / `Dr*`；x64 才有 `R8-R15` / `Xmm0-15`（`{ Low, High }`）。
+  `EFlags` / `SegGs…` / `Dr*`；x64 才有 `R8-R15` / `Xmm0-15`（`{ Low, High }`）。❗这些字段**全部是
+  LuaVariant**（C1d 起；`Xmm*` 的两个半部也是）—— 打印用 `.hex` / `.val`；`d:context(nil, t)` 的 setter
+  仍两种都收（`{ Cip = 0x401000 }` 与 `{ Cip = c.Cip }` 一样有效）。
 - 停住时 `Cip` 与 `ev.ea` 的关系要看**是哪种事件**（实测，同一份靶子）：
   · `d:arm` 武装的断点被引擎**压回 EIP** ⇒ `c.Cip.val == ev.ea.val`；停住时引擎已把**原字节写回**
     （`d:read` 读到的是原指令、不是 `CC`），原指令还没执行，`cont` 时才重新补 `0xCC`；

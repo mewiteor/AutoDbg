@@ -14,6 +14,10 @@ default, `d:cont()` / `d:step()` drive it, `d:context()` / `d:read()` inspect th
 `dbglib` sugar (`wait_all` / `run_all`). Ask the runtime what this build has: `dbg.caps()`;
 human prose: `help([topic])` / `dbg.help()`. Interactive Lua from stdin: `--repl`.
 
+**Pointer chains**: `V(addr)` works **only inside a debug callback** (top level / REPL: it returns
+`nil, msg`, and in the REPL `V` is simply `nil`). At top level use the session-bound **`d:v(addr)`**:
+`d:v(base)[0x10]:to('I')`. On a `dbg.remote` proxy neither exists — use `d:read_u32` / `d:read_u64`.
+
 ## Fast path
 
 ```bat
@@ -59,7 +63,7 @@ if d.detach then d:detach() else d:kill() end
 | File | When |
 | --- | --- |
 | `references/cli.md` | CLI flags, `--repl`, `--json` envelope, raw-TCP frames (proto **2**, `event` frame), control commands (`--cancel` / `--kill` / `--detach`) |
-| `references/lua-api.md` | every Lua global: **`dbg` session objects + `dbglib`**, `help()`/`dbg.caps()`, then the 29 frozen names `Run`/`Attach`/`SetBreakpoint`/`ReadMemory`/`FindMemory`/`GetContext`/`V()`/`gui.*`/`open_file` |
+| `references/lua-api.md` | every Lua global: **`dbg` session objects + `dbglib`**, `V`/`d:v` pointer chains, `help()`/`dbg.caps()`, then the 29 frozen names `Run`/`Attach`/`SetBreakpoint`/`ReadMemory`/`FindMemory`/`GetContext`/`V()`/`gui.*`/`open_file` |
 | `references/pitfalls.md` | the traps that cost the most time (callback-only logic, `ReadMemory` shape, callback file I/O, cancel semantics) |
 
 ## Execution model (do not fight it)

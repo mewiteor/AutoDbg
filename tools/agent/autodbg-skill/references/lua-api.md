@@ -135,7 +135,7 @@ local str = d:read_str(addr)          -- 以 NUL 结尾的字节串（不转码�
 d:write(addr, "\x90\x90")             -- 字节串原样写
 d:write(addr, 0x1234)                 -- 整数 = u32 小端 4 字节
 
-local c = d:context()                 -- 整张寄存器表（地址类键是 LuaVariant；x64 的 Xmm* 是 { Low=, High= }）
+local c = d:context()                 -- 整张寄存器表：**所有字段都是 LuaVariant**；x64 的 Xmm* 是 { Low=, High= }（两个 variant）
 d:context(nil, { Cax = 0x1234 })      -- **部分更新**（只写表里出现的键）→ true / nil, err
 local frames = d:stack()              -- { {index, ea, modname, rva}, … }（栈回溯，与 StackTrace 同形）
 for _, m in ipairs(d:mods()) do end   -- { name, base, size, path }（base 是 LuaVariant，size 是 number）
@@ -146,12 +146,14 @@ for _, t in ipairs(d:threads()) do end-- { {tid}, … }
   **`Cax Cbx Ccx Cdx Csi Cdi Csp Cbp Cip`** + `ContextFlags` / `EFlags` / `SegGs…SegSs` / `Dr0-Dr3` /
   `Dr6` / `Dr7`；x64 另加 `R8-R15`、`Xmm0-15`（`{Low, High}`）、`P1Home…P6Home`、`MxCsr`、
   `VectorControl`、`DebugControl`、`LastBranch*`。**不是** `Eax`/`Eip`/`Rip`。
-  ❗**值类型按 `ctx_kind` 分流**：`UPTR` 的键（`Cax…Cip`、`Dr0-Dr7`、x64 的 `R8-R15` /
-  `P1Home…P6Home` / `LastBranch*Rip` / `LastException*Rip`）是 **LuaVariant**；`U32` 的键
-  （`ContextFlags` / `EFlags` / `SegGs…SegSs` / `MxCsr`）与 `U64` 的键（`VectorControl` /
-  `DebugControl`）是**普通 number**；`M128` 的键（`Xmm0-15`）是 `{ Low, High }` 表。
+  ❗**所有字段都是 LuaVariant**（切片 C1d 起，与契约名 `GetContext` **逐字段同型**）：`UPTR` 的键
+  （`Cax…Cip`、`Dr0-Dr7`、x64 的 `R8-R15` / `P1Home…P6Home` / `LastBranch*Rip` /
+  `LastException*Rip`）是 `LV_UZ`；`U32` 的键（`ContextFlags` / `EFlags` / `SegGs…SegSs` /
+  `MxCsr`）是 `LV_U32`；`U64` 的键（`VectorControl` / `DebugControl`）是 `LV_U64`；`M128` 的键
+  （`Xmm0-15`）是 `{ Low, High }` 两个 `LV_U64`。⇒ 打印一律 `.hex` / `.val`，**不要**
+  `string.format('%X', c.Cip)`（variant 不是 number，见下面「地址类值的比较与算术」）。
   **setter 两种都收**：`d:context(nil, { Cip = 0x401000 })` 与 `d:context(nil, { Cip = c.Cip })`
-  一样有效（地址类键走 `arg_num_or_lv`）。
+  一样有效（`arg_num_or_lv`），`{ EFlags = 0x202 }` 也不必先包 `U32()`。
 - 缺省 tid = 当前停住的那个线程（`d.stop.tid`），没有未应答事件时退到最近一条事件的 tid；
   要看别的线程就**显式**给 tid。
 - `d:read(addr, n)` 与契约名 `ReadMemory` 的差别只有形状：那边返回字节数组、部分读被吞成整体失败；
@@ -169,13 +171,13 @@ for _, t in ipairs(d:threads()) do end-- { {tid}, … }
 | 同上 | `size` | number |
 | `d:stack()` | `ea` | **LuaVariant**（`modname` 是 string） |
 | 同上 | `index` / `rva` | number |
-| `d:context()` | `ctx_kind::UPTR` 的键 | **LuaVariant** |
-| 同上 | `ctx_kind::U32` / `U64` 的键 | number |
-| 同上 | `ctx_kind::M128` 的键（x64 `Xmm*`） | 表 `{ Low, High }`（两个 number） |
+| `d:context()` | **所有**标量键（`ctx_kind::U32` / `U64` / `UPTR`） | **LuaVariant**（`LV_U32` / `LV_U64` / `LV_UZ`；与 `GetContext` **逐字段同型**） |
+| 同上 | `ctx_kind::M128` 的键（x64 `Xmm*`） | 表 `{ Low, High }`（两个 **LuaVariant**，`LV_U64`） |
 | `d:eip()` | 返回值 | **LuaVariant** |
 | `d:read_u64()` | 返回值 | **LuaVariant**（`LV_U64`：宽度由函数名给出，x86 上也不截断） |
 | `d:read_u8/u16/u32()` | 返回值 | number |
 | `d:read()` / `d:read_str()` | 返回值 | string（字节串） |
+| `d:v(addr)` | 返回值 | **Var**（userdata；`[...]` / `:to` 解引用，见「V 与 d:v：指针链走查」） |
 | `dbg.sessions()` / `d.root_pid` / `d:threads()` | `root_pid` / `tid` | number |
 
 **入参一侧（读写对称）**：`d:read*` / `d:read_str` / `d:write` 的**地址实参**、`d:context(tid, t)` 的
@@ -246,6 +248,78 @@ cannot run while a dbg session exists (detach/kill it first)
 - 第 2 条是 T7.3 的「有未应答事件」判据（`dbg_error_paused()`）；现行 `Run`/`Attach` 走的是第 3 条
   —— C 侧 registry 里**存在**任何 dbg 会话就拒（两条路径都独占整个进程的事件流）。
 - 没有会话（或已收尾）时：`dbg: no session (call dbg.create or dbg.attach first)`。
+
+## V 与 d:v：指针链走查
+
+`V(addr)` 是 29 个契约名之一，但切片 C1d 起它**只在调试回调里可用** —— 回调里「产生该事件的
+会话」是唯一确定的（`CallbackScope` 已经挂好）；顶层 / REPL 里没有这个答案，引擎**不猜**。
+
+| 场合 | 写法 | 解引用走哪个引擎 |
+| --- | --- | --- |
+| 调试回调（`Run`/`Attach` 的 `callback`、`SetBreakpoint` 的回调、`d:arm` 的回调） | `V(addr)[off1][off2]:to('I')` | 产生该事件的那个会话 |
+| 顶层脚本 / `--repl` | `d:v(addr)[off1][off2]:to('I')` | **`d` 这个会话**（与「最近一次 create/attach」无关） |
+| `dbg.remote` 的代理 `d` | 两者都不行 → `d:read_u32` / `d:read_u64` 逐跳读 | 见下面「代理上不支持 `d:v`」 |
+
+- **顶层 / REPL 调 `V()`** → 返回 `nil, msg`（是**返回值**不是 error，所以 `local v, e = V(addr)`
+  能直接看到原因），文案逐字是：
+  `V() is only usable inside a debug callback; use d:v(addr) or d:read*/d:write instead`
+- **REPL 里 `V` 根本不存在**（`register_lua_api(L, repl)` 不注册它）⇒ `V` 是 `nil`，对着提示符敲
+  它是 `attempt to call a nil value (global 'V')`（实测原文）。交互那一侧直接用 `d:v`。
+- `V(addr)` 的 `addr` **number 与 LuaVariant 都收**（`V(c.Ccx)` = 「把寄存器里的值当地址」）。
+
+```lua
+-- 回调里（V 可用）：引擎就是跑这次回调的会话，不需要你点名
+Run{ cmdline = [[C:\path\target.exe]], callback = function()
+  SetBreakpoint{ modname = 'my.dll', rva = FindFuncRva('my.dll', 'F'),
+    callback = function(info)
+      local c    = GetContext(info.tid)
+      local flag = V(c.Ccx)[0x10][0x8]:to('I')   -- [[ECX]+0x10]+0x8 处的 uint32
+      print('flag =', flag.hex)                  -- 返回 LuaVariant：用 .hex / .val
+    end }
+end }
+```
+
+`d:v(addr)` 是**会话绑定**的 Var：载荷 = `{ 地址, 本会话的引擎 }`，拿在手里跨会话都
+不串；构造之后 `[...]` 逐跳解引用、`:to` / `:tos` / `:write` / `:writes` / `:swrite` 全走
+**那个会话**（与 `current_session()` 无关）。
+
+```lua
+-- 顶层（V 不可用）：同一张链，引擎换成 d 这个会话
+local d  = dbg.create{ imagepath = [[C:\path\target.exe]] }
+local ev = d:pump(3000)                        -- 要有停住的目标才读得到东西
+if ev then
+  local root = ev.ea                           -- 链头用命中地址；ev.ea 为 0 的事件（如 CREATE_PROCESS）改用 d:mods()[1].base
+  local flag = d:v(root)[0x10][0x8]:to('I')    -- 逐跳：取指针 → 取指针 → 读 uint32
+  print('flag =', flag.hex)                    -- .hex / .val；别塞 string.format('%X', …)
+  d:cont()
+end
+d:kill()                                       -- 收尾之后 d:v 造出来的 Var 都不能再用
+```
+
+- **逐跳语义**：`v[off]` 在「当前地址 + `off`」处读**指针宽**（x86 4 字节 / x64 8 字节），返回
+  **新的 Var**（地址 = 读到的值，仍绑同一个会话）；`off` 收 number 也收整数类 LuaVariant。
+- **`:to(type[, off])` 的单字母码**（`Var` 用单字母，`LuaVariant:to` 才是全名）：
+  `c` int8 / `b` uint8 / `h` int16 / `H` uint16 / `i` int32 / `I` uint32 / `q` int64 /
+  `Q` uint64 / **`z` = `size_t`** / `f` float / `d` double。返回 **LuaVariant**（不是 number）⇒
+  比较与打印用 `.val`（十进制串）/ `.hex`，见上面「地址类值的比较与算术」与仓库 `PITFALLS.md` 的
+  **S25**。要连续 n 个值用 `:tos(type, n[, off])`（返回变体表）。
+- **会话收尾之后**（`d:detach()` / `d:kill()`）再用同一个 Var：
+  `Var: the session bound by d:v() is closed (detach/kill)` —— 宁可报错，也不对已释放的引擎读写。
+- `d:v` 自己的入参错误照旧是 `nil, err`：`d:v: addr (number or LuaVariant) expected` /
+  `d:v: addr must be positive`（`d:v(0)` 不给 Var —— 0 地址没有意义，拿它判失败即可；
+  `CREATE_PROCESS` / `LOAD_DLL` 这类事件的 `ev.ea` 就是 `0`，别拿它当链头）。
+
+**代理上不支持 `d:v`**：`dbg.remote` 的 `RemoteSession` 只转发 `lualib/dbglib.lua` 的
+`SESSION_METHODS` 白名单，里面**没有 `v`** ⇒ 代理上调 `d:v(...)` 是普通 Lua 错误
+`unknown method 'v'`（`Var` 的载荷带本机引擎指针，本来也过不了线）。代理那一侧读指针链用
+`d:read_u32` / `d:read_u64` 逐跳：
+
+```lua
+-- 代理（32 位宿主看 64 位目标）：没有 d:v，逐跳用数据面读
+local p = d:read_u64(ev.ea)                     -- 指针宽：x64 目标用 read_u64
+local q = d:read_u64(tonumber(p.val) + 0x10)
+print('flag =', d:read_u32(tonumber(q.val) + 0x8))
+```
 
 ## dbglib：多会话脚本糖
 
@@ -610,10 +684,15 @@ WriteMemory(V(addr), { 0x90, 0x90, 0x90 })   -- table of bytes，写回目标
 
 ### 1) Var：`V(addr)` —— 按「地址 + 类型字母」读
 
+❗**`V()` 只在调试回调里可用**：顶层 / REPL 里没有「当前会话」这个答案，`V()` 返回
+`nil, msg`（REPL 里 `V` 干脆是 `nil`）；顶层读内存用会话绑定的 **`d:v(addr)`**。两边的完整
+口径与错误文案见上面「V 与 d:v：指针链走查」。
+
 ❗`V(x)` 的 `x` 既可以是数字/`U32()`，也可以是 **LuaVariant**（比如 `GetContext` 取到的寄存器）——
 意义是「把它的**值当成地址**」。所以读「参数在 ECX 里、参数是 ECX 指向的 int32」就是：
 
 ```lua
+-- 在回调里（V 可用）
 local c   = GetContext(tid)
 local arg = V(c.Ccx):to("i").val      -- 读 [RCX] 处的 int32；.val 是**字符串**，.rawval 才是数字
 print("arg =", arg)                    -- "7"
