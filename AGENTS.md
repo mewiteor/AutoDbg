@@ -104,7 +104,7 @@ make.bat i <dir>         :: 指定输出目录（默认 .out）
 | 本地 REPL（T7 切片 D1） | `pwsh tools/server_test/e2e_repl.ps1 -Render <64\|86> [-Variant legacy]` | 管道喂 stdin 跑 `--repl`：`print(1+1)` → `2`（**管道下零提示符**）、多行续行（`for`/`body`/`end`）、`=` 简写（`=1+1`）、EOF → 退出码 **0**、语法错 → **3**、最后一条命令的错 → **2**、`--repl`+`--json` → 启动器退 **2**、`dbg.caps()` 可用（证明复用同一个 `lua_State`）。10 条断言（多出 `repl.remote-exclusive` 与 `repl.exit-report`；x64 无 fixture ⇒ 9 + 1 SKIP），86 / 86 legacy / 64 都要过 |
 | `dbg` 本地门禁（切片 A/B/C1a） | `pwsh tools/server_test/e2e_dbg.ps1 -Render <64\|86> [-Variant legacy]` | 本地模式（不起 server）：`caps.*` 与本 build 一致、**`dbg.detach ~= nil` 且 `dbg.close == nil`**（D51）、`help.*`（含管道下**无 ESC**）、`kill.*`（真终止 + 状态复位）、**`session.*`**（D55：`dbg.last() == dbg.session(pid)`、`d:pump` 缓存优先返回同一张表、事件表字段与 `d.stop`、`read`/`read_u32`/`write` 往返、**partial read 的真实长度**、`context()` 的 `Cip` 与部分更新、`mods()`/`threads()`）。27 条断言（含 `session.*` / `pump.dispatch-attribution` / `route.same-name-two-processes` / `run.refused-with-session` / `sugar.*` / **`remote.*`：86 宿主经 `--repl --server` 驱动 64 位目标**；x64 无 fixture ⇒ 8 条），legacy 同样必须真过 |
 | JSON 信封（T1/D50） | `pwsh tools/server_test/e2e_json.ps1 -Render <64\|86> [-Variant legacy]` | 本地模式 `--json` / `--out=<path>`：那一行 JSON 独占 stdout、字段齐全、`result` / `pid` / `detached` / `images` 口径、`--json` 与 `--server` 互斥（退出码 2）、退出码口径不变；那一行必须**纯 ASCII**（CP936 → UTF-8 或逐字节降级）。`-Variant legacy` **必须真过**（这段就是用来暴露 GBK 的） |
-| agent 技能包（T6） | `pwsh tools/agent/check_skill.ps1 -Render <64\|86>` | `tools/agent/autodbg-skill/` 是 CLI 口径下的**唯一对外契约文档**：检查 `SKILL.md` 的 frontmatter（`name` / `description`）并把每个 `.md` 里的 ` ```lua ` 片段交给产物做语法检查（只解析不执行）。15 条断言（6 条静态 + 9 个含 lua 块的 md）/ 47 个 Lua 片段 |
+| agent 技能包（T6） | `pwsh tools/agent/check_skill.ps1 -Render <64\|86>` | `tools/agent/autodbg-skill/` 是 CLI 口径下的**唯一对外契约文档**：检查 `SKILL.md` 的 frontmatter（`name` / `description`）并把每个 `.md` 里的 ` ```lua ` 片段交给产物做语法检查（只解析不执行）。16 条断言（6 条静态 + 10 个含 lua 块的 md）/ 51 个 Lua 片段 |
 | nvim 客户端（T5） | `pwsh tools/server_test/nvim_smoke.ps1 -Render <64\|86> [-Variant legacy]` | 起 `--server=tcp` → headless nvim 跑 `nvim_smoke.lua`：远程执行 + 结果 buffer、异步路径不出 `E5560`、语法错误 → chunkname + quickfix、`M.cancel`（控制帧）、health/version（`info`）、`open_file` 写/读回（帧上的 `open`/`data`/`close`/`read_req`）。32 条断言（实测）；**nvim 不在 PATH 时 SKIP** |
 | Win9x 实机 | `pwsh tools/w9x_test/w9x.ps1 -Action check\|run\|record` | 需要 VMware 的 Win98 guest 与凭据（`tools/w9x_test/config.local.ps1`，已 gitignore）；**没有 VM / 凭据时 SKIP（exit 0）**。矩阵与剩余项见 `plan.md` §1.3 |
 
@@ -200,7 +200,7 @@ tests/golden/w9x/    Win98 guest 的黄金输出
 | `plan_t7.md` | T7 的独立计划：状态机（begin/pump/cont/end）、「不能没有」的数据面原语、REPL 与协议归因、AI + IDA MCP 的缺口 |
 | `plan_bootloader.md` | T8 的独立计划：交付面必须 32 位、按 host 选 exe、tmpdir 落盘与 handoff（命令行透传 / 退出码 / job）、job 与 dynapi 口径、多 session 的进程树路由 |
 | `nvim/README.md` | neovim 插件的安装、配置、命令与可编程 API |
-| `tools/agent/autodbg-skill/` | **面向 agent 的技能包**（Agent Skills 格式）：`SKILL.md` 入口 + `references/`（CLI / Lua API / 地雷）+ `recipes/`（6 个场景，含 `stop-and-inspect.md` 的 `dbg` 会话 + `dbglib` 配方）。CLI 口径下的唯一对外契约文档（T7 的主面 `dbg` / `dbglib` / `help` / `caps` / `--repl` 已写进去） |
+| `tools/agent/autodbg-skill/` | **面向 agent 的技能包**（Agent Skills 格式）：`SKILL.md` 入口 + `references/`（CLI / Lua API / 地雷）+ `recipes/`（7 个场景，含 `stop-and-inspect.md` 的 `dbg` 会话 + `dbglib` 配方、`cross-arch-remote.md` 的跨位数代理）。CLI 口径下的唯一对外契约文档（T7 的主面 `dbg` / `dbglib` / `help` / `caps` / `--repl` 已写进去） |
 | `make.bat` | 构建定义（ninja 生成器） |
 | 各文件头部注释 | 该文件的职责、来源、与旧实现的差异（第一手依据） |
 

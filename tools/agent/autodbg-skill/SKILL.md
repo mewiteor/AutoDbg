@@ -86,6 +86,7 @@ if d.detach then d:detach() else d:kill() end
 | `recipes/scan-and-patch.md` | find a pattern with `FindMemory`, patch it, verify |
 | `recipes/gui-automation.md` | drive a GUI app via the `gui` table (click / type / screenshot) |
 | `recipes/remote-agent.md` | the agent loop: `--remote` + `--json` + `--cancel`, long runs, `f:read()` in callbacks |
+| `recipes/cross-arch-remote.md` | a **32-bit** host driving a **64-bit** target: `dbg.remote` proxy over a `--repl --server` on the other side |
 
 ## Output contract for agents
 

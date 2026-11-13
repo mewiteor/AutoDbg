@@ -234,6 +234,153 @@ print('breakpoint hits seen in callbacks:', hits)
 - 超时**不吞**：返回已经收集到的结果 + 第二个返回值 `'dbglib.run_all: timeout'`；
   结束时会 `kill` 每个会话（`ok = false` = 那次 kill 失败，其余照常收）。
 
+## dbg.remote：跨位数的会话代理
+
+> **为什么需要它**：位数是唯一绕不过去的硬理由（D56）—— 32 位调试器的 `DebugActiveProcess`
+> 附 64 位目标拿到的是 `ERROR_NOT_SUPPORTED`，x64 模块的 `parse_pe` 也处理不了 32 位目标。
+> 所以「32 位宿主调 64 位目标」只能是**两个进程**：64 位那一侧真正调试，这一侧用**代理对象**
+> 驱动过去。代理的方法面与本地 session 相同（`d:pump` 有时是 OS wait，有时是 socket wait），
+> 脚本不用分两套写；强隔离 / 崩溃隔离是顺带的好处，硬理由只有位数。
+> 事实来源：`lualib/dbglib.lua`（`remote` / `RemoteHost` / `RemoteSession` / `remote_call`）、
+> `src/scripting/lua/dbg_bindings.cpp` 的 `dbg.remote*` 转发、`src/scripting/lua/client.cpp` 的
+> `remote_connect` / `remote_run_script` / `remote_close`；散文版是 `help('dbg.remote')`。
+
+### 前提：远端必须是 `--repl --server`
+
+```bat
+:: 位数够的那一侧（这里是 64 位）：--repl 让连接内的 lua_State 跨命令存活 —— 代理全靠这一条
+.out\AutoDbg_64.exe --server=tcp --repl --server-port=8642 --server-token=c0ffee1234abcd02
+```
+
+- **每次方法调用 = 一条 `script` 帧**：body 就是 `return dbglib.remote_call(<pid>, "<method>", "<args json>")`；
+  返回值从 `result` 帧的 `json.value` 取回（协议面唯一增量，**proto 不 bump**，仍是 2）。
+- 必须是 `--repl --server`，不能是裸 `--server`：非 `--repl` 的 server 每条命令都是**新** `lua_State`，
+  上一条命令建起来的会话在下一帧里就不存在，代理必然失败。
+- 显式给 `--server-token=<hex>` 时 loopback 上**也**校验（显式 token ⇒ `auth_required = true`）
+  ⇒ 客户端 `opts.token` 必须同值；两边都不给（loopback 且没设 token）才免校验。
+
+### 形状
+
+```lua
+local host, err   = dbg.remote('127.0.0.1:8642', { token = 'c0ffee1234abcd02' })              -- RemoteHost
+local one,  err2  = dbg.remote('127.0.0.1:8642', { token = 'c0ffee1234abcd02', pid = 4242 })  -- 钉住的 RemoteSession
+```
+
+| 参数 | 说明 |
+| --- | --- |
+| `addr` | `'host:port'`（IPv4 文本或 `localhost`；**不做 DNS**） |
+| `opts.token` | 握手帧里的 token（远端要求的那个） |
+| `opts.pid` | 给了就直接返回**钉住**这个 `root_pid` 的 RemoteSession；不给返回 RemoteHost |
+| `opts.timeout_ms` | **每次调用**的整次上限，缺省 8000（到点 ⇒ `nil, 'dbg.remote: timeout'`） |
+| `opts.read_timeout_ms` | 单帧读超时；0 / 缺省 ⇒ C 侧的 5000 |
+| `opts.max_frame` | 能接受的帧上限；0 / 缺省 ⇒ 8 MB |
+
+### RemoteHost：远端宿主
+
+| 方法 | 说明 |
+| --- | --- |
+| `h:create(opts)` | 与 `dbg.create{...}` 同参（**`imagepath` 必填**，`cmdline` 是参数串）；返回本机代理对象，`d.root_pid` 是**远端**那个进程。`opts` 里带函数 ⇒ `nil, 'dbg.remote: create options cannot cross the wire (function/userdata)'` |
+| `h:attach(pid)` | 远端的 `dbg.attach(pid)`，返回代理对象；`pid` 不是数字 ⇒ `nil, 'dbg.remote: attach: pid (number) expected'` |
+| `h:sessions()` | 远端 `root_pid` 的数组（session 对象是 userdata，过不了线） |
+| `h:close()` | 关连接（重复调无害：C 侧先把指针置空）；**不动目标** —— 收尾永远是显式的 `d:kill()` / `d:detach()`（D51） |
+
+### RemoteSession：方法面与本地 session 相同
+
+白名单原文（`dbglib.lua` 的 `SESSION_METHODS`）：
+
+`pump` `cont` `step` `eip` `arm` `hits` `dropped` `setcap` `stopped` `paused` `caps`
+`detach` `kill` `read` `read_u8` `read_u16` `read_u32` `read_u64` `read_str` `write`
+`context` `stack` `mods` `threads`
+
+- 另有 `d:close()`（等同 `h:close()`）：连接是**共享**的，任何一个 close 都会让同一条连接上的其余代理失效。
+- `d.root_pid` 是远端的 `root_pid`。字段就这一个 —— 代理上没有 `d.stop` / `d.state` / `d.kind`
+  （那些是 C 侧会话对象的字段）；「停住」仍然看 `d:pump()` 返回的那张事件表。
+- **`d:pump([ms])` 返回普通表，且 `ev.session` 被填回这个代理对象** ⇒ `ev.session:cont(ev.cont_code)`
+  在本地会话与代理上写法完全一致（远端表里的 `session` 是远端那个 userdata，过不了线，客户端补回来）。
+  省略 `ms` 就是远端 session 的缺省（`100`）。
+- 能力要**问远端**：`d:caps()` 报的是远端那台机器 / 那个 build 有什么。代理对象的 `d.detach`
+  **永远是函数**（薄转发），远端是 9x 时调用才失败（见下面「错误」的最后一行）。
+
+### 过线的两种标记（代理已自动处理）
+
+- `>= 1e14` 的整数 ⇒ `{"__i":"140699000000000"}`。`jsonx.encode` 的数字是 `%.14g`，而 x64 用户态
+  地址的十进制有 15 位 ⇒ 直接过线会静默丢低位，`d:read(m.base, 4)` 就摸到错地址。
+- 字节串 ⇒ `{"__hex":"B8444250…"}`（`read` / `read_str` 的**返回值**、`write` 的**第二个参数**）；
+  `nil` 参数 ⇒ `{"__nil":true}` 占位。
+- 两端共用 `encode_value` / `decode_value`，所以脚本这一侧拿到的是**普通 Lua 值**，不用管标记。
+  为什么是这两种、自己用 `jsonx` 传地址时要注意什么：见仓库 `PITFALLS.md` 的 **S23**。
+
+### 能力边界（不是待办，是设计）
+
+- **函数 / userdata / session 对象过不了线**：客户端编码阶段就返回
+  `nil, 'dbg.remote: argument cannot cross the wire (function/userdata/Nan)'`；服务端侧另有一条
+  `{"ok":false,"err":"unserializable"}`。
+- **`d:arm` 在代理上不可用**（第三个参数是回调函数，上面那条就是它的结果）。回调只能活在**远端**
+  那个 state 里 ⇒ 要武装断点就在远端那侧做，代理这一侧负责 `pump` / `cont` / 数据面 / 收尾。
+- **单条命令有 4096 字节上限**：一条 REPL 命令的 chunk 上限是 `k_repl_chunk_cap = 4096`
+  （超了按语法错 `3` 处理）⇒ `d:write` 一次别超过**约 1.8 KB**（字节过线是十六进制，
+  一个字节两个字符，还要算上命令本身的开销）。
+- **`open_file` 在代理路径上不支持**：代理连接把 `open` / `data` / `read_req` / `close` 帧一律丢弃
+  ⇒ 远端那条 `open_file` 只会等到超时。
+- 远端 REPL 会把返回值 `print` 进 `out` 帧（`--repl` 本就如此），客户端直接丢弃；大 payload 因此
+  多跑一趟 socket，功能无影响。
+
+### 错误（一律 `nil, err`，不抛异常）
+
+| 情形 | 文案 |
+| --- | --- |
+| `addr` 形状不对 | `nil, "dbglib.remote: addr must be 'host:port'"` |
+| 连不上 / 没有 winsock | `'dbg.remote: connect failed: <net_status_name>'`（连不上复用 `bind-failed` 这个名字）/ `'dbg.remote: no winsock (ws2_32.dll / wsock32.dll)'` |
+| token / 版本不符 | `'dbg.remote: {"error":"unauthorized"}'` / `{"error":"bad-version",…}` —— 服务端 `error` 帧的 json **原文** |
+| 握手没应答 / 回帧不对 | `'dbg.remote: no handshake response'` / `'dbg.remote: unexpected handshake reply'` |
+| 单次调用到点 | `'dbg.remote: timeout'` |
+| 连接已关 | `'dbg.remote: connection closed'` |
+| 远端那条命令失败 | `'dbg.remote: <reply.err 或 Lua 错误文本>'`，例如 `unserializable` / `no session 1234` |
+| 远端能力缺席 | `'dbg.remote: method 'detach' is not available on this host'` |
+
+### 骨架（32 位宿主看 64 位目标）
+
+```lua
+-- cross_arch.lua：先在另一侧起好 AutoDbg_64.exe --server=tcp --repl --server-port=8642 --server-token=...
+local h, herr = dbg.remote('127.0.0.1:8642', { token = 'c0ffee1234abcd02', timeout_ms = 20000 })
+if not h then error(herr) end                     -- 连不上 / 错 token：nil, 'dbg.remote: …'
+
+local d, cerr = h:create{
+  imagepath = [[C:\Windows\System32\cmd.exe]],  -- dbg.create 的必填项，代理同参
+  cmdline   = '/c ping -n 20 127.0.0.1',
+}
+if not d then h:close(); error(cerr) end
+print('remote root_pid', d.root_pid)              -- pid 在**远端**那个进程里
+
+local ev
+for _ = 1, 3 do                                   -- 第一条事件通常是 CREATE_PROCESS（type = 3）
+  ev = d:pump(4000)
+  if ev then break end
+end
+if not ev then d:kill(); h:close(); error('no event from the remote session') end
+print('ev', ev.type, ev.pid, ev.tid)
+
+print(string.format('Cip=%X', d:context().Cip))   -- 停住时读；键名与本地一致（Cax … Cip）
+
+local mods, merr = d:mods()                       -- { { name, base, size, path }, … }
+if not mods or not mods[1] then d:kill(); h:close(); error(merr or 'no modules') end
+local m    = mods[1]
+local head = d:read(m.base, 4)                    -- 字节串（base 走 __i、字节走 __hex）
+print(m.name, string.format('base=%X', m.base), 'head_len=' .. tostring(head and #head))
+
+d:cont(ev.cont_code)                              -- 应答码用 cont_code，不是 ev.code
+print('kill', d:kill())                           -- 收尾动词仍是 kill / detach（D51）
+print('close', h:close())                         -- 只关连接；不动目标
+```
+
+### 与本地 registry 的关系
+
+- 代理**不进**本地 `dbg.sessions()` / `dbg.session(pid)`：它只是本机的一个 Lua 对象（连着一条 socket），
+  不是调试会话。
+- 远端有哪些会话问 `h:sessions()`（只给 `root_pid` 列表 —— session 是 userdata，过不了线）。
+- `dbglib.wait_all` / `run_all` 是**本地**多会话糖：它们跑在 `dbg.pump` 这条进程级事件流上，
+  代理的事件不在里面 ⇒ 跨位数的组合得自己写 `d:pump` 循环（形状见 `recipes/cross-arch-remote.md`）。
+
 ## help 与 caps
 
 三方分工（D53），互不包含：

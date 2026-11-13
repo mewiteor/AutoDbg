@@ -10,7 +10,7 @@ autodbg-skill/
 ├── SKILL.md                  # 入口：执行模型、快速路径、路由表
 ├── references/
 │   ├── cli.md                # 选项 / --repl / --json 契约 / raw TCP 帧表（协议 2）
-│   ├── lua-api.md            # dbg 会话对象 + dbglib + help/caps，然后 29 个契约全局 + Var/LuaVariant + gui + open_file
+│   ├── lua-api.md            # dbg 会话对象 + dbg.remote + dbglib + help/caps，然后 29 个契约全局 + Var/LuaVariant + gui + open_file
 │   └── pitfalls.md           # 最费时间的坑（回调、ReadMemory、文件 I/O、cancel 三档）
 └── recipes/
     ├── run-and-break.md      # 启动 + 断点抓参数（Run + 回调）
@@ -18,7 +18,8 @@ autodbg-skill/
     ├── attach-existing.md    # Attach 已在跑的进程（--pid / gui.pick）
     ├── scan-and-patch.md     # FindMemory -> WriteMemory -> 验证
     ├── gui-automation.md     # gui.* 控件 / 输入 / 截图
-    └── remote-agent.md       # --remote + --json + --cancel 的代理循环
+    ├── remote-agent.md       # --remote + --json + --cancel 的代理循环
+    └── cross-arch-remote.md  # 32 位宿主调 64 位目标（dbg.remote 跨位数代理）
 ```
 
 ## 怎么让 agent 看到它
