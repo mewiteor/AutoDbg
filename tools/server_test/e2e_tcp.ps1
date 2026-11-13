@@ -699,7 +699,7 @@ for i = 1, 24 do
     end
     dbg.cont(nil, nil, 0x00010002)   -- DBG_CONTINUE：fixture 的 int3 是写死的，不显式放行就会终止
 end
-dbg.close()
+dbg.kill()
 "@, (New-Object System.Text.UTF8Encoding($false)))
 
         $s2 = Join-Path $TmpDir 'pump_code.lua'
@@ -716,7 +716,7 @@ for i = 1, 24 do
     dbg.cont(nil, nil, 0x00010002)
 end
 print('code1=' .. tostring(codes[1]) .. ' code2=' .. tostring(codes[2]))
-dbg.close()
+dbg.kill()
 "@, (New-Object System.Text.UTF8Encoding($false)))
 
         $s3 = Join-Path $TmpDir 'pump_step.lua'
@@ -741,7 +741,7 @@ for i = 1, 14 do
     end
     dbg.cont(nil, nil, 0x00010002)
 end
-dbg.close()
+dbg.kill()
 "@, (New-Object System.Text.UTF8Encoding($false)))
 
         $s4 = Join-Path $TmpDir 'pump_reentry.lua'
@@ -759,7 +759,7 @@ for i = 1, 24 do
     dbg.cont(nil, nil, 0x00010002)
 end
 print('runwhile=' .. tostring(select(2, pcall(Run, { imagepath = EXE }))))
-dbg.close()
+dbg.kill()
 "@, (New-Object System.Text.UTF8Encoding($false)))
 
         # record-and-continue 分两段：
@@ -778,7 +778,7 @@ for i = 1, 40 do
     if dbg.stopped() then break end
 end
 print('autocont_hits=' .. #dbg.hits() .. ' autocont_paused=' .. tostring(dbg.paused()))
-dbg.close()
+dbg.kill()
 
 local exited = nil
 ok, err = dbg.create{ imagepath = EXE, on_exit_process = function(info) exited = info.code end }
@@ -792,7 +792,7 @@ for i = 1, 60 do
     if dbg.stopped() then break end
 end
 print(string.format('hits=%d dropped=%d exit=%s', #dbg.hits(), dbg.dropped(), tostring(exited)))
-dbg.close()
+dbg.kill()
 "@, (New-Object System.Text.UTF8Encoding($false)))
 
         $s6 = Join-Path $TmpDir 'pump_cancel.lua'
@@ -802,11 +802,14 @@ if not ok then print('create ' .. tostring(err)) return end
 print('event1=' .. tostring(dbg.pump(30000, false)))
 local code, e = dbg.pump(30000, false)             -- 目标停在未应答的事件上 ⇒ 这一泵是空转
 print('idle=' .. tostring(code) .. ' err=' .. tostring(e))
-dbg.close()
+dbg.kill()
 "@, (New-Object System.Text.UTF8Encoding($false)))
 
         # `dbg.attach`：附到一个**已在跑**的 32 位目标（自己起的 64 位进程附不了：32 位调试器对 64 位目标会拿到
-        # ERROR_NOT_SUPPORTED = 50）。`ping -n 20` 约 19 s，够门禁用；close 必须只分离、目标仍活着（D47）。
+        # ERROR_NOT_SUPPORTED = 50）。`ping -n 20` 约 19 s，够门禁用。
+        # ❗切片 A（D51）：收尾是两个动词，**9x 上 `dbg.detach` 不存在**。这里故意**留一个未应答的
+        #   事件**再 `dbg.detach()`（detach 前必须自己先 `ContinueDebugEvent`，否则目标停在被挂起的
+        #   线程上），然后断言目标仍活着（detach.pending-event）。
         $syswow = Join-Path $env:WINDIR 'SysWOW64\cmd.exe'
         $cmd32  = if (Test-Path $syswow) { $syswow } else { Join-Path $env:WINDIR 'system32\cmd.exe' }
         $tgt = Start-Process -FilePath $cmd32 -ArgumentList '/c', 'ping -n 20 127.0.0.1 >NUL' `
@@ -814,21 +817,17 @@ dbg.close()
         Start-Sleep -Milliseconds 200
         $s7 = Join-Path $TmpDir 'pump_attach.lua'
         [IO.File]::WriteAllText($s7, @"
+print('caps_detach=' .. tostring(dbg.caps().detach) .. ' detach_key=' .. tostring(dbg.detach ~= nil) ..
+      ' close_key=' .. tostring(dbg.close))
 local ok, err = dbg.attach($($tgt.Id))
 print('attach=' .. tostring(ok) .. ' err=' .. tostring(err))
 if not ok then return end
-local seen = 0
-for i = 1, 12 do
-    local code = dbg.pump(2000, false)
-    if code == nil or code == 0 then break end
-    if code == 3 then seen = 3 end          -- CREATE_PROCESS
-    dbg.cont(nil, nil, 0x00010002)
-    if seen == 3 and i >= 3 then break end
-end
-print('create_process=' .. seen)
-print('close=' .. tostring(dbg.close()))
+local ev = dbg.pump(2000, false)          -- CREATE_PROCESS：故意**不放行**
+print('create_process=' .. tostring(ev) .. ' paused=' .. tostring(dbg.paused()))
+print('detach=' .. tostring(dbg.detach()))
 print('nopid=' .. tostring(select(2, dbg.attach(0))))
 print('badpid=' .. tostring(select(2, dbg.attach('x'))))
+print('after_detach=' .. tostring(select(2, dbg.pump(10, false))))
 "@, (New-Object System.Text.UTF8Encoding($false)))
 
         With-Server @('--server-timeout=20000') {
@@ -880,15 +879,17 @@ print('badpid=' .. tostring(select(2, dbg.attach('x'))))
             try { $c2.Close() } catch { }
             }
 
-            # ⑦ attach + close 的归属口径：附加来的目标只分离（目标仍活着），自己 create 的才随 close 终止
+            # ⑦ attach + detach 的归属口径：`dbg.detach` 只分离（目标仍活着），`dbg.close` 已删
             $r7 = Run-Client @("--remote=127.0.0.1:$Port", $s7)
             Start-Sleep -Milliseconds 400
             $tgt.Refresh()
-            Check 'pump.attach-detach' ($r7.out -match 'attach=true' -and $r7.out -match 'create_process=3' -and `
-                $r7.out -match 'close=0' -and -not $tgt.HasExited) `
+            Check 'pump.attach-detach' ($r7.out -match 'caps_detach=true detach_key=true close_key=nil' -and `
+                $r7.out -match 'attach=true' -and $r7.out -match 'create_process=3' -and `
+                $r7.out -match 'paused=true' -and $r7.out -match 'detach=true' -and -not $tgt.HasExited) `
                 "alive=$(-not $tgt.HasExited) out=[$($r7.out)]"
             Check 'pump.attach-arg-errors' ($r7.out -match 'nopid=dbg.attach: pid expected' -and `
-                $r7.out -match 'badpid=dbg.attach: pid \(number\) expected') "out=[$($r7.out)]"
+                $r7.out -match 'badpid=dbg.attach: pid \(number\) expected' -and `
+                $r7.out -match 'after_detach=dbg: no session') "out=[$($r7.out)]"
             if (-not $tgt.HasExited) { Stop-Process -Id $tgt.Id -Force -ErrorAction SilentlyContinue }
         }
     }

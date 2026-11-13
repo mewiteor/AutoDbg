@@ -14,6 +14,7 @@
 #include "bson.hpp"  /* lua_bson_encode / lua_bson_decode */
 #include "gui_bindings.hpp" /* S4：`gui` 表（plan_server.md §7.1） */
 #include "dbg_bindings.hpp" /* T7.3：`dbg` 表（plan_t7.md §2.1）——照 gui 的做法，一个全局表 */
+#include "help_bindings.hpp" /* 切片 A / D53：全局 `help([topic])`（人类散文；机器能力用 dbg.caps()） */
 #include "state.hpp" /* lua_reset_dir（Q7：脚本目录工具，声明在 state.hpp） */
 #include "variant.hpp"
 
@@ -95,6 +96,7 @@ void register_lua_api(lua_State *L)
      * 上面 29 个契约全局名一个字不改。 */
     register_gui_api(L);
     autodbg::host::register_dbg_api(L);   /* T7.3：`dbg` 表（状态机原语；便捷层是 Lua sugar，归 T7.6） */
+    autodbg::host::register_help_api(L);  /* 切片 A（D53）：`help` —— 新名字，不在 29 个契约名里 */
 
     /* T4（D44）：`open_file` + 文件对象（io 风格，读写都走帧协议）；
      * T5 之前它藏在 `register_file_api()` 里，那个函数随 read_file/write_file 一起删了。 */

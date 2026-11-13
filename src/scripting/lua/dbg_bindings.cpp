@@ -21,10 +21,14 @@
  *     断点**自带**的回调（`on_breakpoint_callback`）只转交用户，不另记 —— 否则同一个命中会被记两次。
  *     例外：断点的 `on_exception` 通道不记（同一命中已经由 `on_breakpoint` 记过），但仍会调用户回调。
  *   · 回调里出错**不**长跳穿 C++ 帧（D18）：`lua_pcall` 兜住，消息存起来，下一次 `pump` 把它作为第二返回值。
+ *   · 收尾是**两个动词**（D51）：`detach`（恢复原字节 + `DebugActiveProcessStop`，目标继续活着）与
+ *     `kill`（先恢复原字节/释放回调，再 TerminateProcess）。**9x 上 `detach` 这个 key 不存在** ——
+ *     `register_dbg_api` 里按 `DebugActiveProcessStop` 的可用性装。T7.3 提交过的 `close`（按目标来源
+ *     隐式决定杀不杀 + 降级返回 1）已删：那是切片 A 要消除的隐式回退。
  *   · 收尾方法叫 `close` 而不是 `end`：`end` 是 Lua 关键字，`dbg.end` 写不出来（只有 `dbg["end"]()` 能调）。
  *   · `first_chance`：只有 `on_user_exception` 通道有真值；通用 `on_exception` 通道 core 不传 → 记 -1
  *     （数据面补口归 T7.4 §2.2 第 5 条）。
- *   · 重入：回调里调 `begin/pump/cont/close/step/arm/eip` → `nil, "pump cannot be called from a callback"`
+ *   · 重入：回调里调 `begin/pump/cont/step/arm/eip/detach/kill` → `nil, "pump cannot be called from a callback"`
  *     （固定文案；plan_t7.md §2.3 最后一条：回调里不能再 pump）。
  *   · `arm` 要求模块**已加载**（`get_base` 非 0）——否则 core 的 `set_breakpoint` 只会建一个
  *     `has_orignal_byte = 0` 的节点，直到命中时才报 "tmp->has_orignal_byte is zero!"（§9 第 9 条）；
@@ -49,11 +53,14 @@
 #include <lua.hpp>
 
 #include "common/allocator.hpp"   /* free_from_tchar → common::release（UNICODE 下才真释放） */
+#include "common/dynapi.hpp"     /* get_proc_as：DebugActiveProcessStop 的能力探测（D51） */
+#include "common/platform.hpp"    /* is_win9x / arch_name / variant_name / flavor_name（caps） */
 #include "core/core.hpp"
 #include "core/types.hpp"         /* RunParams / DebugCallbacks / 事件载荷 / callback_ref_t */
 #include "core/util.hpp"          /* TCHAR 宏、tchar 转换、ZeroMem */
 
 #include "exec_guard.hpp"         /* D32：pump 空闲片里的那一个 poll 点 */
+#include "help_bindings.hpp"      /* `dbg.help()` = `help('dbg')`（同一张文本表，不是第二真相源） */
 
 namespace autodbg::host
 {
@@ -70,8 +77,20 @@ const int kHitCapMax = 64;
  * 另两条「入口错」用常量，免得 rename 时改漏： */
 const char *const kErrReentry = "pump cannot be called from a callback";
 const char *const kErrPaused  = "cannot run while an event is unhandled";
-const char *const kErrStarted = "dbg: already started (call dbg.close first)";
+const char *const kErrStarted = "dbg: already started (call dbg.detach or dbg.kill first)";
 const char *const kErrNoSess  = "dbg: no session (call dbg.create or dbg.attach first)";
+
+/* `DebugActiveProcessStop` 的能力（D51）：**平台属性**，在建表时（`register_dbg_api`）探一次。
+ * 探不到（Win95/98）⇒ `dbg.detach` **不安装** —— 能力缺席，而不是「存在但一调就降级成 kill」。 */
+bool g_has_detach = false;
+
+typedef BOOL(WINAPI * debug_active_process_stop_fn)(DWORD);
+
+debug_active_process_stop_fn resolve_detach() noexcept
+{
+    return autodbg::common::get_proc_as<debug_active_process_stop_fn>("kernel32.dll",
+                                                                    "DebugActiveProcessStop");
+}
 
 enum HitType
 {
@@ -563,22 +582,11 @@ static int dbg_cont(lua_State *L)
     return 1;
 }
 
-/* `dbg.close()`：收尾。返回值：0 = 正常（该终止就终止）；1 = 要求 detach 但系统没有
- * `DebugActiveProcessStop`（Win95/98）⇒ 已降级成 terminate（D47 的「能力上报」）。
- * ❗目标归属决定「杀不杀」：**附加来的目标只分离**（`pid != 0` ⇒ 置 `to_detach()`，恢复原字节 +
- * `DebugActiveProcessStop`，目标继续活着、pid 不变）；**自己 `create` 的目标维持老口径**（随 close 终止）。
- * 这样「我只想看一眼」时不会把用户的目标搞死，而自己起的靶子不会泄漏。 */
-static int dbg_close(lua_State *L)
+/* 会话收尾的**宿主侧**那一半（core 的 `end()` 管引擎侧）：释放回调 ref、释放 TCHAR 串、
+ * 复位本地状态 —— 之后可以再 `create` / `attach`。命中环形队列留到下一次入口再清
+ * （它是复盘窗口，不是会话资源）。 */
+static void finish_session()
 {
-    if (g.in_callback) return reentry(L);
-    if (!g.started)     return fail(L, kErrNoSess);
-
-    if (g.params.pid) sess().to_detach() = true;   /* attach 来的：只要分离（core 的 `end` 做实事） */
-
-    const char *err = nullptr;
-    int r = sess().end(&err);
-    (void)err;
-
     unref(g.ref_entry);
     unref(g.ref_exception_cb);
     unref(g.ref_on_exception);
@@ -588,14 +596,76 @@ static int dbg_close(lua_State *L)
 
     free_strings();
 
-    /* 复位本层状态：同一个 `lua_State` 里可以再次 `create` / `attach`
-     * （命中环形队列与 `params.pid` 留到下一次入口再清） */
     g.started     = false;
     g.paused      = false;
     g.cb_error[0] = 0;
     g.params.pid  = 0;
+}
 
-    lua_pushinteger(L, (lua_Integer)r);
+/* `dbg.detach()`：恢复断点原字节 + `DebugActiveProcessStop`，**目标继续活着**（D51）。
+ * ❗只有平台有这个导出时才会注册这个 key（`register_dbg_api` 里按能力装）。 */
+static int dbg_detach(lua_State *L)
+{
+    if (g.in_callback) return reentry(L);
+    if (!g.started)     return fail(L, kErrNoSess);
+
+    /* ❗未应答的事件必须先放行：否则 `DebugActiveProcessStop` 之后目标停在被系统挂起的
+     * 线程上（DBG_CONTINUE = 这个断点「已处理」，然后我们撒手 —— 此处唯一合理的选择）。 */
+    if (g.paused)
+    {
+        sess().cont(g.last_pid, g.last_tid, DBG_CONTINUE);
+        g.paused = false;
+    }
+
+    sess().to_detach() = true;   /* core 的 `end()` 做实事：恢复原字节 + 通知销毁 + DebugActiveProcessStop */
+    const char *err = nullptr;
+    int r = sess().end(&err);
+    (void)err;
+    finish_session();
+
+    if (r != 0) return fail(L, "detach not supported on this platform");
+    lua_pushboolean(L, 1);
+    return 1;
+}
+
+/* `dbg.kill()`：终止目标（先恢复原字节 + 通知销毁，顺带把断点回调的 ref 还回来）。 */
+static int dbg_kill(lua_State *L)
+{
+    if (g.in_callback) return reentry(L);
+    if (!g.started)     return fail(L, kErrNoSess);
+
+    sess().detach_process(&g.cb); /* `end()` 在 to_detach 为假时不做这一步，所以这里显式做 */
+    sess().to_detach() = false;
+    sess().term()      = true;    /* `run_shutdown` 会 TerminateProcess / TerminateThread */
+    const char *err = nullptr;
+    sess().end(&err);             /* 返回值只有「detach 降级」一种含义 ⇒ kill 路径必然 0 */
+    (void)err;
+    finish_session();
+
+    lua_pushboolean(L, 1);
+    return 1;
+}
+
+/* `dbg.caps()`：这台机器 / 这个 build 实际有什么（D53）。形状固定、可门禁。 */
+static int dbg_caps(lua_State *L)
+{
+    lua_createtable(L, 0, 7);
+    lua_pushstring(L, autodbg::common::arch_name());        lua_setfield(L, -2, "arch");
+    lua_pushstring(L, autodbg::common::variant_name());     lua_setfield(L, -2, "variant");
+    lua_pushstring(L, autodbg::common::flavor_name());      lua_setfield(L, -2, "flavor");
+    lua_pushboolean(L, autodbg::common::is_win9x() ? 1 : 0); lua_setfield(L, -2, "win9x");
+    /* `attach` 在 9x 上不可用（plan.md §1.3 case 30）⇒ 能力上报，不是许可 */
+    lua_pushboolean(L, autodbg::common::is_nt() ? 1 : 0);   lua_setfield(L, -2, "attach");
+    lua_pushboolean(L, g_has_detach ? 1 : 0);               lua_setfield(L, -2, "detach");
+    lua_pushinteger(L, (lua_Integer)kHitCapMax);            lua_setfield(L, -2, "hits_cap");
+    return 1;
+}
+
+/* `dbg.help()` = `help('dbg')`：文本表只有一份（help_bindings.cpp） */
+static int dbg_help(lua_State *L)
+{
+    if (!help_print_topic("dbg")) return fail(L, "dbg.help: no help topic");
+    lua_pushboolean(L, 1);
     return 1;
 }
 
@@ -737,13 +807,22 @@ bool        dbg_paused()        noexcept { return g.paused; }
 void register_dbg_api(lua_State *L)
 {
     reset_state(L);
+    g_has_detach = (resolve_detach() != nullptr);   /* D51：平台能力，建表时定一次 */
 
-    lua_createtable(L, 0, 14);
+    lua_createtable(L, 0, 17);
     lua_pushcfunction(L, dbg_create);  lua_setfield(L, -2, "create");   /* = Run 的原语版（CreateProcess） */
     lua_pushcfunction(L, dbg_attach);  lua_setfield(L, -2, "attach");   /* = Attach 的原语版（DebugActiveProcess；Win95/98 没有） */
     lua_pushcfunction(L, dbg_pump);    lua_setfield(L, -2, "pump");
     lua_pushcfunction(L, dbg_cont);    lua_setfield(L, -2, "cont");
-    lua_pushcfunction(L, dbg_close);   lua_setfield(L, -2, "close");    /* ❗不叫 `end`：`end` 是 Lua 关键字，`dbg.end` 写不出来（`dbg["end"]()` 才能调）*/
+    /* ❗D51：没有 `close`。收尾是两个语义不同的动词，且 `detach` 在没有
+     * `DebugActiveProcessStop` 的平台上**根本不存在**（下面按能力装） */
+    if (g_has_detach)
+    {
+        lua_pushcfunction(L, dbg_detach); lua_setfield(L, -2, "detach");
+    }
+    lua_pushcfunction(L, dbg_kill);    lua_setfield(L, -2, "kill");
+    lua_pushcfunction(L, dbg_caps);    lua_setfield(L, -2, "caps");     /* 机器可读：这台机器有什么 */
+    lua_pushcfunction(L, dbg_help);    lua_setfield(L, -2, "help");     /* = help('dbg') */
     lua_pushcfunction(L, dbg_step);    lua_setfield(L, -2, "step");
     lua_pushcfunction(L, dbg_eip);     lua_setfield(L, -2, "eip");
     lua_pushcfunction(L, dbg_arm);     lua_setfield(L, -2, "arm");

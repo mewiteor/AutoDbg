@@ -68,19 +68,19 @@ end(&err)                        run_shutdown（761）+ detach；D47 的降级�
 入口**两个**（不再用 `params.pid != 0` 隐式分派）：`create{...}` = `Run` 的原语版（`CreateProcess`，选项键与
 `Run` 同名），`attach(pid [, opts])` = `Attach` 的原语版（`DebugActiveProcess`，**只认显式 pid** ——
 「沿用上次 pid / 鼠标选进程」属 D48 解析链，不进原语层；Win95/98 没附加能力 ⇒ `nil, err`）。
-方法共 15 个：`create / attach / pump / cont / close / step / eip / arm / hits / dropped / setcap / code /
-stopped / paused`（`end` 改叫 `close` —— `end` 是 Lua 关键字，`dbg.end` 写不出来）。回调参数统一是普通表
+方法共 17 个（切片 A 后的现状）：`create / attach / pump / cont / detach / kill / step / eip / arm /
+hits / dropped / setcap / code / stopped / paused / caps / help`。回调参数统一是普通表
 `{pid,tid,ea,code,modname,rva}`（新接口不再用 LuaVariant）。`hits()` 是 64 格环形队列 + `dropped` 计数
 + `setcap(1..64)`；记录只在 `on_breakpoint / on_exception / on_user_exception / on_single_step` 四个通道产生。
 
-`close()` 的**归属口径**：附加来的目标（`attach`）只分离不杀 —— `to_detach()` 为真时 core 的 `end` 做
-真 detach（恢复原字节 + `DebugActiveProcessStop`），目标继续活着、pid 不变；自己 `create` 的目标仍随
-`close` 终止（= `Run` 的老口径）。返回值：0 = 正常；**1 = 要 detach 但系统没 `DebugActiveProcessStop`
-（Win95/98）⇒ 已降级成 kill**（D47 的能力上报）。`run()` 的旧路径（`to_detach` 恒为假）行为一字不变。
-
-> ❗**下一步（设计已拍板，见 §11.1 / D51）**：`close` 将被拆成 `d:detach()` / `d:kill()`，且 **9x 上
-> `dbg.detach` 根本不存在**（能力缺席而不是降级）。上一段描述的「`close` + 返回 1 降级」是 T7.3 的
-> 临时口径，它去掉前不要往新文档/示例里引用。
+> ✅ **切片 A 已落地（D51 / D53）**：最初的 `close()`（按目标来源隐式决定杀不杀 + 降级返回 1）已换成
+> 两个动词 —— `dbg.detach()`（恢复原字节 + `DebugActiveProcessStop`，目标继续活着）与 `dbg.kill()`
+> （先恢复原字节/释放回调，再 TerminateProcess）；**9x 上 `dbg.detach` 这个 key 根本不存在**
+> （建表时 dynapi 探，能力缺席而不是降级）。同轮进了 `dbg.caps()`（机器可读能力表）、全局
+> `help([topic])` 与 `dbg.help()`（人类散文，纯文本；上色归切片 B），并在 `common/platform.*`
+> 收拢了 `is_win9x()/arch_name()/variant_name()/flavor_name()`。详情见 §11.7 的「切片 A 落地状态」。
+> core 的 `end()` 仍保留 D47 的真 detach（`to_detach()` 为真时恢复原字节 + `DebugActiveProcessStop`，
+> 没有该导出就降级成 kill 并返回 1）—— 那是给 `run()`/`--detach` 旧路径用的，`dbg` 层不再暴露那个返回值。
 
 同轮改的 core：`pump` 的等待按 **≤250 ms 切片**，每片没等到事件就问一次 `on_wait_timeout`
 （`run()` 传 100 ms ⇒ 正好一片 ⇒ 行为逐字节不变）；`m_last_code` + `last_code()` 让绑定层拿到
@@ -497,7 +497,7 @@ type  pid  tid  ea  modname  rva  code  first_chance  cont_code
 
 | 切片 | 内容 | 量 | 门禁 |
 | --- | --- | --- | --- |
-| **A** | `close` → `detach`/`kill`（9x 无 `detach`）；`dbg.caps()`；`help()` 纯文本表 | ~200 行 | `detach.*`、`caps.*`、`help.plain-when-piped` |
+| **A** ✅ 已落地 | `close` → `detach`/`kill`（9x 无 `detach`）；`dbg.caps()`；`help()` 纯文本表 | ~700 行（含新文件与门禁） | `e2e_dbg.ps1` 十条：`caps.*` / `detach.capability` / `help.*` / `kill.*` |
 | **B** | help 上色（`core::print_styled` + 探测 + `NO_COLOR` + `--json` 口径） | ~80 行 | `help.no-color-when-piped` |
 | **C** | Session 对象（事件是**普通表**，无 Stop 对象）+ registry + `dbg.sessions/session/last/detach(pid)/kill(pid)`；29 名转薄转发；`Var` 退出新面 | ~550 行 | `session.*`（含 §10 那组 `route.*`）、`session.default-parity` |
 | **D** | REPL 本体（T7.5：`event` 帧 / `out.id` 归因 / proto 2 / ABI 5 / `=` 简写 / 多行 / 退出收尾报告） | 按 §8 | `repl.*` |
@@ -505,3 +505,10 @@ type  pid  tid  ea  modname  rva  code  first_chance  cont_code
 顺序硬约束：**A 必须早于 C**（`detach`/`kill` 就是 Session 对象的方法）；**C 必须早于 D**（REPL 里
 人/AI 都按对象写）。29 个旧名在 C 期间转成对象 API 的薄转发（行为逐字节不变，`session.default-parity`
 守门），退役留给之后的 D 条目。
+### 11.8 切片 A 落地状态（已提交）
+
+- `src/common/platform.{hpp,cpp}`（新文件）：`is_win9x()` / `is_nt()`（`GetVersionExA` 的 `dwPlatformId`，与启动器 `detect_variant()` 同一判据）+ `arch_name` / `variant_name` / `flavor_name`（收拢一处，免得 caps / help / info 各写一份字符串）。❗为什么不用编译开关：`/DAUTODBG_WIN9X` 是「要能在 9x 上跑」的**构建约束**，legacy 产物在 Win11 上也跑；而 caps 报的是**这台机器**。
+- `src/scripting/lua/help_bindings.{hpp,cpp}`（新文件）：`help([topic])` 与 `dbg.help()` 共用 `kHelp[]` 一张表，`help('dbg')` 是**前缀匹配生成的成员列表**（不存在第二份）。输出走 `PrintS` ⇒ server 模式自动进 `out` 帧、本地进控制台/管道，本层不碰句柄。正文是**窄串字面量**（现代变体 UTF-8、legacy CP936，`PrintS` 各自转成 console 需要的形式）；**主题名与签名保持 ASCII**（门禁逐字匹配）。❗legacy 编译警告 **C4566** 的教训：`⇒` / `❗` 这类字符**不能出现在字符串字面量里**（CP936 表示不出），注释里可以 —— 帮助正文里一律用 `->` 与「注意：」。
+- `dbg` 表：`detach`（按 `DebugActiveProcessStop` 的可用性装）/ `kill` / `caps` / `help`，**删 `close`**；宿主侧收尾收拢成 `finish_session()`（unref 回调 + 释放 TCHAR 串 + 复位 started/paused/pid）。`detach` 前若停着未应答事件，先 `ContinueDebugEvent(pid, tid, DBG_CONTINUE)`。
+- 门禁：**新文件 `tools/server_test/e2e_dbg.ps1`**（本地模式、10 条）——`caps.arch-variant`、`caps.detach`、`detach.capability`（`dbg.detach ~= nil` 且 `dbg.close == nil`）、`help.index/group/topic/unknown-topic/plain-when-piped`、`kill.terminates`、`kill.state-reset`。`e2e_tcp.ps1` 的 `pump.attach-detach` 改成「留一个未应答事件再 detach」并断言 caps/表成员一致、目标仍活着；条数仍 56。
+- 本机实测：`e2e_dbg` 86 modern 10 / 86 legacy 10 / 64 modern 8（x64 无 fixture ⇒ `kill.*` SKIP）+ `e2e_tcp` 86/legacy 56、x64 48、`--selftest` 70（两架构）、导入表 13 产物、`e2e_json` 32、`e2e_gui` 21、`check_skill` 14、`nvim_smoke` 32 全绿。
