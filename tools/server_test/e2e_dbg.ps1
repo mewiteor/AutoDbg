@@ -31,7 +31,14 @@
 #     route.same-name-two-processes 两个同名实例是两个进程（root_pid 不同）：在 a 里写一个字节，
 #                                 b 读同一地址仍是原值 ⇒ 内存走的确实是**各自的**进程句柄
 #     run.refused-with-session    存在 dbg 会话时 pcall(Run, {...}) 的第二个返回值 = 新的固定文案
-# ❗session.* / kill.* / C2a 的 4 条都需要 x86 的 fixture ⇒ x64 上这几段整段 SKIP（8 条）。
+#   T7.6（多会话脚本糖 `lualib/dbglib.lua`，plan_t7.md §11.9.2 / D58）—— 同样是两个同名实例：
+#     sugar.wait-all              rendezvous：两边各自 arm 到 site 后 `dbglib.wait_all` 返回 true，
+#                                 两边同时 `paused()` 且 `stop.rva == site` ⇒ 才读 context；再 detach/kill
+#     sugar.run-all               batch：`dbglib.run_all{{imagepath=EXE},{imagepath=EXE}}` 返回两张结果表，
+#                                 每张 ok == true / exit == 0x4000001F / hits >= 1，返回后 sessions() == 0
+#                                 ❗exit 是**实测值**：不武装断点时 fixture 的第二个 int3 走 NOT_HANDLED，
+#                                 进程被系统以 WOW64 断点状态终止（不是 fixture 契约的 42）；见下面的说明
+# ❗session.* / kill.* / C2a 的 4 条 / sugar.* 的 2 条都需要 x86 的 fixture ⇒ x64 上这几段整段 SKIP（8 条）。
 # =============================================================================
 [CmdletBinding()]
 param(
@@ -394,6 +401,65 @@ print('kill=' .. tostring(a:kill()) .. '/' .. tostring(b:kill()) .. ' left=' .. 
     Check 'pump.dispatch-attribution' ($r.out -match 'own=true a_pending=true a_session=true' -and `
         $r.out -match 'cached=true distinct=true' -and $r.out -match 'kill=true/true left=0') `
         "dbg.pump 的事件表带 session；只泵 b 时 a 的事件也被分派进 a（a.stop 非空）；a:pump(0) 返回 a.stop 而不是 b 的；out=[$($r.out)]"
+
+    # ------------------------------------------------------------ ⑦ T7.6：dbglib 的两个模型（D58）
+    # `dbglib` 是 lualib/dbglib.lua 烘烤出来的全局（按文件名设全局，AGENTS.md §2）；
+    # 本段交替验证它的两个函数喂的是**真的** session 对象，而不是另一套平行 API。
+    $s_sugar_wait = Write-Lua 'sugar_wait.lua' @"
+local EXE = '$fxLua'
+local SITE = $($site.site)
+print('sugar_lib=' .. tostring(type(dbglib)) .. '/' .. tostring(dbglib and dbglib._version))
+local a = dbg.create{ imagepath = EXE }
+local b = dbg.create{ imagepath = EXE }
+if not a or not b then print('sugar_two=false') return end
+print('sugar_two=true pids_differ=' .. tostring(a.root_pid ~= b.root_pid))
+print('sugar_arm=' .. tostring(a:arm('x86_loop.exe', SITE, function() end)) .. '/' ..
+                tostring(b:arm('x86_loop.exe', SITE, function() end)))
+-- rendezvous：两边**同时**停住才算达成（命中目标就**不** cont）
+local ok, err = dbglib.wait_all({ { sess = a, mod = 'x86_loop.exe', rva = SITE },
+                                  { sess = b, mod = 'x86_loop.exe', rva = SITE } })
+print('wait=' .. tostring(ok) .. ' err=' .. tostring(err))
+print('both_paused=' .. tostring(a:paused() and b:paused()) ..
+      ' ra=' .. tostring(a.stop and a.stop.rva) .. ' rb=' .. tostring(b.stop and b.stop.rva))
+-- 停住之后才能读 context（这正是用 wait_all 而不用 run_all 的理由）
+local ca, cb = a:context(), b:context()
+print('ctx=' .. tostring(ca ~= nil and cb ~= nil and ca.Cip ~= nil and cb.Cip ~= nil))
+print('close=' .. tostring(a:detach()) .. '/' .. tostring(b:kill()) .. ' left=' .. #dbg.sessions())
+"@
+    $r = Run-Local $s_sugar_wait 60000
+    Check 'sugar.wait-all' ($r.out -match 'sugar_lib=table/0\.1\.0' -and `
+        $r.out -match 'sugar_two=true pids_differ=true' -and `
+        $r.out -match 'sugar_arm=true/true' -and $r.out -match 'wait=true err=nil' -and `
+        $r.out -match "both_paused=true ra=$($site.site) rb=$($site.site)" -and `
+        $r.out -match 'ctx=true' -and $r.out -match 'close=true/true left=0') `
+        "dbglib.wait_all 必须让两个会话同时停在自己的 site（$($site.site)）再读 context；out=[$($r.out)]"
+
+    # `sugar.run-all`：autocont（record-and-continue）⇒ 命中处**不能**检查，只能靠回调收集。
+    # ❗`exit` 的期望值是**实测**出来的 0x4000001F（= 1073741855）：不武装断点时 fixture 的第二个 int3
+    #   走 NOT_HANDLED、进程被系统以 WOW64 断点状态终止 —— 所以它**不是** fixture 契约里的 42。
+    #   一、二两个会话的 exit / hits 必须一致（同一个 target、同一条代码路径）。
+    $s_sugar_run = Write-Lua 'sugar_run.lua' @"
+local EXE = '$fxLua'
+local hits = 0
+local res, perr = dbglib.run_all({
+    { imagepath = EXE, on_breakpoint = function(ev) hits = hits + 1 end },   -- upvalue 收集（D58）
+    { imagepath = EXE },
+})
+print('run_res=' .. tostring(res ~= nil) .. ' err=' .. tostring(perr) .. ' n=' .. tostring(res and #res))
+if res then
+    for i = 1, #res do
+        print(string.format('r%d ok=%s exit=%s hits=%d pid_pos=%s', i, tostring(res[i].ok),
+            tostring(res[i].exit), res[i].hits, tostring(res[i].root_pid > 0)))
+    end
+end
+print('left=' .. #dbg.sessions() .. ' cb_hits=' .. tostring(hits > 0))
+"@
+    $r = Run-Local $s_sugar_run 60000
+    $rwant = 'ok=true exit=1073741855 hits=[1-9]\d* pid_pos=true'
+    Check 'sugar.run-all' ($r.out -match 'run_res=true err=nil n=2' -and `
+        $r.out -match "r1 $rwant" -and $r.out -match "r2 $rwant" -and `
+        $r.out -match 'left=0 cb_hits=true') `
+        "run_all 返回两张结果表（ok/exit/hits/root_pid），跑完不留下会话；out=[$($r.out)]"
 }
 
 Write-Output ''

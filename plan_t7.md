@@ -548,12 +548,12 @@ type  pid  tid  ea  modname  rva  code  first_chance  cont_code
 | **C3** | 29 名转薄转发 + `Var` 退出新面（D52） | ~200 行 | `session.default-parity` |
 | **D** | REPL 本体（T7.5：`event` 帧 / `out.id` 归因 / proto 2 / ABI 5 / `=` 简写 / 多行 / 退出收尾报告） | 按 §8 | `repl.*` |
 | **C-remote** | `dbg.remote(host:port, token)` 远端 session 代理（方法面与本地相同，复用 `--server` + `client.cpp`）—— 跨位数 / 强隔离的唯一形态（D56） | ~200 行 | `remote.proxy-parity`（需两个位数） |
-| **sugar（T7.6）** | `dbglib.run_all`（batch/collect）与 `dbglib.wait_all(pred, timeout)`（rendezvous），只跑在 `dbg.pump` 与 `paused()` 上（D58） | ~120 行 | `sugar.run-all`、`sugar.wait-all` |
+| **sugar（T7.6）** ✅ 已落地 | `lualib/dbglib.lua`（烘焙成全局 `dbglib`）：`wait_all(goals[,opts])`（rendezvous）与 `run_all(params_list[,opts])`（batch/collect），纯 Lua、5.1 语法、只跑在 `dbg.pump`/`stopped()`/`paused()` 上（D58） | ~250 行 | `e2e_dbg` 21 → 23（`sugar.wait-all` / `sugar.run-all`） |
 
 顺序硬约束：**A 必须早于 C**（`detach`/`kill` 就是 Session 对象的方法）；**C 必须早于 D**（REPL 里
 人/AI 都按对象写）。29 个旧名在 C 期间转成对象 API 的薄转发（行为逐字节不变，`session.default-parity`
 守门），退役留给之后的 D 条目。
-### 11.8 切片 A / B / C1a / C1b / C2a 落地状态（已提交）
+### 11.8 切片 A / B / C1a / C1b / C2a / sugar 落地状态（已提交）
 
 - `src/common/platform.{hpp,cpp}`（新文件）：`is_win9x()` / `is_nt()`（`GetVersionExA` 的 `dwPlatformId`，与启动器 `detect_variant()` 同一判据）+ `arch_name` / `variant_name` / `flavor_name`（收拢一处，免得 caps / help / info 各写一份字符串）。❗为什么不用编译开关：`/DAUTODBG_WIN9X` 是「要能在 9x 上跑」的**构建约束**，legacy 产物在 Win11 上也跑；而 caps 报的是**这台机器**。
 - `src/scripting/lua/help_bindings.{hpp,cpp}`（新文件）：`help([topic])` 与 `dbg.help()` 共用 `kHelp[]` 一张表，`help('dbg')` 是**前缀匹配生成的成员列表**（不存在第二份）。输出走 `PrintS` ⇒ server 模式自动进 `out` 帧、本地进控制台/管道，本层不碰句柄。正文是**窄串字面量**（现代变体 UTF-8、legacy CP936，`PrintS` 各自转成 console 需要的形式）；**主题名与签名保持 ASCII**（门禁逐字匹配）。❗legacy 编译警告 **C4566** 的教训：`⇒` / `❗` 这类字符**不能出现在字符串字面量里**（CP936 表示不出），注释里可以 —— 帮助正文里一律用 `->` 与「注意：」。
@@ -591,6 +591,13 @@ type  pid  tid  ea  modname  rva  code  first_chance  cont_code
 - ❗未应答槽的诚实口径：本切片只覆盖「单进程树」⇒ 每会话至多一个未应答事件（OS 挂起该进程线程直到 `ContinueDebugEvent`）。若同一会话的第二个事件到达（C2b 的树才会发生），**不覆盖 `d.stop`**，返回 `nil, kErrPending` —— 覆盖会让那个进程永远挂起。
 - 门禁：`e2e_dbg` 17 → **21**（`session.multi-two-stopped`：两个同名 fixture 同时停在各自 site 断点再各自收尾；`pump.dispatch-attribution`：只泵 b 时 a 的事件也被分派进 a、`a:pump(0)` 返回 `a.stop` 而不是 b 的；`route.same-name-two-processes`：同名不同 base、各自能读自己的 `base+site`；`run.refused-with-session`）。
 - 本机实测：`e2e_dbg` 86 modern **21** / 86 legacy 21 / 64 modern 8、`e2e_tcp` 56/56/48、`--selftest` 73（两架构）、导入表 13 产物、`e2e_json` 32、`e2e_gui` 21、`check_skill` 14、`nvim_smoke` 32 全绿。
+**切片 sugar（T7.6，`lualib/dbglib.lua`）**：
+
+- 烘焙成全局 `dbglib`（按文件名，AGENTS §2 的约定），**纯 Lua、5.1 语法**（LuaJIT 变体用自己的解释器编这一份），`dbg` 只在**调用时**取（PITFALLS L4 的按文件名烘焙顺序）。两个函数都不抛异常，失败一律 `nil, err`。
+- `wait_all(goals[, opts])`（rendezvous）：`goals` = `{ {sess=, mod=, rva=}, ... }`；每轮先判「某个未达成的会话 `stopped()` ⇒ 目标提前退出」→ `dbg.pump(pump_ms, false)` → 命中（同会话 + 同 RVA + 可选模块名）就**不 cont**（停住=达成），其它事件用 `ev.session:cont(ev.cont_code)` 放行。上界是**迭代次数** `ceil(timeout_ms/pump_ms)`，不用 `os.clock`/`os.time`（两个 Lua 版本语义不一，门禁会飘）。
+- `run_all(params_list[, opts])`（batch/collect）：浅拷贝每张选项表 → 包一层 `on_exit_process` 记 `code` 再链用户回调（不动调用方的表）→ 逐个 `dbg.create`（任一失败就把已建的 `kill` 掉）→ `dbg.pump(pump_ms, true)` autocont 到全部 `stopped()` → 返回每会话结果 `{root_pid, ok, exit, hits}` 并在返回前 `d:kill()`；超时**不吞**（返回已收集的结果 + 第二个返回值 `'dbglib.run_all: timeout'`）。
+- ❗实测口径：fixture 不武装断点时 `run_all` 的 `exit` 是 **1073741855（0x4000001F）**、`hits` 3，**不是** fixture 契约的 42（第二个 int3 走 NOT_HANDLED 被系统终止）。门禁按实测值断言；要「跑完 8 轮 + 退出 42」必须像 `pump.record-and-continue` 那样**显式放行**，`autocont` 做不到。
+- 门禁：`e2e_dbg` 21 → **23**（`sugar.wait-all`：两边都停在自己的 site、再各自收尾；`sugar.run-all`：两张结果表 `ok/exit/hits` 与 `sessions()` 归零）。86 modern/legacy 23 条全过；LuaJIT 手测（modern/legacy 两变体）同一脚本 `wait_all` 返回 true、`run_all` 结果正确 ⇒ `dbglib` 在 LuaJIT 字节码下正常加载。
 ### 11.9 多 session 的脚本面（D57 / D58，随切片 C / T7.6）
 
 #### 11.9.1 pump 的两层（D57）
