@@ -139,7 +139,7 @@ local c = d:context()                 -- 整张寄存器表：**所有字段都�
 d:context(nil, { Cax = 0x1234 })      -- **部分更新**（只写表里出现的键）→ true / nil, err
 local frames = d:stack()              -- { {index, ea, modname, rva}, … }（栈回溯，与 StackTrace 同形）
 for _, m in ipairs(d:mods()) do end   -- { name, base, size, path }（base 是 LuaVariant，size 是 number）
-for _, t in ipairs(d:threads()) do end-- { {tid}, … }
+for _, t in ipairs(d:threads()) do end-- { {tid, pid}, … }
 ```
 
 - `d:context([tid])` 的键名（源码：`src/core/context.cpp` 的 `k_context_fields[]`）：
@@ -178,7 +178,7 @@ for _, t in ipairs(d:threads()) do end-- { {tid}, … }
 | `d:read_u8/u16/u32()` | 返回值 | number |
 | `d:read()` / `d:read_str()` | 返回值 | string（字节串） |
 | `d:v(addr)` | 返回值 | **Var**（userdata；`[...]` / `:to` 解引用，见「V 与 d:v：指针链走查」） |
-| `dbg.sessions()` / `d.root_pid` / `d:threads()` | `root_pid` / `tid` | number |
+| `dbg.sessions()` / `d.root_pid` / `d:threads()` | `root_pid` / `tid` / `pid`（`pid` 是 `d:threads()` 每项上 C2b 新加的字段） | number |
 
 **入参一侧（读写对称）**：`d:read*` / `d:read_str` / `d:write` 的**地址实参**、`d:context(tid, t)` 的
 **字段值**，number 与 LuaVariant **都收**（`arg_num_or_lv`：userdata 必须是 LuaVariant，number 侧

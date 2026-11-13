@@ -104,8 +104,10 @@ void DebuggerSession::del_breakpoints_by_modname_without_update_memory(const cor
  * ❗T7 切片 C2b（plan_t7.md §10 第 3 条）：读写一律走 **`peinfo->dwProcessId`** 的句柄。
  *   旧实现直取 `proc().hProcess`（根进程）⇒ 在进程树里，子进程的 `CREATE_PROCESS` / `LOAD_DLL`
  *   会拿根进程的句柄去改子进程的代码页：要么改错地方、要么改失败（断点记录有，补丁没打上）。
- *   断点记录的 key 仍是 `(modname, rva)`（`BreakpointInfo` 无 pid 且布局不可动）⇒ 同名模块在
- *   树里每个进程各打一份 `0xCC`，这是本切片的已有口径（“断点的进程维度落在新记录层”留给后续）。
+ *   断点记录的 key 仍是 `(modname, rva)`（`BreakpointInfo` 无 pid 且布局不可动），而原始字节只有
+ *   一份 ⇒ 下面遇到 `has_orignal_byte` 已置位就跳过（本文件 :126），所以只有**第一个**进程（通常
+ *   是根）会被打上 `0xCC`（PITFALLS.md S27）；按 pid 的断点记录层（plan_t7.md §10 第 4 条）留给
+ *   后续。
  */
 void DebuggerSession::apply_breakpoints_for_module(PEInfo *peinfo)
 {
