@@ -53,12 +53,17 @@ echo build模式: %BUILD_MODE%
 
 if not exist %INSTALLROOT% mkdir %INSTALLROOT%
 
+set GEN_BUILD=1
+
 if "x%ARCH_ARG%" == "x" (
     call :config 64 || goto err
     call :config 86 || goto err
 ) else (
     echo arch: %ARCH_ARG%
+    :: a: 只生成 compile_commands.json（不构建）——单架构拿不到另一架构的产物，
+    ::     主 exe 是 x86 且要内嵌 x64 blob（T8/D63），所以构建只在没有 a 时进行
     set GEN_COMPILE=1
+    set GEN_BUILD=0
     call :config %ARCH_ARG% || goto err
 )
 exit /b
@@ -106,8 +111,12 @@ if not exist %BUILDDIR%\tests\fixtures\bin mkdir %BUILDDIR%\tests\fixtures\bin
 
 if %ARCH% == 64 (
     set SUBSYS_VER=
+    set PACK_BLOB_ESC=
+    set PACK_FLAGS=-quiet --no-blob
 ) else (
     set SUBSYS_VER=,5.01
+    set PACK_BLOB_ESC=%INSTALLROOT::=$:%\AutoDbg_64.exe
+    set PACK_FLAGS=-quiet --blob=%INSTALLROOT%\AutoDbg_64.exe
 )
 
 > %BUILDDIR%\build.ninja echo # build.ninja - lualib ^(%1 %BUILD_MODE%^)  [generated, do not edit]
@@ -183,7 +192,7 @@ set CFLAGS_V9X=!CFLAGS_V9X:/D_UNICODE /DUNICODE =!
 >>%BUILDDIR%\build.ninja echo   description = PEVER $out
 >>%BUILDDIR%\build.ninja echo.
 >>%BUILDDIR%\build.ninja echo rule pack
->>%BUILDDIR%\build.ninja echo   command = $packtool $out -quiet $in
+>>%BUILDDIR%\build.ninja echo   command = $packtool $out $flags $in
 >>%BUILDDIR%\build.ninja echo   description = PACK $out
 >>%BUILDDIR%\build.ninja echo.
 set CFLAGS_JSON=%CFLAGS:\=\\% /std:c17
@@ -547,8 +556,10 @@ if "x%ARCH%" == "x86" set DEFS=%DEFS% %INSTALLROOT::=$:%\fixtures\x86_spawn.exe
 
 if "x%GEN_COMPILE%" == "x1" echo ]>>%ROOT%compile_commands.json
 :: 版本宏：每次都算一遍（内容没变就不碰文件）
-call :genversion || exit /b 1
-ninja -C %BUILDDIR%
+if "x%GEN_BUILD%" == "x1" (
+    call :genversion || exit /b 1
+    ninja -C %BUILDDIR%
+)
 
 exit /b
 
@@ -706,8 +717,9 @@ setlocal
 set LOBJ=launcher
 set PACKMOD=%INSTALLROOT::=$:%\AutoDbg_lua_%ARCH%.dll %INSTALLROOT::=$:%\AutoDbg_luajit_%ARCH%.dll
 if "%ARCH%" == "86" set PACKMOD=!PACKMOD! %INSTALLROOT::=$:%\AutoDbgLegacy_lua_%ARCH%.dll %INSTALLROOT::=$:%\AutoDbgLegacy_luajit_%ARCH%.dll
->>%BUILDDIR%\build.ninja echo build pack\packdata.c: pack !PACKMOD! ^| %BUILDDIR::=$:%\tools\pack.exe
+>>%BUILDDIR%\build.ninja echo build pack\packdata.c: pack !PACKMOD! ^| %BUILDDIR::=$:%\tools\pack.exe !PACK_BLOB_ESC!
 >>%BUILDDIR%\build.ninja echo   packtool = %BUILDDIR%\tools\pack.exe
+>>%BUILDDIR%\build.ninja echo   flags = !PACK_FLAGS!
 >>%BUILDDIR%\build.ninja echo.
 >>%BUILDDIR%\build.ninja echo build pack\packdata.obj: cc pack\packdata.c
 >>%BUILDDIR%\build.ninja echo.
@@ -817,7 +829,7 @@ echo     r: 重新构建
 echo     b ^<buildpath^>: 指定构建目录
 echo     i ^<installpath^>: 指定输出目录
 echo     d: debug模式，默认release模式
-echo     a ^<arch^>: 只构建一个架构 ^(64 / 86^)，并生成 compile_commands.json
+echo     a ^<arch^>: 只生成该架构的 compile_commands.json ^(不构建^)
 echo 说明: arch 98 已退役 —— 老系统口径改由运行时 --variant=legacy 选择
 echo 产物: AutoDbg_64.exe / AutoDbg_86.exe ^(单文件，内含 flavor x variant 全部模块^)
 exit /b
