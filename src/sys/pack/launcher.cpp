@@ -14,6 +14,9 @@
  *   信封本身在模块里组装（`main.cpp`）。`--out` 单独给也算 JSON 模式；与 `--server` 互斥
  *   （同时给 → 报错、退出码 2）；JSON 模式不弹文件对话框，启动器自己的诊断走 stderr
  *   （stdout 必须被那一行 JSON 独占）。
+ * T7 切片 D1：`--repl` → `boot.repl_mode = 1`（ABI 5），**不需要脚本**。与 `--json` / `--out`
+ *   互斥（那一行必须独占 stdout）、与 `--server` 互斥（REPL 跑在 server 上属切片 D2，本切片
+ *   只报错），两者都退 2。REPL 主循环在模块里（`scripting/lua/repl.cpp`）。
  *
  * ❗启动器是 **ANSI 编译**（要能在 Win9x 上跑）：所有 API 显式带 A/W 后缀；
  *   `GetCommandLineW` / `GetOpenFileNameW` 一律走 `GetProcAddress`（9x 的 kernel32/comdlg32 没有 W 版）。
@@ -615,6 +618,7 @@ void print_usage()
     out("      --module-dir=<dir>     load module DLLs from <dir> (still memory-mapped)\n");
     out("      --quiet                do not show error message boxes\n");
     out("      --selftest             run built-in pure-function self test\n");
+    out("      --repl                 read Lua statements from stdin (piped or console)\n");
     out("      --json                 print one machine-readable JSON line (D50)\n");
     out("      --out=<path>           write the same JSON to <path>; stdout stays empty\n");
     out("      --server[=tcp]           server mode (raw tcp frames; http was removed, D41)\n");
@@ -626,7 +630,8 @@ void print_usage()
     out("      --server-timeout=<sec>   per-request timeout (0 = none)\n");
     out("      --server-log=<path>      diagnostic log file\n");
     out("      --server-no-echo         do not echo executed output to console\n");
-    out("      (--json/--out are mutually exclusive with --server, exit code 2)\n\n");
+    out("      (--json/--out are mutually exclusive with --server, exit code 2)\n");
+    out("      (--repl is mutually exclusive with --json/--out, and with --server until D2)\n\n");
     out("client (raw tcp, D42):\n");
     out("      --remote=<host:port>   run the script on a remote server (default port 8642)\n");
     out("      --remote-token=<hex>    token for the handshake (loopback needs none)\n");
@@ -677,6 +682,8 @@ extern "C" int launcher_main(int argc, char **argv)
     bool        server_mode    = false;
     unsigned    server_mode_v  = 1;   /* 1 = http（将被 D41 删除）、2 = raw tcp（D42） */
     bool        selftest_mode  = false;
+    /* T7 切片 D1：`--repl`（不需要脚本；与 --json/--out、--server 互斥） */
+    bool        repl_mode      = false;
     const char *server_addr    = nullptr;
     unsigned    server_port    = 0;
     unsigned    server_max_body = 0;
@@ -743,6 +750,10 @@ extern "C" int launcher_main(int argc, char **argv)
         else if (str_eq(a, "--selftest"))
         {
             selftest_mode = true;
+        }
+        else if (str_eq(a, "--repl"))
+        {
+            repl_mode = true;
         }
         else if (str_eq(a, "--json"))
         {
@@ -908,6 +919,23 @@ extern "C" int launcher_main(int argc, char **argv)
         return 2;
     }
 
+    /* ---- T7 切片 D1：`--repl` 的两条互斥 ----
+     * ① `--json` / `--out`：D50 要求 stdout **只有那一行**，REPL 的输出没法塞进信封；
+     * ② `--server`：REPL 跑在 server 上（帧 + 命令归因）是切片 D2 的活，本切片只报错、不静默忽略。 */
+    if (repl_mode)
+    {
+        if (json_mode)
+        {
+            out_err("launcher: --repl cannot be combined with --json/--out\n");
+            return 2;
+        }
+        if (server_mode)
+        {
+            out_err("launcher: --repl with --server lands in D2\n");
+            return 2;
+        }
+    }
+
     /* ---- T3（D42）：客户端模式的校验 ----
      * `--version` 在**不带** `--remote` 时保持老语义（打启动器版本、退出 0）；带了就变成
      * 「向 server 查版本」的控制命令。控制命令离开 `--remote` 就是无意义的 → 报错。 */
@@ -942,10 +970,11 @@ extern "C" int launcher_main(int argc, char **argv)
     {
         set_script_ansi(script);
     }
-    else if (!list_only && !server_mode && !selftest_mode && !json_mode && !(remote_host != nullptr && remote_cmd != 0))
+    else if (!list_only && !server_mode && !selftest_mode && !repl_mode && !json_mode && !(remote_host != nullptr && remote_cmd != 0))
     {
         /* JSON 模式不弹窗：它是机器可读接口，拿不到交互桌面时应该直接报错（退出码 -1）；
-         * 客户端的控制命令（cancel/kill/detach/health/version）也不需要脚本。 */
+         * 客户端的控制命令（cancel/kill/detach/health/version）也不需要脚本；
+         * `--repl` 同理 —— 它的输入是 stdin，没有脚本。 */
         if (!ask_script())
             return (GetLastError() == 0) ? 0 : -1;   /* 取消 = 正常退出 */
         script = g_script_a;
@@ -1169,6 +1198,9 @@ extern "C" int launcher_main(int argc, char **argv)
     /* ---- T1（D50）：JSON 信封（ABI 3）---- */
     boot.json_mode = json_mode ? 1u : 0u;
     boot.json_out  = (g_json_out[0] != '\0') ? g_json_out : nullptr;
+
+    /* ---- T7 切片 D1：`--repl`（ABI 5）---- */
+    boot.repl_mode = repl_mode ? 1 : 0;
 
     /* ---- T3（D42）：客户端（ABI 4）---- */
     boot.remote_host     = remote_host;

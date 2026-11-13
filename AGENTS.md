@@ -82,7 +82,7 @@ make.bat i <dir>         :: 指定输出目录（默认 .out）
 ```
 
 - 无脚本参数时弹文件对话框（启动器里的 `GetOpenFileNameW`，9x 降级 A 版）选脚本。
-- 选项（启动器层）：`-h` / `--help`（打 usage 后退出 0）、`--version`（版本/ABI/架构后退出 0；版本串来自构建期的 `git describe`，见 §1）、`--flavor=lua|luajit`（默认 lua 5.5）、`--variant=modern|legacy`（仅排障；正常靠平台探测 + 映射失败回退）、`--list`（列出载荷里的模块）、`--module-dir=<dir>`（调试：从磁盘取同名 DLL，仍走内存映射）、`--quiet`（关错误弹窗）、`--selftest`（跑纯函数自测）、`--json` / `--out=<path>`（机器可读结果信封，§12.6；两者互斥于 `--server`，同时给 → 启动器报错、退出码 2）、`--server[=tcp]`（raw TCP 帧；`--server=http` 已随 D41 删除并报错）及其 `--server-*` 子选项（§12.1）、**客户端（T3/D42）**：`--remote=<host:port>`、`--remote-token=<hex>`、`--pid=<n>`、`--read-timeout=<ms>`、`--max-frame=<bytes>`、`--cancel` / `--kill` / `--detach` / `--health`（这四条离开 `--remote` → 启动器报错、退出码 2；带 `--remote` 时 `--version` 变成「查 server 版本」）。
+- 选项（启动器层）：`-h` / `--help`（打 usage 后退出 0）、`--version`（版本/ABI/架构后退出 0；版本串来自构建期的 `git describe`，见 §1）、`--flavor=lua|luajit`（默认 lua 5.5）、`--variant=modern|legacy`（仅排障；正常靠平台探测 + 映射失败回退）、`--list`（列出载荷里的模块）、`--module-dir=<dir>`（调试：从磁盘取同名 DLL，仍走内存映射）、`--quiet`（关错误弹窗）、`--selftest`（跑纯函数自测）、`--repl`（本地 REPL：stdin 喂**合法 Lua 语句**，不需要脚本；与 `--json`/`--out` 互斥 → 启动器退 2；与 `--server` 目前也退 2，`--repl`+`--server` 归 D2）、`--json` / `--out=<path>`（机器可读结果信封，§12.6；两者互斥于 `--server`，同时给 → 启动器报错、退出码 2）、`--server[=tcp]`（raw TCP 帧；`--server=http` 已随 D41 删除并报错）及其 `--server-*` 子选项（§12.1）、**客户端（T3/D42）**：`--remote=<host:port>`、`--remote-token=<hex>`、`--pid=<n>`、`--read-timeout=<ms>`、`--max-frame=<bytes>`、`--cancel` / `--kill` / `--detach` / `--health`（这四条离开 `--remote` → 启动器报错、退出码 2；带 `--remote` 时 `--version` 变成「查 server 版本」）。
   启动器的输出一律 **ASCII**（它走 `WriteFile` 写字节，中文在 CP936 控制台上会乱码；模块那边走 `WriteConsoleW` 才例外）。
 - **脚本首行标记**也能选 flavor：`--!lua` / `--!luajit`（优先级：命令行 > 首行标记 > 字节码 magic > 默认 lua）。
   其它 `--!xxx` 一律报错退出（D9）；例外：`--!autodbg` / `--!adbg` 是**编辑器侧标记**
@@ -101,6 +101,7 @@ make.bat i <dir>         :: 指定输出目录（默认 .out）
 | 纯函数自测 | `.out\AutoDbg_<arch>.exe --selftest` | 覆盖 `json_writer` / `png_writer` / `dbl2str` / **帧编解码** / **`decide_console_action`**（T7.1）等纯计算层（基线 70 → T1/D50 转义 +11 = 81 → T2 帧编解码 +20 = 101 → T5 删 `http`/`base64` 两段后 = 67 → **T7.1 补 `decide_console_action` 三条 = 70** → **T7.3 切片 B 补 `console_style_enabled` 三条 = 73**） |
 | GUI 自动化（本地） | `pwsh tools/server_test/e2e_gui.ps1 -Render <64\|86> [-Variant legacy]` | 起一个 `gui_target.ps1` 靶子窗口，用**本地 CLI** 跑 `gui.*` 脚本断言（屏幕/窗口/控件/截图/`gui.pick`）；`-AllowInput` 才跑会动真鼠标/键盘的用例。T5 之前它走 HTTP `/run`，现已改成本地（`gui.*` 与传输无关，21 条断言；带 `-AllowInput` 是 26 条） |
 | raw TCP 帧（T2/T3/T4/D42） | `pwsh tools/server_test/e2e_tcp.ps1 -Render <64\|86> [-Variant legacy]` | `--server=tcp`：握手帧（`id` = 协议版本、`data` = token）→ `info`；版本不符 / 首帧非握手 / 错 token 的 `error` 帧；`script` → `out`+`result`+`end`；`control` 的 health / version / cancel / 未知 / shutdown；**执行期的 control**（Lua 死循环 + 引擎空转）；**`dbg` 状态机**（T7.3：`pump.*` 八条 —— 停住不放行 / 默认 code 对齐 / step / 重入拒绝 / record-and-continue + dropped / 空转期 cancel / attach + close 只分离 / attach 参数错）；**`--remote` 客户端**（跑脚本 / `--json` 信封 / 语法错误 / health / version / 另一个进程的 `--cancel`）；**`open_file` 读向**（远程 open 应答、read/tell/seek/lines 字节与位置语义、等回包超时 → `nil,"timeout"` 且脚本继续）、**调试回调里的阻塞读**（超时后回调返回、下一次 `Run` 照常；迟到的 `read_resp` 被丢弃）；**`0.0.0.0` 横幅列出网卡地址**。56 条断言（`pump.*` 只在 x86 跑），legacy 同样必须真过 |
+| 本地 REPL（T7 切片 D1） | `pwsh tools/server_test/e2e_repl.ps1 -Render <64\|86> [-Variant legacy]` | 管道喂 stdin 跑 `--repl`：`print(1+1)` → `2`（**管道下零提示符**）、多行续行（`for`/`body`/`end`）、`=` 简写（`=1+1`）、EOF → 退出码 **0**、语法错 → **3**、最后一条命令的错 → **2**、`--repl`+`--json` → 启动器退 **2**、`dbg.caps()` 可用（证明复用同一个 `lua_State`）。8 条断言，86 / 86 legacy / 64 都要过 |
 | `dbg` 本地门禁（切片 A/B/C1a） | `pwsh tools/server_test/e2e_dbg.ps1 -Render <64\|86> [-Variant legacy]` | 本地模式（不起 server）：`caps.*` 与本 build 一致、**`dbg.detach ~= nil` 且 `dbg.close == nil`**（D51）、`help.*`（含管道下**无 ESC**）、`kill.*`（真终止 + 状态复位）、**`session.*`**（D55：`dbg.last() == dbg.session(pid)`、`d:pump` 缓存优先返回同一张表、事件表字段与 `d.stop`、`read`/`read_u32`/`write` 往返、**partial read 的真实长度**、`context()` 的 `Cip` 与部分更新、`mods()`/`threads()`）。23 条断言（含 `session.multi-two-stopped` / `pump.dispatch-attribution` / `route.same-name-two-processes` / `run.refused-with-session` / `sugar.wait-all` / `sugar.run-all`；x64 无 fixture ⇒ 8 条），legacy 同样必须真过 |
 | JSON 信封（T1/D50） | `pwsh tools/server_test/e2e_json.ps1 -Render <64\|86> [-Variant legacy]` | 本地模式 `--json` / `--out=<path>`：那一行 JSON 独占 stdout、字段齐全、`result` / `pid` / `detached` / `images` 口径、`--json` 与 `--server` 互斥（退出码 2）、退出码口径不变；那一行必须**纯 ASCII**（CP936 → UTF-8 或逐字节降级）。`-Variant legacy` **必须真过**（这段就是用来暴露 GBK 的） |
 | agent 技能包（T6） | `pwsh tools/agent/check_skill.ps1 -Render <64\|86>` | `tools/agent/autodbg-skill/` 是 CLI 口径下的**唯一对外契约文档**：检查 `SKILL.md` 的 frontmatter（`name` / `description`）并把每个 `.md` 里的 ` ```lua ` 片段交给产物做语法检查（只解析不执行）。14 条断言（6 条静态 + 8 个含 lua 块的 md）/ 39 个 Lua 片段 |
@@ -151,7 +152,8 @@ src/scripting/lua/   唯一感知 lua_State 的层
   bindings.cpp       29 个契约全局的薄封装（参数编组 → 调 core）+ on_wait_timeout
   registry.cpp       register_lua_api()：29 个全局 + Var 元表 + `gui` 表（`read_file`/`write_file` 已随 T5/D44 删除——文件 I/O 只有 `open_file` 的文件对象）
   state              create_state_with_libs() / run_script_file() / 烘焙 lualib
-  main.cpp           autodbg_run（唯一导出）+ CRT 兼容层
+  main.cpp           autodbg_run（唯一导出）+ CRT 兼容层 + `--selftest` / `--server` / `--repl` 三个分支
+  repl.hpp/.cpp      `run_repl`：`--repl` 的读-求值-打印循环（合法 Lua 语句、`=` 简写、多行续行；管道可跑）
   server_config / tcp_server（raw TCP 服务端）/ client（`--remote`）/ exec / exec_guard / output /
   file_io + file_stream（`open_file`）/ gui_bindings / dbg_bindings（T7.3 的 `dbg` 表：create/attach/pump/cont/
   detach/kill/…）/ help_bindings（全局 `help([topic])`）/ variant / bson / helpers
@@ -356,6 +358,7 @@ payload              // 单条 LZMA 流：各模块原始字节按 entry 顺序�
 - `selftest` / `server_mode` / `server_*`：S0 追加的字段（D27），ABI 版本因此到 **2**。
 - `json_mode` / `json_out`：T1（D50）追加的字段（`--json` / `--out=<path>`），ABI 版本因此到 **3**。
 - `remote_host` / `remote_port` / `remote_cmd` / `pid` / `read_timeout_ms` / `max_frame`：T3（D42）追加的字段（`--remote` / `--pid` / `--read-timeout` / `--max-frame`），ABI 版本因此到 **4**。
+- `repl_mode`：T7 切片 D1 追加的字段（`--repl`：`0` = 普通脚本、`1` = REPL），ABI 版本因此到 **5**。
 
 改这个结构或导出名 = 改 ABI，必须同步 `AUTODBG_ABI_VERSION` 并重跑全部运行路径。
 

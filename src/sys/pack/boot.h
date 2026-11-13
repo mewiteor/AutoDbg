@@ -12,11 +12,12 @@
  *   - 只加字段不改语义时 `abi` 也要加 1：旧启动器配新 DLL 会因 `size` 不符被拒，
  *     但我们要的是「明确拒绝」而不是「读到半个结构」。
  *   - 版本号占用：1 = 初版，2 = S0（server / selftest，D27），3 = T1（`--json` / `--out`，D50），
- *     **4 = T3（客户端 `--remote` / `--pid` / `--read-timeout` / `--max-frame`，D42）**。
+ *     4 = T3（客户端 `--remote` / `--pid` / `--read-timeout` / `--max-frame`，D42），
+ *     **5 = T7 切片 D1（`--repl`）**。
  *   - 所有指针由启动器填、DLL 只读。
  * ========================================================================== */
 
-#define AUTODBG_ABI_VERSION 4u
+#define AUTODBG_ABI_VERSION 5u
 
 typedef struct autodbg_boot
 {
@@ -61,6 +62,11 @@ typedef struct autodbg_boot
     unsigned pid;                /* in : `--pid=<n>`（0 = 不指定；D48 解析链里的「显式」） */
     unsigned read_timeout_ms;    /* in : 单次文件操作 / 等回包的超时（0 = 缺省 5000；T4 用） */
     unsigned max_frame;          /* in : 客户端能接受的帧上限（0 = 缺省 8 MB） */
+    /* ---- ABI 5（T7 切片 D1，plan_t7.md §11.7 的 D 行）：`--repl` ----
+     * 1 = 模块侧跑 REPL 主循环（读 stdin → 求值 → 打结果），**不需要脚本**
+     * （与 `selftest` / `server_mode` 同类：`script_a/w` 置 NULL）。
+     * 与 `--json` / `--out` 互斥（那一行 JSON 必须独占 stdout），由启动器拒绝。 */
+    int repl_mode;               /* in : 0 = 普通脚本；1 = REPL（`--repl`） */
 } autodbg_boot;
 
 /* DLL 必须导出的唯一入口（C 链接，__cdecl）：返回码即进程退出码 */

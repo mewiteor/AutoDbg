@@ -292,7 +292,7 @@ With-Server @() {
     Send-Frame $s 12 4 0 '' $null
     $f = Recv-Frame $s
     $j = if ($f -and $f.json) { $f.json | ConvertFrom-Json } else { $null }
-    Check 'control.version' ($f.type -eq 9 -and $j.version.Length -gt 0 -and $j.abi -eq 4 -and $j.arch -match '^(x64|x86)$') "json=$($f.json)"
+    Check 'control.version' ($f.type -eq 9 -and $j.version.Length -gt 0 -and $j.abi -eq 5 -and $j.arch -match '^(x64|x86)$') "json=$($f.json)"
 
     Send-Frame $s 12 0 0 '' $null
     $f = Recv-Frame $s
@@ -427,7 +427,7 @@ With-Server @() {
 
     $r = Run-Client @("--remote=127.0.0.1:$Port", '--version')
     $j = if ($r.out) { try { $r.out | ConvertFrom-Json } catch { $null } } else { $null }
-    Check 'client.version-abi' ($r.code -eq 0 -and $j.abi -eq 4 -and $j.arch -match '^(x64|x86)$') "code=$($r.code) out=[$($r.out)]"
+    Check 'client.version-abi' ($r.code -eq 0 -and $j.abi -eq 5 -and $j.arch -match '^(x64|x86)$') "code=$($r.code) out=[$($r.out)]"
 
     # 另一个进程的 `--cancel`：accept 线程接控制连接 → 落到正在跑的这次执行上（D46）
     $runnerOut = Join-Path $TmpDir 'runner.out'

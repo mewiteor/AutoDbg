@@ -161,7 +161,7 @@ check("health.proto", type(h.info) == "table" and h.info.proto == 1, "proto=" ..
 
 local v = ad.version({ sync = true })
 check("version.ok", v.ok == true, "error=" .. tostring(v.error))
-check("version.abi", type(v.info) == "table" and v.info.abi == 4, "abi=" .. tostring(v.info and v.info.abi))
+check("version.abi", type(v.info) == "table" and v.info.abi == 5, "abi=" .. tostring(v.info and v.info.abi))
 
 -- ---------------------------------------------------------------- ⑥ 文件 I/O 走帧
 local tmp = vim.fn.tempname() .. ".bin"

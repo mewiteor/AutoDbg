@@ -20,12 +20,16 @@
  *   ④ 读 `boot->json_mode` / `boot->json_out` → 跑脚本 → 组装并输出那一行 JSON；
  *   ⑤ JSON 模式下 `puts("done")` 被跳过（那一行必须独占 stdout），`print` 由 `output.hpp`
  *      收进缓冲（见 state.cpp）；`--out` 时 stdout 为空、内容改写文件。
+ * T7 切片 D1：`boot->repl_mode != 0`（`--repl`，ABI 5）→ **不跑脚本**，走 `run_repl_mode()`：
+ *   与脚本路径同一个 `create_state_with_libs()`（所以 `dbg`/`gui`/`open_file`/`help`/`dbglib`
+ *   全都在），读 stdin 求值，返回码即退出码。
  * ========================================================================== */
 #include <windows.h>
 
 #include "core/core.hpp" /* DebuggerSession + set_current_session */
 #include "core/util.hpp" /* E / ErrorS / Error / ErrorN / macro helpers */
 #include "state.hpp"     /* run_script_file / g_wfilepath */
+#include "repl.hpp"      /* T7 切片 D1：`--repl` 的主循环（run_repl） */
 #include "file_io.hpp"    /* T4：set_client_read_timeout（等回包的上限） */
 #include "client.hpp"    /* T3（D42）：`--remote` 客户端模式 */
 #include "tcp_server.hpp" /* T5（D41）：server 只剩 raw TCP（HTTP 已删） */
@@ -427,6 +431,42 @@ static int run_selftest_mode()
 }
 
 /* =============================================================================
+ * run_repl_mode —— T7 切片 D1：`--repl`（ABI 5 的 `repl_mode`）
+ *
+ * 与 `run_once` **同口径的前半段**（isa 初始化 → init_tab → 会话挂载），然后不跑脚本：
+ *   建状态（与脚本路径同一个 `create_state_with_libs()`，D1 要求「复用同一个 state」）
+ *   → `run_repl` 读 stdin 求值 → `lua_close` → 会话收尾。返回码即退出码（不 `exit()`）。
+ * ❗为什么单独一个函数而不是塞进 `run_once`：`run_once` 的 `_tmain` 先要一个脚本文件
+ *   （`g_wfilepath`，否则弹文件对话框），而 REPL 没有脚本；`puts("done")` 对 REPL 也只是噪音。
+ * ========================================================================== */
+static int run_repl_mode()
+{
+#ifndef _WIN64
+    __isa_available_init();
+#endif
+    init_tab();
+
+    /* 会话与脚本路径同口径：旧契约名（`Run`/`Attach`）走 `current_session()`。 */
+    s_session = new autodbg::core::DebuggerSession();
+    autodbg::core::set_current_session(s_session);
+
+    lua_State *L = create_state_with_libs();
+    int        r = -1;
+    if (L == nullptr)
+        ErrorS("repl: cannot create lua state\n");
+    else
+    {
+        r = autodbg::host::run_repl(L);
+        lua_close(L);
+    }
+
+    delete s_session;
+    s_session = nullptr;
+    autodbg::core::set_current_session(nullptr);
+    return r;
+}
+
+/* =============================================================================
  * autodbg_run —— 模块 DLL 的**唯一导出**（Plan §2.3 / P3）
  *
  * 等价于旧 `mainCRTStartup` 去掉 `__getmainargs` 与 `ExitProcess`：
@@ -455,6 +495,10 @@ extern "C" __declspec(dllexport) int __cdecl autodbg_run(const autodbg_boot *boo
         return run_selftest_mode();
     if (boot->server_mode != 0)
         return autodbg::server::tcp_server_main(boot);
+    /* ---- T7 切片 D1：`--repl`（与上面两个同类：**不需要脚本**，也不碰命令行） ----
+     * `--repl` + `--server` 的形态属切片 D2（启动器现在就拒绝），所以这里不接 server。 */
+    if (boot->repl_mode != 0)
+        return run_repl_mode();
 
     /* ---- 拆命令行（缓冲由我们自己持有：拆分是原地改写） ---- */
     static LPTSTR s_argv[64];

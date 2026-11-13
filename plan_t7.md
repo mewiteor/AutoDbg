@@ -546,14 +546,15 @@ type  pid  tid  ea  modname  rva  code  first_chance  cont_code
 | **C2a** ✅ 已落地 | 多会话（每会话**自带** `DebuggerSession`）+ 进程级事件路由（`wait_one`/`dispatch` 拆分；按 `root_pid` 归属）+ `d:pump` 过滤循环 + `dbg.detach(pid)/kill(pid)`；本切片只保证「一个会话 = 一棵单进程树」 | ~500 行 | `e2e_dbg` 17 → 21（`session.multi-two-stopped` / `pump.dispatch-attribution` / `route.same-name-two-processes` / `run.refused-with-session`） |
 | **C2b** | 进程树：子进程事件归属父会话、按 pid 的句柄表（`read`/`write`/`VirtualProtectEx` 不能只用 `proc().hProcess`）、每 **pid** 的待应答槽、子进程 fixture | ~400 行 | `route.child-process` / `route.child-handle` / `route.other-session-queued` |
 | **C3** | 29 名转薄转发 + `Var` 退出新面（D52） | ~200 行 | `session.default-parity` |
-| **D** | REPL 本体（T7.5：`event` 帧 / `out.id` 归因 / proto 2 / ABI 5 / `=` 简写 / 多行 / 退出收尾报告） | 按 §8 | `repl.*` |
+| **D1** ✅ 已落地 | REPL 本体（`--repl` + `boot.repl_mode` + ABI 4 → 5）：`ReadFile` 优先（管道可跑）/ `ReadConsoleW` 回退、≤250 ms 切片、`=` 简写、多行续行、退出码 = 最后一条命令、EOF → 0 | ~500 行（含门禁） | 新 `e2e_repl.ps1` 8 条（86 / 86 legacy / 64） |
+| **D2** | 协议：`event` 帧 + `out.id` 归因 + proto 1 → 2；`--repl` 与 `--server` 并存（每行一条命令）；外加两件小事：`--repl --remote` 目前**静默忽略**（应报错）、REPL 退出时「N 个会话未关闭」报告（D54 的安全网） | ~300 行 | `repl.event-attribution` / `repl.exit-report` / `repl.remote-exclusive` |
 | **C-remote** | `dbg.remote(host:port, token)` 远端 session 代理（方法面与本地相同，复用 `--server` + `client.cpp`）—— 跨位数 / 强隔离的唯一形态（D56） | ~200 行 | `remote.proxy-parity`（需两个位数） |
 | **sugar（T7.6）** ✅ 已落地 | `lualib/dbglib.lua`（烘焙成全局 `dbglib`）：`wait_all(goals[,opts])`（rendezvous）与 `run_all(params_list[,opts])`（batch/collect），纯 Lua、5.1 语法、只跑在 `dbg.pump`/`stopped()`/`paused()` 上（D58） | ~250 行 | `e2e_dbg` 21 → 23（`sugar.wait-all` / `sugar.run-all`） |
 
 顺序硬约束：**A 必须早于 C**（`detach`/`kill` 就是 Session 对象的方法）；**C 必须早于 D**（REPL 里
 人/AI 都按对象写）。29 个旧名在 C 期间转成对象 API 的薄转发（行为逐字节不变，`session.default-parity`
 守门），退役留给之后的 D 条目。
-### 11.8 切片 A / B / C1a / C1b / C2a / sugar 落地状态（已提交）
+### 11.8 切片 A / B / C1a / C1b / C2a / sugar / D1 落地状态（已提交）
 
 - `src/common/platform.{hpp,cpp}`（新文件）：`is_win9x()` / `is_nt()`（`GetVersionExA` 的 `dwPlatformId`，与启动器 `detect_variant()` 同一判据）+ `arch_name` / `variant_name` / `flavor_name`（收拢一处，免得 caps / help / info 各写一份字符串）。❗为什么不用编译开关：`/DAUTODBG_WIN9X` 是「要能在 9x 上跑」的**构建约束**，legacy 产物在 Win11 上也跑；而 caps 报的是**这台机器**。
 - `src/scripting/lua/help_bindings.{hpp,cpp}`（新文件）：`help([topic])` 与 `dbg.help()` 共用 `kHelp[]` 一张表，`help('dbg')` 是**前缀匹配生成的成员列表**（不存在第二份）。输出走 `PrintS` ⇒ server 模式自动进 `out` 帧、本地进控制台/管道，本层不碰句柄。正文是**窄串字面量**（现代变体 UTF-8、legacy CP936，`PrintS` 各自转成 console 需要的形式）；**主题名与签名保持 ASCII**（门禁逐字匹配）。❗legacy 编译警告 **C4566** 的教训：`⇒` / `❗` 这类字符**不能出现在字符串字面量里**（CP936 表示不出），注释里可以 —— 帮助正文里一律用 `->` 与「注意：」。
@@ -598,6 +599,15 @@ type  pid  tid  ea  modname  rva  code  first_chance  cont_code
 - `run_all(params_list[, opts])`（batch/collect）：浅拷贝每张选项表 → 包一层 `on_exit_process` 记 `code` 再链用户回调（不动调用方的表）→ 逐个 `dbg.create`（任一失败就把已建的 `kill` 掉）→ `dbg.pump(pump_ms, true)` autocont 到全部 `stopped()` → 返回每会话结果 `{root_pid, ok, exit, hits}` 并在返回前 `d:kill()`；超时**不吞**（返回已收集的结果 + 第二个返回值 `'dbglib.run_all: timeout'`）。
 - ❗实测口径：fixture 不武装断点时 `run_all` 的 `exit` 是 **1073741855（0x4000001F）**、`hits` 3，**不是** fixture 契约的 42（第二个 int3 走 NOT_HANDLED 被系统终止）。门禁按实测值断言；要「跑完 8 轮 + 退出 42」必须像 `pump.record-and-continue` 那样**显式放行**，`autocont` 做不到。
 - 门禁：`e2e_dbg` 21 → **23**（`sugar.wait-all`：两边都停在自己的 site、再各自收尾；`sugar.run-all`：两张结果表 `ok/exit/hits` 与 `sessions()` 归零）。86 modern/legacy 23 条全过；LuaJIT 手测（modern/legacy 两变体）同一脚本 `wait_all` 返回 true、`run_all` 结果正确 ⇒ `dbglib` 在 LuaJIT 字节码下正常加载。
+**切片 D1（REPL 本体，`--repl`）**：
+
+- **ABI 4 → 5**：`boot.repl_mode`（`0` = 脚本、`1` = REPL）。三处断言要同步：`e2e_tcp.ps1` 的 `control.version` **与** `client.version-abi`、`nvim_smoke.lua` 的 `version.abi`（D1 才发现的第三处）。
+- 启动器：`--repl` 不需要脚本；与 `--json`/`--out` 互斥（退出码 2）；与 `--server` 目前也退 2（那句报错写明「lands in D2」）；`-h`/usage 补一行（启动器输出仍是 ASCII）。
+- 新 `src/scripting/lua/repl.{hpp,cpp}` 的 `run_repl`：`ReadFile` 优先（**管道可跑，门禁靠它**）→ 回退 `ReadConsoleW`；读取切片 ≤250 ms 并在片间 `guard_poll_control()`；`=` 简写 → `return …`；多行续行；结果用**全局 `print`** 输出（server 模式下自动进 `out` 帧）；退出码 = **最后一条命令的码**（0/2/3），EOF → 0；失败一律打 stderr、不 `exit()`。**本地不提供中断**（§11.6 第 4 条已定）；历史/箭头/Tab 补全明确不做。
+- 实测纠正两条：① 续行判据不是 plan 写的 `'end of input'`，而是 **`near <eof>`**（Lua 5.5 与 LuaJIT 都是）；② 管道关闭时 `ReadFile` 返回 **FALSE + `ERROR_BROKEN_PIPE`**（不是「0 字节」）—— 第一版因此退出 `-1`，现在有门禁守着。
+- 门禁：新 `tools/server_test/e2e_repl.ps1` **8 条**（`repl.stdin-piped` / `multi-line` / `shorthand` / `exit-code-eof` / `exit-code-syntax-error` / `last-error-code` / `json-exclusive` / `state-shared`），86 modern / 86 legacy / 64 全过（8/8/8）。`repl.state-shared` 用 `=dbg.caps().arch` 证明 REPL 与脚本路径**复用同一个 `lua_State`**。
+- 未做（D2 接管）：`event` 帧 / `out.id` 归因 / proto 2 / `--repl` + `--server`；另有两件小尾巴：**`--repl --remote=` 目前被静默忽略**（应像 `--json` 那样退 2）、**REPL 退出时的「N 个会话未关闭」报告**（D54 的安全网）还没写。
+- 残余风险：真控制台路径（提示符 + `ReadConsoleW`）在没有交互控制台的环境里无法覆盖，非控制台路径已全覆盖；行/块上限 4096 字节（超长行截断 → 语法错 3）。
 ### 11.9 多 session 的脚本面（D57 / D58，随切片 C / T7.6）
 
 #### 11.9.1 pump 的两层（D57）
